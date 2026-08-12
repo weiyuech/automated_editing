@@ -1,0 +1,67 @@
+{
+  "name": "automated-video-editing-frontend",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "out/main/index.js",
+  "scripts": {
+    "dev": "electron-vite dev",
+    "build": "electron-vite build",
+    "preview": "electron-vite preview",
+    "dist:win": "electron-vite build && electron-builder --win nsis --x64 --publish never"
+  },
+  "dependencies": {
+    "@vitejs/plugin-vue": "^5.0.4",
+    "electron-vite": "^2.2.0",
+    "vue": "^3.4.21"
+  },
+  "devDependencies": {
+    "electron": "^30.0.0",
+    "electron-builder": "26.15.3",
+    "vite": "^5.2.0"
+  },
+  "build": {
+    "appId": "com.weiyuech.automatedediting",
+    "productName": "自动视频剪辑",
+    "asar": true,
+    "directories": {
+      "output": "../release",
+      "buildResources": "build"
+    },
+    "files": [
+      "out/**/*",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "build/backend-dist",
+        "to": "backend"
+      },
+      {
+        "from": "build/icon.png",
+        "to": "icon.png"
+      },
+      {
+        "from": "../THIRD_PARTY_NOTICES.md",
+        "to": "THIRD_PARTY_NOTICES.md"
+      }
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": ["x64"]
+        }
+      ],
+      "icon": "build/icon.png",
+      "artifactName": "Automated-Video-Editing-${version}-Windows-${arch}-Setup.${ext}"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "自动视频剪辑"
+    }
+  }
+}

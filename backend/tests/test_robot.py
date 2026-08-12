@@ -1,0 +1,272 @@
+import json
+
+import pytest
+
+from automated_video_editing_backend.core.events import EventHub
+from automated_video_editing_backend.core.models import (
+    MediaItem,
+    MoveCommand,
+    RobotGoalCommand,
+    RobotMode,
+    RobotState,
+)
+from automated_video_editing_backend.services.robot import (
+    HardwareRobotAdapter,
+    RobotService,
+    refuse_if_unfit_to_drive,
+)
+
+
+@pytest.mark.asyncio
+async def test_robot_without_hardware_url_starts_disconnected():
+    robot = RobotService(EventHub())
+    state = await robot.status()
+
+    assert state.adapter == RobotMode.REAL
+    assert state.connected is False
+    assert state.connection_status == "disconnected"
+    assert state.error == "Robot websocket URL is not configured"
+
+    with pytest.raises(ValueError):
+        await robot.move(MoveCommand(direction="forward"))
+
+
+@pytest.mark.asyncio
+async def test_hardware_adapter_uses_documented_websocket_protocol():
+    received: list[dict] = []
+
+    adapter = HardwareRobotAdapter(EventHub(), "ws://robot.local:8765")
+    adapter.state.connected = True
+    adapter.state.connection_status = "connected"
+
+    async def fake_connect():
+        return adapter.state
+
+    adapter.connect = fake_connect
+
+    class FakeRobotSocket:
+        async def send(self, message):
+            payload = json.loads(message)
+            received.append(payload)
+            if "get_map_list" in payload:
+                await adapter._handle_message(json.dumps({"robot_map_list": ["map1"]}))
+            elif "set_switch_map" in payload:
+                await adapter._handle_message(json.dumps({"robot_switch_map": "true"}))
+            elif "get_path_list" in payload:
+                await adapter._handle_message(json.dumps({"robot_path_list": ["path1"]}))
+            elif "set_goal" in payload:
+                await adapter._handle_message(json.dumps({
+                    "robot_goal": {
+                        "path_file": "path1",
+                        "goal_id": 3,
+                        "goal_object": "car",
+                        "goal_check": "true",
+                    }
+                }))
+            elif "video_record" in payload:
+                await adapter._handle_message(json.dumps({
+                    "robot_video_record": {
+                        **payload["video_record"],
+                        "status": "ok",
+                        "url": "robot://video.mp4",
+                    }
+                }))
+            elif "take_photo" in payload:
+                await adapter._handle_message(json.dumps({
+                    "robot_take_photo": {"status": "ok", "url": "robot://photo.jpg"}
+                }))
+
+        async def close(self):
+            return None
+
+    adapter._socket = FakeRobotSocket()
+    await adapter._handle_message(json.dumps({
+        "system": {"status": "ready", "battery": 85},
+        "map": {"mode": "localization", "name": "map1", "status": "ready"},
+        "naviagtion": {"status": "ready", "goal_status": "going"},
+            "task": {
+                "path_file": "path1",
+                "goal_id": 1,
+                "goal_object": "car",
+                "goal_status": "done",
+                "object_status": "faild",
+            },
+            "gimbal": {"record_status": "idle", "yaw": 45, "pitch": 10, "mode": 1},
+    }))
+
+    try:
+        assert await adapter.map_list() == ["map1"]
+        assert await adapter.switch_map("map1") == {
+            "map_name": "map1",
+            "ok": True,
+            "raw": "true",
+        }
+        assert await adapter.path_list("map1") == ["path1"]
+        goal = await adapter.set_goal(
+            RobotGoalCommand(path_name="path1", goal_id=3, goal_object="car")
+        )
+        assert goal["goal_check"] == "true"
+        state = await adapter.start_recording()
+        assert state.recording is True
+        photo = await adapter.capture_photo()
+        assert photo["url"] == "robot://photo.jpg"
+
+        assert {"get_map_list": "all"} in received
+        assert {"set_switch_map": "map1"} in received
+        assert {"get_path_list": "map1"} in received
+        assert {
+            "set_goal": {"path_name": "path1", "goal_id": 3, "goal_object": "car"}
+        } in received
+        assert {"video_record": {"start": 0, "resolution": 4}} in received
+        assert {"take_photo": {"counter": 1, "gap": 0}} in received
+        assert adapter.state.object_status == "failed"
+        assert adapter.state.battery == 85
+    finally:
+        await adapter.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_robot_photo_url_syncs_through_media_service():
+    class FakeAdapter:
+        def __init__(self):
+            self.state = RobotState(connected=True)
+
+        async def status(self):
+            return self.state
+
+        async def capture_photo(self):
+            self.state.media_url = "http://robot.local/photo.png"
+            return {"status": "ok", "url": self.state.media_url}
+
+    class FakeMedia:
+        def __init__(self):
+            self.downloads = []
+
+        async def download_url(self, url, metadata=None, filename_prefix=""):
+            self.downloads.append((url, metadata, filename_prefix))
+            return MediaItem(
+                path="/Users/user/Desktop/automated_video_editing/data/downloads/robot-photo.png",
+                kind="image",
+                metadata=metadata or {},
+            )
+
+    events = EventHub()
+    media = FakeMedia()
+    robot = RobotService(events, adapter=FakeAdapter(), media=media)
+
+    result = await robot.capture_photo()
+
+    assert result["local_media_item"]["kind"] == "image"
+    assert media.downloads == [(
+        "http://robot.local/photo.png",
+        {
+            "source": "data/downloads",
+            "origin": "robot_hardware",
+            "robot_url": "http://robot.local/photo.png",
+            "kind_hint": "image",
+        },
+        "robot-",
+    )]
+    assert (await robot.status()).media_local_path.endswith("robot-photo.png")
+
+
+def _heartbeat(adapter, **blocks):
+    """Feed one heartbeat straight into the state parser."""
+    adapter._apply_protocol_state(blocks)
+
+
+def test_heartbeat_records_hardware_and_map_mode():
+    """system.status and map.mode were read past entirely, so a faulted robot in mapping mode
+    looked identical to a healthy one ready to drive."""
+    adapter = HardwareRobotAdapter(EventHub(), "ws://robot.invalid:8765")
+
+    _heartbeat(
+        adapter,
+        system={"status": "error", "battery": 41},
+        map={"mode": "mapping", "name": "map1", "status": "faild"},
+    )
+
+    assert adapter.state.system_status == "error"
+    assert adapter.state.map_mode == "mapping"
+    assert adapter.state.battery == 41
+    # Their spelling, normalised, so the UI never has to show "faild".
+    assert adapter.state.map_status == "failed"
+
+
+def test_mapping_mode_refuses_a_goal():
+    adapter = HardwareRobotAdapter(EventHub(), "ws://robot.invalid:8765")
+    _heartbeat(adapter, system={"status": "ready"}, map={"mode": "mapping", "status": "ready"})
+
+    with pytest.raises(ValueError, match="扫图模式"):
+        refuse_if_unfit_to_drive(adapter.state)
+
+
+def test_hardware_fault_refuses_a_goal():
+    adapter = HardwareRobotAdapter(EventHub(), "ws://robot.invalid:8765")
+    _heartbeat(adapter, system={"status": "error"}, map={"mode": "localization", "status": "ready"})
+
+    with pytest.raises(ValueError, match="硬件状态异常"):
+        refuse_if_unfit_to_drive(adapter.state)
+
+
+def test_lost_localisation_refuses_a_goal():
+    adapter = HardwareRobotAdapter(EventHub(), "ws://robot.invalid:8765")
+    _heartbeat(adapter, system={"status": "ready"}, map={"mode": "localization", "status": "faild"})
+
+    with pytest.raises(ValueError, match="定位失败"):
+        refuse_if_unfit_to_drive(adapter.state)
+
+
+def test_a_healthy_robot_is_fit_to_drive():
+    adapter = HardwareRobotAdapter(EventHub(), "ws://robot.invalid:8765")
+    _heartbeat(adapter, system={"status": "ready"}, map={"mode": "localization", "status": "ready"})
+
+    refuse_if_unfit_to_drive(adapter.state)
+
+
+def test_a_robot_that_has_said_nothing_yet_is_not_blocked():
+    """Before the first heartbeat every field is None. Refusing then would make the app
+    unusable until a heartbeat happened to arrive."""
+    adapter = HardwareRobotAdapter(EventHub(), "ws://robot.invalid:8765")
+
+    refuse_if_unfit_to_drive(adapter.state)
+
+
+def test_task_goal_status_is_normalised_too():
+    adapter = HardwareRobotAdapter(EventHub(), "ws://robot.invalid:8765")
+
+    _heartbeat(adapter, task={"goal_status": "faild", "object_status": "faild", "goal_id": 3})
+
+    assert adapter.state.goal_status == "failed"
+    assert adapter.state.object_status == "failed"
+
+
+def test_a_heartbeat_without_a_record_field_leaves_the_recording_alone():
+    """`.get` on a missing key returns None, which is not "recording" — so a gimbal block
+    carrying only yaw would rewrite a running recording as stopped. Whether to send the stop
+    command is decided from this flag and nothing else, so absent has to mean unchanged.
+    """
+    import asyncio
+    import json
+
+    adapter = HardwareRobotAdapter(EventHub(), "ws://robot.local:8765")
+    adapter.state.connected = True
+
+    recording = json.dumps({"gimbal": {"record_status": "recording", "yaw": 0, "pitch": 0}})
+    asyncio.get_event_loop_policy().new_event_loop().run_until_complete(
+        adapter._handle_message(recording)
+    )
+    assert adapter.state.recording is True
+
+    # The same robot, a beat later, reporting only where the camera is pointed.
+    partial = json.dumps({"gimbal": {"yaw": 12, "pitch": 0}})
+    asyncio.get_event_loop_policy().new_event_loop().run_until_complete(
+        adapter._handle_message(partial)
+    )
+    assert adapter.state.recording is True, "a silent field must not stop a running recording"
+
+    idle = json.dumps({"gimbal": {"record_status": "idle", "yaw": 12}})
+    asyncio.get_event_loop_policy().new_event_loop().run_until_complete(
+        adapter._handle_message(idle)
+    )
+    assert adapter.state.recording is False

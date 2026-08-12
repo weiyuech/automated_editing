@@ -1,0 +1,49 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Node/Electron
+frontend/node_modules/
+.pnpm-store/
+frontend/dist/
+frontend/out/
+release/
+
+# Generated/runtime files
+.cache/
+data/
+logs/
+exports/
+previews/
+*.db
+*.sqlite
+
+# Fetched assets, not source. `python scripts/prepare_assets.py` reproduces both from pinned
+# URLs, and the packaging workflow runs it. Kept out of the repo because the FFmpeg build is an
+# ~80MB platform binary and the CJK fonts are ~28MB, and neither is anything we author.
+#
+# If they are missing the app does not guess: the 字幕 controls disable themselves and say which
+# is absent, and tests/test_subtitles.py fails rather than letting a build ship without them.
+backend/vendor/
+backend/src/automated_video_editing_backend/assets/fonts/
+
+# OS/editor
+.DS_Store
+.idea/
+.vscode/
+
+# Local credentials and unrelated legacy control-system workspace
+.env
+.env.*
+!.env.example
+.claude/
+直播控制系统/
+
+# Generated packaging inputs/outputs. The icon source and rendered PNG are authored assets.
+frontend/build/backend-dist/
+frontend/build/icon.ico
