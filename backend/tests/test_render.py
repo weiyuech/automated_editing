@@ -1,3 +1,5 @@
+from pathlib import Path
+
 from automated_video_editing_backend.core.models import (
     EditTimeline,
     SubtitleCue,
@@ -156,10 +158,14 @@ def test_original_audio_is_only_wired_when_the_timeline_says_so():
     assert "concat=n=1:v=0:a=1[origraw]" in kept_graph
 
 
-def test_ffmpeg_binary_resolves_common_macos_path(monkeypatch):
+def test_ffmpeg_binary_resolves_the_platform_binary(monkeypatch):
     monkeypatch.delenv("FFMPEG_BIN", raising=False)
-    binary = RenderService().ffmpeg_binary()
-    assert binary.endswith("ffmpeg")
+    assert Path(RenderService().ffmpeg_binary()).name in {"ffmpeg", "ffmpeg.exe"}
+
+
+def test_ffprobe_binary_resolves_the_platform_binary(monkeypatch):
+    monkeypatch.delenv("FFPROBE_BIN", raising=False)
+    assert Path(RenderService().ffprobe_binary()).name in {"ffprobe", "ffprobe.exe"}
 
 
 def test_still_clip_is_looped_to_its_duration():

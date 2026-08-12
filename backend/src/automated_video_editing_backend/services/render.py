@@ -501,8 +501,10 @@ class RenderService:
             return False
 
     def ffprobe_binary(self) -> str:
+        vendored = VENDOR_DIR / _platform_key() / ("ffprobe.exe" if os.name == "nt" else "ffprobe")
         candidates = [
             os.environ.get("FFPROBE_BIN"),
+            str(vendored),
             shutil.which("ffprobe"),
             "/opt/homebrew/bin/ffprobe",
             "/usr/local/bin/ffprobe",

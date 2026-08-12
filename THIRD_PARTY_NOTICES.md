@@ -5,9 +5,11 @@ This notice is informational; each component remains subject to its own license.
 
 ## FFmpeg
 
-The application bundles a pinned Windows build of FFmpeg from BtbN/FFmpeg-Builds with
-`libass`, `libfreetype`, and `libfontconfig` enabled for subtitle rendering. The selected build
-is distributed under GNU GPL v3. FFmpeg source and build scripts are available from:
+The application bundles the immutable BtbN Windows snapshot
+`FFmpeg n8.1.2-34-g9b6c8969e0` (`autobuild-2026-08-11-13-11`) with `libass`, `libfreetype`,
+and `libfontconfig` enabled for subtitle rendering. Its archive is verified against SHA-256
+`05eedc113542be39af5d0f78f0b1093bafb89c98cecf25b77e8644670293107f`. The selected build is
+distributed under GNU GPL v3. FFmpeg source and build scripts are available from:
 
 - https://github.com/FFmpeg/FFmpeg
 - https://github.com/BtbN/FFmpeg-Builds

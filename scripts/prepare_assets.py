@@ -24,6 +24,7 @@ Run:  python scripts/prepare_assets.py [--platform darwin-x86_64|win64|linux64] 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import io
 import subprocess
 import sys
@@ -138,8 +139,12 @@ FFMPEG_BUILDS = {
         "member": "ffmpeg",
     },
     "win64": {
-        "url": "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n8.1-latest-win64-gpl-8.1.zip",
+        # Immutable upstream snapshot: FFmpeg n8.1.2-34-g9b6c8969e0. Do not use the BtbN
+        # `latest` tag here; its asset is replaced daily under the same URL.
+        "url": "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-08-11-13-11/ffmpeg-n8.1.2-34-g9b6c8969e0-win64-gpl-8.1.zip",
+        "sha256": "05eedc113542be39af5d0f78f0b1093bafb89c98cecf25b77e8644670293107f",
         "member": "ffmpeg.exe",
+        "probe_member": "ffprobe.exe",
     },
     "linux64": {
         "url": "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n8.1-latest-linux64-gpl-8.1.tar.xz",
@@ -324,35 +329,49 @@ def prepare_ffmpeg(platform_key: str, force: bool) -> Path | None:
         raise SystemExit(f"no pinned FFmpeg for {platform_key!r}; known: {list(FFMPEG_BUILDS)}")
     target_dir = VENDOR_DIR / platform_key
     target = target_dir / build["member"]
-    if target.exists() and not force:
+    member_names = [build["member"]]
+    if build.get("probe_member"):
+        member_names.append(build["probe_member"])
+    targets = [target_dir / member_name for member_name in member_names]
+    if all(path.exists() for path in targets) and not force:
         print(f"  ffmpeg ({platform_key}): present, skipping")
         return target
 
     print(f"  ffmpeg ({platform_key}): fetching")
     payload = fetch(build["url"])
+    expected_digest = build.get("sha256")
+    if expected_digest:
+        actual_digest = hashlib.sha256(payload).hexdigest()
+        if actual_digest != expected_digest:
+            raise SystemExit(
+                f"FFmpeg archive checksum mismatch: expected {expected_digest}, got {actual_digest}"
+            )
     target_dir.mkdir(parents=True, exist_ok=True)
     if build["url"].endswith(".zip"):
         with zipfile.ZipFile(io.BytesIO(payload)) as archive:
-            member = next(
-                (n for n in archive.namelist() if n.endswith("/" + build["member"])
-                 or n == build["member"]),
-                None,
-            )
-            if member is None:
-                raise SystemExit(f"{build['member']} not found in the archive")
-            target.write_bytes(archive.read(member))
+            for member_name, member_target in zip(member_names, targets):
+                member = next(
+                    (n for n in archive.namelist() if n.endswith("/" + member_name)
+                     or n == member_name),
+                    None,
+                )
+                if member is None:
+                    raise SystemExit(f"{member_name} not found in the archive")
+                member_target.write_bytes(archive.read(member))
     else:
         import tarfile
 
         with tarfile.open(fileobj=io.BytesIO(payload), mode="r:xz") as archive:
-            member = next(
-                (m for m in archive.getmembers() if m.name.endswith("/" + build["member"])), None
-            )
-            if member is None:
-                raise SystemExit(f"{build['member']} not found in the archive")
-            extracted = archive.extractfile(member)
-            target.write_bytes(extracted.read() if extracted else b"")
-    target.chmod(0o755)
+            for member_name, member_target in zip(member_names, targets):
+                member = next(
+                    (m for m in archive.getmembers() if m.name.endswith("/" + member_name)), None
+                )
+                if member is None:
+                    raise SystemExit(f"{member_name} not found in the archive")
+                extracted = archive.extractfile(member)
+                member_target.write_bytes(extracted.read() if extracted else b"")
+    for member_target in targets:
+        member_target.chmod(0o755)
     return target
 
 

@@ -61,6 +61,7 @@ jobs:
 
           required = [
               Path("backend/vendor/ffmpeg/win64/ffmpeg.exe"),
+              Path("backend/vendor/ffmpeg/win64/ffprobe.exe"),
               Path("backend/src/automated_video_editing_backend/assets/fonts/NotoSansSC.ttf"),
               Path("backend/src/automated_video_editing_backend/assets/fonts/NotoSerifSC.ttf"),
               Path("backend/src/automated_video_editing_backend/assets/fonts/SmileySans.ttf"),
@@ -70,6 +71,9 @@ jobs:
               raise SystemExit("Missing release assets: " + ", ".join(missing))
           print("Fonts and FFmpeg are ready.")
           PY
+
+      - name: Add bundled FFmpeg tools to PATH
+        run: echo "$GITHUB_WORKSPACE/backend/vendor/ffmpeg/win64" >> "$GITHUB_PATH"
 
       - name: Run backend tests
         run: python -m pytest backend/tests -q
@@ -86,6 +90,7 @@ jobs:
           required_names = {
               "automated-video-editing-backend.exe",
               "ffmpeg.exe",
+              "ffprobe.exe",
               "NotoSansSC.ttf",
               "NotoSerifSC.ttf",
               "SmileySans.ttf",

@@ -56,6 +56,10 @@ binaries += [
         str(BACKEND_ROOT / "vendor" / "ffmpeg" / "win64" / "ffmpeg.exe"),
         "vendor/ffmpeg/win64",
     ),
+    (
+        str(BACKEND_ROOT / "vendor" / "ffmpeg" / "win64" / "ffprobe.exe"),
+        "vendor/ffmpeg/win64",
+    ),
 ]
 
 a = Analysis(
