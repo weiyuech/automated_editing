@@ -70,22 +70,23 @@ class FramingTestService:
         if state.recording:
             raise ValueError("机器人正在录制，请先停止当前采集")
 
+        original_yaw = self.robot.heartbeat_yaw()
+        if original_yaw is None:
+            original_yaw = state.yaw
+
         recording_started = False
         media_url = ""
         try:
-            await self.robot.center_camera()
             await self.robot.sweep_camera(self.LEFT_YAW, self.PREPOSITION_SPEED_DEG_S)
-            if not await self._await_yaw(self.LEFT_YAW, timeout_s=3.5):
-                raise RuntimeError("云台未能到达取景测试起点 -45°")
+            await self._await_yaw(self.LEFT_YAW, timeout_s=3.5)
 
-            recording = await self.robot.start_recording(center_camera=False)
+            recording = await self.robot.start_recording()
             if not recording.recording:
                 raise RuntimeError(recording.error or "机器人未确认开始录制")
             recording_started = True
 
             await self.robot.sweep_camera(self.RIGHT_YAW, self.SWEEP_SPEED_DEG_S)
-            if not await self._await_yaw(self.RIGHT_YAW, timeout_s=self.RECORD_SECONDS + 3.0):
-                raise RuntimeError("云台未能完成 -45° 到 45° 的取景测试")
+            await asyncio.sleep(self.RECORD_SECONDS)
 
             stopped = await self.robot.stop_recording(sync_media=False)
             recording_started = False
@@ -99,9 +100,13 @@ class FramingTestService:
             if recording_started:
                 with suppress(Exception):
                     await self.robot.stop_recording(sync_media=False)
-            # The test is the one capture allowed to pan. It must still leave the physical
-            # lens at 0°; failure is reported instead of silently stranding it at an edge.
-            await self.robot.center_camera()
+            # This test deliberately pans, but the protocol does not define which yaw means
+            # physical front. Return to the operator's actual starting angle instead of 0°.
+            if original_yaw is not None:
+                with suppress(Exception):
+                    await self.robot.sweep_camera(
+                        float(original_yaw), self.PREPOSITION_SPEED_DEG_S
+                    )
 
         try:
             self._preview_path = await self._download(media_url)

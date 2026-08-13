@@ -4,7 +4,7 @@ import asyncio
 import json
 from abc import ABC, abstractmethod
 from contextlib import suppress
-from typing import Any, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from automated_video_editing_backend.core.diagnostics import log_event
 from automated_video_editing_backend.core.events import EventHub
@@ -20,11 +20,6 @@ from automated_video_editing_backend.core.models import (
 if TYPE_CHECKING:
     from automated_video_editing_backend.core.models import MediaItem
     from automated_video_editing_backend.services.media import MediaService
-
-
-CENTER_YAW = 0.0
-CENTER_TOLERANCE_DEG = 2.0
-CENTER_TIMEOUT_S = 20.0
 
 
 class RobotAdapter(ABC):
@@ -317,7 +312,7 @@ class HardwareRobotAdapter(RobotAdapter):
             "robot_video_record",
             timeout_s=8.0,
         )
-        if not isinstance(response, dict) or response.get("status") != "ok":
+        if not _response_ok(response):
             self.state.recording = False
             raise ValueError(f"机器人拒绝开始录制：{_response_error(response)}")
         self.state.recording = True
@@ -333,7 +328,7 @@ class HardwareRobotAdapter(RobotAdapter):
             "robot_video_record",
             timeout_s=8.0,
         )
-        if not isinstance(response, dict) or response.get("status") != "ok":
+        if not _response_ok(response):
             raise ValueError(f"机器人拒绝停止录制：{_response_error(response)}")
         self.state.recording = False
         self.state.media_url = str(response.get("url") or "") or self.state.media_url
@@ -350,7 +345,7 @@ class HardwareRobotAdapter(RobotAdapter):
             "robot_take_photo",
             timeout_s=8.0,
         )
-        if not isinstance(response, dict) or response.get("status") != "ok":
+        if not _response_ok(response):
             raise ValueError(f"机器人拍照失败：{_response_error(response)}")
         self.state.media_url = str(response.get("url") or "")
         if not self.state.media_url:
@@ -664,23 +659,6 @@ class RobotService:
         await self.events.publish("ROBOT_STATE", state.model_dump(mode="json"))
         return state
 
-    async def center_camera(self) -> RobotState:
-        """Put the lens at physical 0° and confirm it before a normal capture."""
-        before = self.heartbeat_yaw()
-        log_event("info", "gimbal.center.started", heartbeat_yaw=before)
-        state = await self.adapter.set_camera_angle(CameraAngle(angle=CENTER_YAW))
-        deadline = asyncio.get_running_loop().time() + CENTER_TIMEOUT_S
-        while asyncio.get_running_loop().time() < deadline:
-            yaw = self.heartbeat_yaw()
-            if yaw is not None and abs(yaw - CENTER_YAW) <= CENTER_TOLERANCE_DEG:
-                log_event("info", "gimbal.center.confirmed", heartbeat_yaw=yaw)
-                await self.events.publish("ROBOT_STATE", state.model_dump(mode="json"))
-                return state
-            await asyncio.sleep(0.2)
-        yaw = self.heartbeat_yaw()
-        log_event("error", "gimbal.center.failed", heartbeat_yaw=yaw)
-        raise ValueError(f"云台未能回到 0°（最后心跳角度：{yaw if yaw is not None else '未知'}°）")
-
     async def _clear_media_state(self) -> None:
         state = await self.adapter.status()
         state.media_url = None
@@ -688,10 +666,13 @@ class RobotService:
         state.media_sync_error = None
         await self.events.publish("ROBOT_STATE", state.model_dump(mode="json"))
 
-    async def start_recording(self, center_camera: bool = True) -> RobotState:
+    async def start_recording(self) -> RobotState:
+        """Start recording at the operator's current lens angle.
+
+        The protocol does not define which reported yaw is the physical front, so ordinary
+        capture must not issue an implicit gimbal command. Camera movement remains explicit.
+        """
         await self._clear_media_state()
-        if center_camera:
-            await self.center_camera()
         state = await self.adapter.start_recording()
         log_event("info", "capture.recording.started", recording=state.recording)
         await self.events.publish("ROBOT_STATE", state.model_dump(mode="json"))
@@ -700,27 +681,34 @@ class RobotService:
     async def stop_recording(self, sync_media: bool = True) -> RobotState:
         state = await self.adapter.stop_recording()
         if sync_media:
-            await self._sync_robot_media(state.media_url, "video", required=True)
+            # Recording and transferring the resulting file are separate outcomes. Once the
+            # robot accepted stop, a network/routing failure must not rewrite that success as
+            # "recording failed" or leave the capture session active.
+            await self._sync_robot_media(state.media_url, "video")
         log_event(
             "info",
             "capture.recording.stopped",
             robot_url=state.media_url,
             local_path=state.media_local_path,
+            media_sync_error=state.media_sync_error,
         )
         await self.events.publish("ROBOT_STATE", state.model_dump(mode="json"))
         return state
 
     async def capture_photo(self) -> dict[str, Any]:
         await self._clear_media_state()
-        await self.center_camera()
         result = await self.adapter.capture_photo()
-        synced = await self._sync_robot_media(str(result.get("url") or ""), "image", required=True)
-        result["local_media_item"] = synced.model_dump(mode="json")
+        synced = await self._sync_robot_media(str(result.get("url") or ""), "image")
+        if synced:
+            result["local_media_item"] = synced.model_dump(mode="json")
+        state = await self.adapter.status()
+        result["media_sync_error"] = state.media_sync_error
         log_event(
             "info",
             "capture.photo.completed",
             robot_url=result.get("url"),
-            local_path=synced.path,
+            local_path=synced.path if synced else None,
+            media_sync_error=state.media_sync_error,
         )
         await self.events.publish("ROBOT_PHOTO", result)
         return result
@@ -729,8 +717,6 @@ class RobotService:
         self,
         robot_url: str | None,
         kind_hint: str,
-        *,
-        required: bool = False,
     ) -> MediaItem | None:
         from automated_video_editing_backend.services.media import resolve_robot_media_url
 
@@ -739,8 +725,6 @@ class RobotService:
         if not self.media:
             error = "媒体服务不可用，无法保存机器人文件"
             await self._media_sync_failed(state, robot_url or "", kind_hint, error)
-            if required:
-                raise ValueError(error)
             return None
 
         try:
@@ -768,8 +752,6 @@ class RobotService:
         except Exception as exc:
             error = str(exc)
             await self._media_sync_failed(state, robot_url or "", kind_hint, error)
-            if required:
-                raise ValueError(f"机器人已拍摄，但保存到 Windows 失败：{error}") from exc
             return None
 
         state.media_local_path = item.path
@@ -820,6 +802,11 @@ def _response_error(response: Any) -> str:
     if isinstance(response, dict):
         return str(response.get("error") or response.get("message") or response.get("status") or response)
     return str(response)
+
+
+def _response_ok(response: Any) -> bool:
+    """Accept harmless firmware casing/whitespace while still requiring explicit success."""
+    return isinstance(response, dict) and str(response.get("status") or "").strip().casefold() == "ok"
 
 
 def refuse_if_unfit_to_drive(state: RobotState | None) -> None:

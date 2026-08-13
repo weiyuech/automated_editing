@@ -7,8 +7,8 @@ from typing import Any
 from fastapi import WebSocket
 from starlette.websockets import WebSocketDisconnect
 
-from automated_video_editing_backend.core.events import EventHub
 from automated_video_editing_backend.core.diagnostics import log_event
+from automated_video_editing_backend.core.events import EventHub
 from automated_video_editing_backend.core.models import CameraAngle, CruiseRequest, MoveCommand
 from automated_video_editing_backend.core.security import require_ws_token
 from automated_video_editing_backend.services.capture import CaptureService
@@ -117,7 +117,15 @@ async def _handle_command(
         session = await capture.stop()
         if session is not None and state.media_local_path:
             capture.attach_to_recording(session, state.media_local_path)
-        await websocket.send_json({"type": "CAPTURE_STOPPED", "data": session.model_dump(mode="json") if session else {}})
+        payload = session.model_dump(mode="json") if session else {}
+        payload.update(
+            {
+                "media_url": state.media_url,
+                "media_local_path": state.media_local_path,
+                "media_sync_error": state.media_sync_error,
+            }
+        )
+        await websocket.send_json({"type": "CAPTURE_STOPPED", "data": payload})
     elif msg_type == "CAPTURE_NOTE":
         note = str(data.get("note") or "")[:500]
         session = await capture.add_note(note)

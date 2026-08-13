@@ -2023,14 +2023,18 @@ function connectWs() {
     if (msg.type === 'CAPTURE_STARTED') {
       activeSession.value = msg.data
       captureStatusKind.value = 'success'
-      captureStatus.value = '云台已确认在 0°，录制已开始。'
+      captureStatus.value = '录制已开始。'
     }
     if (msg.type === 'CAPTURE_STOPPED') {
       activeSession.value = null
-      captureStatusKind.value = 'success'
-      captureStatus.value = robot.value.media_local_path
-        ? `视频已保存：${shortPath(robot.value.media_local_path)}`
-        : '录制已停止。'
+      const localPath = msg.data?.media_local_path || robot.value.media_local_path
+      const syncError = msg.data?.media_sync_error || robot.value.media_sync_error
+      captureStatusKind.value = syncError ? 'danger' : 'success'
+      captureStatus.value = syncError
+        ? `机器人录制成功，但保存到 Windows 失败：${humanError(syncError)}`
+        : localPath
+          ? `视频已保存：${shortPath(localPath)}`
+          : '机器人录制已停止。'
     }
     if (msg.type === 'JOB_UPDATED' || msg.type === 'JOB_CREATED') {
       refreshJobs()
@@ -2043,6 +2047,9 @@ function connectWs() {
         captureStatusKind.value = 'success'
         captureStatus.value = `照片已保存：${shortPath(msg.data.local_media_item.path)}`
         log(`机器人照片已保存：${shortPath(msg.data.local_media_item.path)}`)
+      } else if (!msg.data?.media_sync_error && !robot.value.media_sync_error) {
+        captureStatusKind.value = 'success'
+        captureStatus.value = '机器人已完成拍照。'
       }
       refreshMedia(); refreshVault()
     }
@@ -2050,7 +2057,13 @@ function connectWs() {
       log(`机器人媒体已保存：${shortPath(msg.data?.media_item?.path)}`)
       refreshMedia(); refreshVault()
     }
-    if (msg.type === 'ROBOT_MEDIA_SYNC_FAILED') log(`机器人媒体同步失败：${humanError(msg.data?.error || '未知错误')}`)
+    if (msg.type === 'ROBOT_MEDIA_SYNC_FAILED') {
+      const action = msg.data?.kind_hint === 'image' ? '拍照' : '录制'
+      const error = humanError(msg.data?.error || '未知错误')
+      captureStatusKind.value = 'danger'
+      captureStatus.value = `机器人${action}成功，但保存到 Windows 失败：${error}`
+      log(`机器人${action}成功，但保存到 Windows 失败：${error}`)
+    }
     // Deliberately does not clear cruiseIssues: this event is published before the start
     // response returns, and clearing here would race away the validation warnings it carries.
     if (msg.type === 'CRUISE_STARTED') cruiseRun.value = msg.data
@@ -2631,7 +2644,7 @@ function pingBackend() { sendWs('PING') }
 function setCameraAngle() { sendWs('ROBOT_CAMERA_ANGLE', { angle: cameraAngle.value }) }
 function captureStart() {
   captureStatusKind.value = 'muted'
-  captureStatus.value = '正在将云台回到 0°并开始录制…'
+  captureStatus.value = '正在开始录制…'
   sendWs('CAPTURE_START', { title: captureTitle.value })
 }
 function captureStop() {
@@ -2641,7 +2654,7 @@ function captureStop() {
 }
 function capturePhoto() {
   captureStatusKind.value = 'muted'
-  captureStatus.value = '正在将云台回到 0°、拍照并保存到 Windows…'
+  captureStatus.value = '正在拍照并保存到 Windows…'
   sendWs('ROBOT_CAPTURE_PHOTO')
 }
 function captureNoteSend() { sendWs('CAPTURE_NOTE', { note: captureNote.value }); captureNote.value = '' }

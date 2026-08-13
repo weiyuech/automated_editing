@@ -2,8 +2,8 @@ import json
 
 import pytest
 
-from automated_video_editing_backend.core.events import EventHub
 from automated_video_editing_backend.core.diagnostics import safe_url
+from automated_video_editing_backend.core.events import EventHub
 from automated_video_editing_backend.core.models import (
     CameraAngle,
     MediaItem,
@@ -12,12 +12,12 @@ from automated_video_editing_backend.core.models import (
     RobotMode,
     RobotState,
 )
+from automated_video_editing_backend.services.media import resolve_robot_media_url
 from automated_video_editing_backend.services.robot import (
     HardwareRobotAdapter,
     RobotService,
     refuse_if_unfit_to_drive,
 )
-from automated_video_editing_backend.services.media import resolve_robot_media_url
 
 
 @pytest.mark.asyncio
@@ -70,13 +70,13 @@ async def test_hardware_adapter_uses_documented_websocket_protocol():
                 await adapter._handle_message(json.dumps({
                     "robot_video_record": {
                         **payload["video_record"],
-                        "status": "ok",
+                        "status": " OK ",
                         "url": "robot://video.mp4",
                     }
                 }))
             elif "take_photo" in payload:
                 await adapter._handle_message(json.dumps({
-                    "robot_take_photo": {"status": "ok", "url": "robot://photo.jpg"}
+                    "robot_take_photo": {"status": "Ok", "url": "robot://photo.jpg"}
                 }))
 
         async def close(self):
@@ -113,6 +113,8 @@ async def test_hardware_adapter_uses_documented_websocket_protocol():
         assert state.recording is True
         photo = await adapter.capture_photo()
         assert photo["url"] == "robot://photo.jpg"
+        state = await adapter.stop_recording()
+        assert state.recording is False
 
         assert {"get_map_list": "all"} in received
         assert {"set_switch_map": "map1"} in received
@@ -121,6 +123,7 @@ async def test_hardware_adapter_uses_documented_websocket_protocol():
             "set_goal": {"path_name": "path1", "goal_id": 3, "goal_object": "car"}
         } in received
         assert {"video_record": {"start": 0, "resolution": 4}} in received
+        assert {"video_record": {"stop": 0}} in received
         assert {"take_photo": {"counter": 1, "gap": 0}} in received
         assert adapter.state.object_status == "failed"
         assert adapter.state.battery == 85
@@ -228,8 +231,8 @@ async def test_zero_yaw_is_a_real_gimbal_start_angle():
 
 
 @pytest.mark.asyncio
-async def test_photo_centers_before_shooting_and_clears_stale_media():
-    class CenteringAdapter:
+async def test_photo_keeps_current_angle_and_clears_stale_media():
+    class AngleTrackingAdapter:
         def __init__(self):
             self.state = RobotState(
                 connected=True,
@@ -259,13 +262,67 @@ async def test_photo_centers_before_shooting_and_clears_stale_media():
         async def download_url(self, url, metadata=None, filename_prefix=""):
             return MediaItem(path="C:/downloads/new.jpg", kind="image", metadata=metadata or {})
 
-    adapter = CenteringAdapter()
+    adapter = AngleTrackingAdapter()
     result = await RobotService(EventHub(), adapter=adapter, media=FakeMedia()).capture_photo()
 
-    assert adapter.calls == [("angle", 0.0), ("photo", 0.0)]
+    assert adapter.calls == [("photo", -90)]
     assert result["local_media_item"]["path"] == "C:/downloads/new.jpg"
     assert adapter.state.media_url is None
     assert adapter.state.media_local_path == "C:/downloads/new.jpg"
+
+
+@pytest.mark.asyncio
+async def test_normal_recording_keeps_current_gimbal_angle():
+    class AngleTrackingAdapter:
+        def __init__(self):
+            self.state = RobotState(connected=True, yaw=135.0)
+            self.calls = []
+
+        async def status(self):
+            return self.state
+
+        async def set_camera_angle(self, angle):
+            self.calls.append(("angle", angle.angle))
+            self.state.yaw = angle.angle
+            return self.state
+
+        async def start_recording(self):
+            self.calls.append(("record", self.state.yaw))
+            self.state.recording = True
+            return self.state
+
+    adapter = AngleTrackingAdapter()
+    await RobotService(EventHub(), adapter=adapter).start_recording()
+
+    assert adapter.calls == [("record", 135.0)]
+
+
+@pytest.mark.asyncio
+async def test_download_failure_does_not_turn_successful_recording_into_capture_failure():
+    class RecordingAdapter:
+        def __init__(self):
+            self.websocket_url = "ws://10.73.2.199:8765"
+            self.state = RobotState(connected=True, recording=True)
+
+        async def status(self):
+            return self.state
+
+        async def stop_recording(self):
+            self.state.recording = False
+            self.state.media_url = "http://192.168.1.201:82/video.mp4"
+            return self.state
+
+    class FailingMedia:
+        async def download_url(self, *_args, **_kwargs):
+            raise ConnectionError("无法连接到远程服务器")
+
+    adapter = RecordingAdapter()
+    state = await RobotService(EventHub(), adapter=adapter, media=FailingMedia()).stop_recording()
+
+    assert state.recording is False
+    assert state.media_url == "http://192.168.1.201:82/video.mp4"
+    assert state.media_local_path is None
+    assert state.media_sync_error == "无法连接到远程服务器"
 
 
 def _heartbeat(adapter, **blocks):
