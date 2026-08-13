@@ -6,6 +6,7 @@ from abc import ABC, abstractmethod
 from contextlib import suppress
 from typing import Any, TYPE_CHECKING
 
+from automated_video_editing_backend.core.diagnostics import log_event
 from automated_video_editing_backend.core.events import EventHub
 from automated_video_editing_backend.core.models import (
     CameraAngle,
@@ -19,6 +20,11 @@ from automated_video_editing_backend.core.models import (
 if TYPE_CHECKING:
     from automated_video_editing_backend.core.models import MediaItem
     from automated_video_editing_backend.services.media import MediaService
+
+
+CENTER_YAW = 0.0
+CENTER_TOLERANCE_DEG = 2.0
+CENTER_TIMEOUT_S = 20.0
 
 
 class RobotAdapter(ABC):
@@ -281,15 +287,17 @@ class HardwareRobotAdapter(RobotAdapter):
         raise ValueError("Manual movement is not defined by the hardware websocket protocol")
 
     async def set_camera_angle(self, angle: CameraAngle) -> RobotState:
+        yaw_start = self.state.yaw if self.state.yaw is not None else self.state.camera_angle
+        pitch = self.state.pitch if self.state.pitch is not None else 0
         payload = {
             "gimbal_control": {
                 "mode": 0,
-                "yaw_start": self.state.yaw or self.state.camera_angle,
+                "yaw_start": yaw_start,
                 "yaw_speed": 5,
                 "yaw_end": angle.angle,
-                "pitch_start": self.state.pitch or 0,
+                "pitch_start": pitch,
                 "pitch_speed": 0,
-                "pitch_end": self.state.pitch or 0,
+                "pitch_end": pitch,
                 "zoom_start": 1,
                 "zoom_speed": 0,
                 "zoom_end": 1,
@@ -309,9 +317,11 @@ class HardwareRobotAdapter(RobotAdapter):
             "robot_video_record",
             timeout_s=8.0,
         )
-        if isinstance(response, dict):
-            self.state.recording = response.get("status") == "ok"
-            self.state.media_url = str(response.get("url") or "") or self.state.media_url
+        if not isinstance(response, dict) or response.get("status") != "ok":
+            self.state.recording = False
+            raise ValueError(f"机器人拒绝开始录制：{_response_error(response)}")
+        self.state.recording = True
+        self.state.media_url = str(response.get("url") or "") or self.state.media_url
         self.state.last_command = "video_record:start"
         self._touch()
         await self._publish_state()
@@ -323,9 +333,12 @@ class HardwareRobotAdapter(RobotAdapter):
             "robot_video_record",
             timeout_s=8.0,
         )
-        if isinstance(response, dict):
-            self.state.recording = False if response.get("status") == "ok" else self.state.recording
-            self.state.media_url = str(response.get("url") or "") or self.state.media_url
+        if not isinstance(response, dict) or response.get("status") != "ok":
+            raise ValueError(f"机器人拒绝停止录制：{_response_error(response)}")
+        self.state.recording = False
+        self.state.media_url = str(response.get("url") or "") or self.state.media_url
+        if not self.state.media_url:
+            raise ValueError("机器人停止了录制，但没有返回视频地址")
         self.state.last_command = "video_record:stop"
         self._touch()
         await self._publish_state()
@@ -337,8 +350,11 @@ class HardwareRobotAdapter(RobotAdapter):
             "robot_take_photo",
             timeout_s=8.0,
         )
-        if isinstance(response, dict):
-            self.state.media_url = str(response.get("url") or "") or self.state.media_url
+        if not isinstance(response, dict) or response.get("status") != "ok":
+            raise ValueError(f"机器人拍照失败：{_response_error(response)}")
+        self.state.media_url = str(response.get("url") or "")
+        if not self.state.media_url:
+            raise ValueError("机器人报告拍照成功，但没有返回照片地址")
         self.state.last_command = "take_photo"
         self._touch()
         await self._publish_state()
@@ -360,7 +376,18 @@ class HardwareRobotAdapter(RobotAdapter):
             self._pending[response_key] = future
             try:
                 await self._send(payload)
-                return await asyncio.wait_for(future, timeout=timeout_s)
+                try:
+                    return await asyncio.wait_for(future, timeout=timeout_s)
+                except TimeoutError as exc:
+                    log_event(
+                        "error",
+                        "robot.reply.timeout",
+                        response_key=response_key,
+                        timeout_seconds=timeout_s,
+                    )
+                    raise TimeoutError(
+                        f"等待机器人回复超时：{response_key}（{timeout_s:g} 秒）"
+                    ) from exc
             finally:
                 if self._pending.get(response_key) is future:
                     self._pending.pop(response_key, None)
@@ -370,6 +397,7 @@ class HardwareRobotAdapter(RobotAdapter):
         if not self._socket or not self.state.connected:
             raise ConnectionError(self.state.error or "Robot websocket is not connected")
         async with self._send_lock:
+            log_event("info", "robot.command.sent", payload=payload)
             await self._socket.send(json.dumps(payload, ensure_ascii=False))
 
     def _start_connection_loop(self) -> None:
@@ -420,6 +448,7 @@ class HardwareRobotAdapter(RobotAdapter):
                 self.state.error = None
                 self._touch()
                 await self._publish_state()
+                log_event("info", "robot.websocket.connected", websocket_url=self.websocket_url)
                 await self._receive_messages(socket)
             except asyncio.CancelledError:
                 raise
@@ -438,6 +467,7 @@ class HardwareRobotAdapter(RobotAdapter):
                 self._touch()
                 self._fail_pending(exc)
                 await self._publish_state()
+                log_event("error", "robot.websocket.error", error=str(exc), websocket_url=self.websocket_url)
                 await asyncio.sleep(self._reconnect_delay_s)
                 self._reconnect_delay_s = min(
                     self._max_reconnect_delay_s,
@@ -460,6 +490,10 @@ class HardwareRobotAdapter(RobotAdapter):
             return
         if not isinstance(payload, dict):
             return
+
+        replies = {key: value for key, value in payload.items() if key.startswith("robot_")}
+        if replies:
+            log_event("info", "robot.reply.received", reply=replies)
 
         resolved = False
         for key, future in list(self._pending.items()):
@@ -521,7 +555,8 @@ class HardwareRobotAdapter(RobotAdapter):
             self.state.yaw = _maybe_float(gimbal.get("yaw"))
             self._heartbeat_yaw = self.state.yaw
             self.state.pitch = _maybe_float(gimbal.get("pitch"))
-            self.state.camera_angle = self.state.yaw or self.state.camera_angle
+            if self.state.yaw is not None:
+                self.state.camera_angle = self.state.yaw
 
         record = payload.get("robot_video_record")
         if isinstance(record, dict):
@@ -625,61 +660,127 @@ class RobotService:
 
     async def set_camera_angle(self, angle: CameraAngle) -> RobotState:
         state = await self.adapter.set_camera_angle(angle)
+        log_event("info", "gimbal.commanded", target_yaw=angle.angle)
         await self.events.publish("ROBOT_STATE", state.model_dump(mode="json"))
         return state
 
-    async def start_recording(self) -> RobotState:
+    async def center_camera(self) -> RobotState:
+        """Put the lens at physical 0° and confirm it before a normal capture."""
+        before = self.heartbeat_yaw()
+        log_event("info", "gimbal.center.started", heartbeat_yaw=before)
+        state = await self.adapter.set_camera_angle(CameraAngle(angle=CENTER_YAW))
+        deadline = asyncio.get_running_loop().time() + CENTER_TIMEOUT_S
+        while asyncio.get_running_loop().time() < deadline:
+            yaw = self.heartbeat_yaw()
+            if yaw is not None and abs(yaw - CENTER_YAW) <= CENTER_TOLERANCE_DEG:
+                log_event("info", "gimbal.center.confirmed", heartbeat_yaw=yaw)
+                await self.events.publish("ROBOT_STATE", state.model_dump(mode="json"))
+                return state
+            await asyncio.sleep(0.2)
+        yaw = self.heartbeat_yaw()
+        log_event("error", "gimbal.center.failed", heartbeat_yaw=yaw)
+        raise ValueError(f"云台未能回到 0°（最后心跳角度：{yaw if yaw is not None else '未知'}°）")
+
+    async def _clear_media_state(self) -> None:
+        state = await self.adapter.status()
+        state.media_url = None
+        state.media_local_path = None
+        state.media_sync_error = None
+        await self.events.publish("ROBOT_STATE", state.model_dump(mode="json"))
+
+    async def start_recording(self, center_camera: bool = True) -> RobotState:
+        await self._clear_media_state()
+        if center_camera:
+            await self.center_camera()
         state = await self.adapter.start_recording()
+        log_event("info", "capture.recording.started", recording=state.recording)
         await self.events.publish("ROBOT_STATE", state.model_dump(mode="json"))
         return state
 
     async def stop_recording(self, sync_media: bool = True) -> RobotState:
         state = await self.adapter.stop_recording()
         if sync_media:
-            await self._sync_robot_media(state.media_url, "video")
+            await self._sync_robot_media(state.media_url, "video", required=True)
+        log_event(
+            "info",
+            "capture.recording.stopped",
+            robot_url=state.media_url,
+            local_path=state.media_local_path,
+        )
         await self.events.publish("ROBOT_STATE", state.model_dump(mode="json"))
         return state
 
     async def capture_photo(self) -> dict[str, Any]:
+        await self._clear_media_state()
+        await self.center_camera()
         result = await self.adapter.capture_photo()
-        synced = await self._sync_robot_media(str(result.get("url") or ""), "image")
-        if synced:
-            result["local_media_item"] = synced.model_dump(mode="json")
+        synced = await self._sync_robot_media(str(result.get("url") or ""), "image", required=True)
+        result["local_media_item"] = synced.model_dump(mode="json")
+        log_event(
+            "info",
+            "capture.photo.completed",
+            robot_url=result.get("url"),
+            local_path=synced.path,
+        )
         await self.events.publish("ROBOT_PHOTO", result)
         return result
 
-    async def _sync_robot_media(self, robot_url: str | None, kind_hint: str) -> MediaItem | None:
+    async def _sync_robot_media(
+        self,
+        robot_url: str | None,
+        kind_hint: str,
+        *,
+        required: bool = False,
+    ) -> MediaItem | None:
+        from automated_video_editing_backend.services.media import resolve_robot_media_url
+
         state = await self.adapter.status()
         state.media_sync_error = None
-        if not robot_url:
-            return None
         if not self.media:
-            state.media_sync_error = "Media service is not available"
-            await self.events.publish("ROBOT_STATE", state.model_dump(mode="json"))
+            error = "媒体服务不可用，无法保存机器人文件"
+            await self._media_sync_failed(state, robot_url or "", kind_hint, error)
+            if required:
+                raise ValueError(error)
             return None
 
         try:
+            download_url = resolve_robot_media_url(
+                str(robot_url or ""),
+                str(getattr(self.adapter, "websocket_url", "") or ""),
+            )
+            log_event(
+                "info",
+                "robot.media.download.started",
+                robot_url=robot_url,
+                resolved_url=download_url,
+                kind=kind_hint,
+            )
             item = await self.media.download_url(
-                robot_url,
+                download_url,
                 metadata={
                     "source": "data/downloads",
                     "origin": "robot_hardware",
-                    "robot_url": robot_url,
+                    "robot_url": download_url,
                     "kind_hint": kind_hint,
                 },
                 filename_prefix="robot-",
             )
         except Exception as exc:
-            state.media_sync_error = str(exc)
-            await self.events.publish("ROBOT_STATE", state.model_dump(mode="json"))
-            await self.events.publish(
-                "ROBOT_MEDIA_SYNC_FAILED",
-                {"url": robot_url, "kind_hint": kind_hint, "error": str(exc)},
-            )
+            error = str(exc)
+            await self._media_sync_failed(state, robot_url or "", kind_hint, error)
+            if required:
+                raise ValueError(f"机器人已拍摄，但保存到 Windows 失败：{error}") from exc
             return None
 
         state.media_local_path = item.path
         state.media_sync_error = None
+        log_event(
+            "info",
+            "robot.media.download.completed",
+            robot_url=robot_url,
+            local_path=item.path,
+            kind=kind_hint,
+        )
         await self.events.publish("ROBOT_STATE", state.model_dump(mode="json"))
         await self.events.publish(
             "ROBOT_MEDIA_SYNCED",
@@ -687,11 +788,38 @@ class RobotService:
         )
         return item
 
+    async def _media_sync_failed(
+        self,
+        state: RobotState,
+        robot_url: str,
+        kind_hint: str,
+        error: str,
+    ) -> None:
+        state.media_sync_error = error
+        log_event(
+            "error",
+            "robot.media.download.failed",
+            robot_url=robot_url,
+            kind=kind_hint,
+            error=error,
+        )
+        await self.events.publish("ROBOT_STATE", state.model_dump(mode="json"))
+        await self.events.publish(
+            "ROBOT_MEDIA_SYNC_FAILED",
+            {"url": robot_url, "kind_hint": kind_hint, "error": error},
+        )
+
 
 def _load_websockets() -> Any:
     import websockets
 
     return websockets
+
+
+def _response_error(response: Any) -> str:
+    if isinstance(response, dict):
+        return str(response.get("error") or response.get("message") or response.get("status") or response)
+    return str(response)
 
 
 def refuse_if_unfit_to_drive(state: RobotState | None) -> None:

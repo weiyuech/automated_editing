@@ -3,7 +3,9 @@ import json
 import pytest
 
 from automated_video_editing_backend.core.events import EventHub
+from automated_video_editing_backend.core.diagnostics import safe_url
 from automated_video_editing_backend.core.models import (
+    CameraAngle,
     MediaItem,
     MoveCommand,
     RobotGoalCommand,
@@ -15,6 +17,7 @@ from automated_video_editing_backend.services.robot import (
     RobotService,
     refuse_if_unfit_to_drive,
 )
+from automated_video_editing_backend.services.media import resolve_robot_media_url
 
 
 @pytest.mark.asyncio
@@ -130,8 +133,16 @@ async def test_robot_photo_url_syncs_through_media_service():
     class FakeAdapter:
         def __init__(self):
             self.state = RobotState(connected=True)
+            self.websocket_url = "ws://robot.local:8765"
 
         async def status(self):
+            return self.state
+
+        def heartbeat_yaw(self):
+            return self.state.yaw
+
+        async def set_camera_angle(self, angle):
+            self.state.yaw = angle.angle
             return self.state
 
         async def capture_photo(self):
@@ -168,6 +179,93 @@ async def test_robot_photo_url_syncs_through_media_service():
         "robot-",
     )]
     assert (await robot.status()).media_local_path.endswith("robot-photo.png")
+
+
+def test_robot_relative_media_paths_resolve_against_robot_host():
+    assert resolve_robot_media_url(
+        "/media/capture/video.mp4", "ws://10.73.2.199:8765/ws"
+    ) == "http://10.73.2.199:8765/media/capture/video.mp4"
+    assert resolve_robot_media_url(
+        "10.73.2.199:9000/photo.jpg", "ws://10.73.2.199:8765"
+    ) == "http://10.73.2.199:9000/photo.jpg"
+    assert resolve_robot_media_url(
+        "10.73.2.199/photo.jpg", "ws://10.73.2.199:8765"
+    ) == "http://10.73.2.199/photo.jpg"
+    assert resolve_robot_media_url(
+        "https://cdn.example/video.mp4?signature=abc", "ws://10.73.2.199:8765"
+    ) == "https://cdn.example/video.mp4?signature=abc"
+
+
+@pytest.mark.parametrize(
+    "value", ["file:///home/robot/video.mp4", "/home/robot/video.mp4", r"C:\\media\\video.mp4"]
+)
+def test_robot_filesystem_paths_are_rejected(value):
+    with pytest.raises(ValueError, match="本机文件路径"):
+        resolve_robot_media_url(value, "ws://10.73.2.199:8765")
+
+
+def test_diagnostic_urls_redact_credentials_and_signed_queries():
+    assert safe_url(
+        "https://user:password@robot.local/media/video.mp4?signature=secret"
+    ) == "https://robot.local/media/video.mp4?<redacted>"
+
+
+@pytest.mark.asyncio
+async def test_zero_yaw_is_a_real_gimbal_start_angle():
+    adapter = HardwareRobotAdapter(EventHub(), "ws://robot.local:8765")
+    adapter.state.connected = True
+    adapter.state.yaw = 0.0
+    adapter.state.camera_angle = -90.0
+    sent = []
+
+    async def fake_send(payload):
+        sent.append(payload)
+
+    adapter._send = fake_send
+    await adapter.set_camera_angle(CameraAngle(angle=15))
+
+    assert sent[0]["gimbal_control"]["yaw_start"] == 0.0
+
+
+@pytest.mark.asyncio
+async def test_photo_centers_before_shooting_and_clears_stale_media():
+    class CenteringAdapter:
+        def __init__(self):
+            self.state = RobotState(
+                connected=True,
+                yaw=-90,
+                media_url="http://robot.local/old.mp4",
+                media_local_path="C:/old.mp4",
+            )
+            self.websocket_url = "ws://robot.local:8765"
+            self.calls = []
+
+        async def status(self):
+            return self.state
+
+        def heartbeat_yaw(self):
+            return self.state.yaw
+
+        async def set_camera_angle(self, angle):
+            self.calls.append(("angle", angle.angle))
+            self.state.yaw = angle.angle
+            return self.state
+
+        async def capture_photo(self):
+            self.calls.append(("photo", self.state.yaw))
+            return {"status": "ok", "url": "http://robot.local/new.jpg"}
+
+    class FakeMedia:
+        async def download_url(self, url, metadata=None, filename_prefix=""):
+            return MediaItem(path="C:/downloads/new.jpg", kind="image", metadata=metadata or {})
+
+    adapter = CenteringAdapter()
+    result = await RobotService(EventHub(), adapter=adapter, media=FakeMedia()).capture_photo()
+
+    assert adapter.calls == [("angle", 0.0), ("photo", 0.0)]
+    assert result["local_media_item"]["path"] == "C:/downloads/new.jpg"
+    assert adapter.state.media_url is None
+    assert adapter.state.media_local_path == "C:/downloads/new.jpg"
 
 
 def _heartbeat(adapter, **blocks):
@@ -270,3 +368,13 @@ def test_a_heartbeat_without_a_record_field_leaves_the_recording_alone():
         adapter._handle_message(idle)
     )
     assert adapter.state.recording is False
+
+
+def test_zero_heartbeat_updates_camera_angle_instead_of_preserving_minus_ninety():
+    adapter = HardwareRobotAdapter(EventHub(), "ws://robot.local:8765")
+    adapter.state.camera_angle = -90.0
+
+    _heartbeat(adapter, gimbal={"yaw": 0, "pitch": 0})
+
+    assert adapter.state.yaw == 0.0
+    assert adapter.state.camera_angle == 0.0

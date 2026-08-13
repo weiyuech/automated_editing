@@ -119,6 +119,10 @@ class FakeAdapter:
         self.state.yaw = target_yaw
         return self.state
 
+    async def set_camera_angle(self, angle):
+        self.state.yaw = angle.angle
+        return self.state
+
     def heartbeat_yaw(self):
         return self.state.yaw
 
@@ -200,9 +204,9 @@ async def test_gimbal_scan_is_off_by_default_and_returns_to_centre_when_enabled(
     await cruise._task
 
     assert all(segment.scanned for segment in run.segments)
-    # Out and back, per point, ending on the angle it started from.
-    assert adapter.sweeps == [(35.0, 30.0), (20.0, 30.0), (35.0, 30.0), (20.0, 30.0)]
-    assert adapter.state.yaw == 20.0
+    # Every recording starts at physical 0°, then each point scans out and back to 0°.
+    assert adapter.sweeps == [(15.0, 30.0), (0.0, 30.0), (15.0, 30.0), (0.0, 30.0)]
+    assert adapter.state.yaw == 0.0
 
 
 @pytest.mark.asyncio
@@ -292,6 +296,27 @@ async def test_ws_refuses_manual_capture_while_a_cruise_runs():
 
     # The refusal must happen before the robot is touched.
     assert adapter.recording_calls == []
+    assert capture.active_session() is None
+
+
+@pytest.mark.asyncio
+async def test_ws_closes_capture_session_when_windows_save_fails():
+    from automated_video_editing_backend.api.ws import _handle_command
+
+    cruise, _, capture = build_cruise()
+    await capture.start("拍摄")
+    socket = FakeSocket()
+
+    class SaveFailureRobot:
+        async def stop_recording(self):
+            raise ValueError("机器人已拍摄，但保存到 Windows 失败")
+
+    class IdleCruise:
+        is_running = False
+
+    with pytest.raises(ValueError, match="保存到 Windows 失败"):
+        await _handle_command(socket, "CAPTURE_STOP", {}, SaveFailureRobot(), capture, IdleCruise())
+
     assert capture.active_session() is None
 
 

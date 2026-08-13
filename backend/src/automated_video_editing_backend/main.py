@@ -13,8 +13,9 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from automated_video_editing_backend.api.routes import build_media_file_router, build_router
 from automated_video_editing_backend.api.ws import websocket_endpoint
+from automated_video_editing_backend.core.diagnostics import configure_diagnostics, log_event
 from automated_video_editing_backend.core.events import EventHub
-from automated_video_editing_backend.core.paths import ensure_generated_dirs
+from automated_video_editing_backend.core.paths import GENERATED_DIRS, ensure_generated_dirs
 from automated_video_editing_backend.services.analysis import AnalysisService
 from automated_video_editing_backend.services.capture import CaptureService
 from automated_video_editing_backend.services.cruise import CruiseService
@@ -35,6 +36,8 @@ from automated_video_editing_backend.services.tts import TTSService
 
 def create_app() -> FastAPI:
     ensure_generated_dirs()
+    configure_diagnostics(GENERATED_DIRS["logs"] / "diagnostics.log")
+    log_event("info", "backend.started", version="0.1.1")
     events = EventHub()
     settings = SettingsService()
     media = MediaService()
@@ -68,7 +71,7 @@ def create_app() -> FastAPI:
             await framing_test.close()
             await robot.disconnect()
 
-    app = FastAPI(title="Automated Video Editing Backend", version="0.1.0", lifespan=lifespan)
+    app = FastAPI(title="Automated Video Editing Backend", version="0.1.1", lifespan=lifespan)
     app.add_middleware(
         CORSMiddleware,
         # electron-vite serves the installed renderer from file://, whose browser origin is

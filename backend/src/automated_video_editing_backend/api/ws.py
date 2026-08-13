@@ -8,6 +8,7 @@ from fastapi import WebSocket
 from starlette.websockets import WebSocketDisconnect
 
 from automated_video_editing_backend.core.events import EventHub
+from automated_video_editing_backend.core.diagnostics import log_event
 from automated_video_editing_backend.core.models import CameraAngle, CruiseRequest, MoveCommand
 from automated_video_editing_backend.core.security import require_ws_token
 from automated_video_editing_backend.services.capture import CaptureService
@@ -54,8 +55,11 @@ async def websocket_endpoint(
                 continue
             try:
                 await _handle_command(websocket, msg_type, data, robot, capture, cruise)
-            except (ConnectionError, ValueError) as exc:
-                await websocket.send_json({"type": "ERROR", "data": {"message": str(exc)}})
+            except Exception as exc:
+                log_event("error", "ui.command.failed", command=msg_type, error=str(exc))
+                await websocket.send_json(
+                    {"type": "ERROR", "data": {"message": str(exc), "command": msg_type}}
+                )
     finally:
         sender.cancel()
         with suppress(asyncio.CancelledError):
@@ -103,7 +107,13 @@ async def _handle_command(
     elif msg_type == "CAPTURE_STOP":
         if cruise.is_running:
             raise ValueError("A cruise is running; cancel it instead of stopping the recording")
-        state = await robot.stop_recording()
+        try:
+            state = await robot.stop_recording()
+        except Exception:
+            # The hardware may have stopped successfully before Windows failed to download the
+            # file. The session is still over and must not remain stuck as an active recording.
+            await capture.stop()
+            raise
         session = await capture.stop()
         if session is not None and state.media_local_path:
             capture.attach_to_recording(session, state.media_local_path)

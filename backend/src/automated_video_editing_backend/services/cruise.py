@@ -378,10 +378,11 @@ class CruiseService:
         if await self._is_recording():
             try:
                 state = await self.robot.stop_recording()
-                run.media_url = state.media_url
-                run.media_local_path = state.media_local_path
             except Exception as exc:
                 run.error = run.error or f"Stop recording failed: {exc}"
+                state = await self.robot.status()
+            run.media_url = state.media_url
+            run.media_local_path = state.media_local_path
 
         session = self.capture.active_session()
         with suppress(Exception):

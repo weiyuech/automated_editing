@@ -24,8 +24,13 @@ class FakeRobot:
         self.state.yaw = target_yaw
         return self.state
 
-    async def start_recording(self):
+    async def start_recording(self, center_camera=True):
         self.state.recording = True
+        return self.state
+
+    async def center_camera(self):
+        self.sweeps.append((0.0, "center"))
+        self.state.yaw = 0.0
         return self.state
 
     async def stop_recording(self, sync_media=True):
@@ -54,9 +59,10 @@ async def test_framing_test_is_disposable_and_never_syncs_to_media_library(tmp_p
         assert status["ready"] is True
         assert status["running"] is False
         assert preview and preview.parent == service.root
-        assert robot.sweeps[0][0] == -45
-        assert robot.sweeps[1][0] == 45
-        assert robot.sweeps[-1][0] == 12
+        assert robot.sweeps[0][0] == 0
+        assert robot.sweeps[1][0] == -45
+        assert robot.sweeps[2][0] == 45
+        assert robot.sweeps[-1][0] == 0
         assert robot.stop_sync_flags == [False]
 
         await service.discard()

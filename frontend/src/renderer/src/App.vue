@@ -172,7 +172,7 @@
               <div class="button-row">
                 <button :disabled="robot.recording || cruiseRunning" @click="captureStart">开始原地采集</button>
                 <button class="danger" :disabled="!robot.recording || cruiseRunning" @click="captureStop">停止采集</button>
-                <button :disabled="cruiseRunning" @click="sendWs('ROBOT_CAPTURE_PHOTO')">拍照</button>
+                <button :disabled="cruiseRunning" @click="capturePhoto">拍照</button>
               </div>
             </div>
             <input v-model="captureTitle" class="field compact-field" placeholder="采集标题" />
@@ -180,6 +180,7 @@
             <p v-if="robot.media_local_path" class="inline-status success">已保存到本地：{{ shortPath(robot.media_local_path) }}</p>
             <p v-else-if="robot.media_url" class="inline-status muted">机器人媒体地址：{{ robot.media_url }}</p>
             <p v-if="robot.media_sync_error" class="inline-status danger">媒体同步失败：{{ humanError(robot.media_sync_error) }}</p>
+            <p v-if="captureStatus" class="inline-status" :class="captureStatusKind">{{ captureStatus }}</p>
           </div>
         </Panel>
 
@@ -1262,6 +1263,8 @@ const selectedCalendarDate = ref(formatDateKey(todayDate))
 const activeSession = ref(null)
 const captureTitle = ref('')
 const captureNote = ref('')
+const captureStatus = ref('')
+const captureStatusKind = ref('muted')
 const cameraAngle = ref(0)
 const framingTest = ref({ running: false, ready: false, preview_id: '' })
 const framingTestBusy = ref(false)
@@ -2017,8 +2020,18 @@ function connectWs() {
   socket.onmessage = (event) => {
     const msg = JSON.parse(event.data)
     if (msg.type === 'ROBOT_STATE') robot.value = msg.data
-    if (msg.type === 'CAPTURE_STARTED') activeSession.value = msg.data
-    if (msg.type === 'CAPTURE_STOPPED') activeSession.value = null
+    if (msg.type === 'CAPTURE_STARTED') {
+      activeSession.value = msg.data
+      captureStatusKind.value = 'success'
+      captureStatus.value = '云台已确认在 0°，录制已开始。'
+    }
+    if (msg.type === 'CAPTURE_STOPPED') {
+      activeSession.value = null
+      captureStatusKind.value = 'success'
+      captureStatus.value = robot.value.media_local_path
+        ? `视频已保存：${shortPath(robot.value.media_local_path)}`
+        : '录制已停止。'
+    }
     if (msg.type === 'JOB_UPDATED' || msg.type === 'JOB_CREATED') {
       refreshJobs()
       if (msg.data?.status === 'succeeded') {
@@ -2026,7 +2039,11 @@ function connectWs() {
       }
     }
     if (msg.type === 'ROBOT_PHOTO') {
-      if (msg.data?.local_media_item) log(`机器人照片已保存：${shortPath(msg.data.local_media_item.path)}`)
+      if (msg.data?.local_media_item) {
+        captureStatusKind.value = 'success'
+        captureStatus.value = `照片已保存：${shortPath(msg.data.local_media_item.path)}`
+        log(`机器人照片已保存：${shortPath(msg.data.local_media_item.path)}`)
+      }
       refreshMedia(); refreshVault()
     }
     if (msg.type === 'ROBOT_MEDIA_SYNCED') {
@@ -2050,7 +2067,15 @@ function connectWs() {
       if (msg.type === 'CRUISE_FAILED') setCruiseStatus('danger', `巡游失败：${humanError(msg.data?.error || '未知错误')}`)
       refreshMedia(); refreshVault()
     }
-    if (msg.type === 'ERROR') { log(`错误：${humanError(msg.data?.message || '未知后端错误')}`); return }
+    if (msg.type === 'ERROR') {
+      const message = humanError(msg.data?.message || '未知后端错误')
+      if (['CAPTURE_START', 'CAPTURE_STOP', 'ROBOT_CAPTURE_PHOTO'].includes(msg.data?.command)) {
+        captureStatusKind.value = 'danger'
+        captureStatus.value = message
+      }
+      log(`错误：${message}`)
+      return
+    }
     if (!['PONG'].includes(msg.type)) log(eventLabel(msg.type))
   }
   ws.value = socket
@@ -2604,8 +2629,21 @@ async function refreshRobotPaths(showStatus = true, allowBusy = false) {
 
 function pingBackend() { sendWs('PING') }
 function setCameraAngle() { sendWs('ROBOT_CAMERA_ANGLE', { angle: cameraAngle.value }) }
-function captureStart() { sendWs('CAPTURE_START', { title: captureTitle.value }) }
-function captureStop() { sendWs('CAPTURE_STOP') }
+function captureStart() {
+  captureStatusKind.value = 'muted'
+  captureStatus.value = '正在将云台回到 0°并开始录制…'
+  sendWs('CAPTURE_START', { title: captureTitle.value })
+}
+function captureStop() {
+  captureStatusKind.value = 'muted'
+  captureStatus.value = '正在停止录制并保存到 Windows…'
+  sendWs('CAPTURE_STOP')
+}
+function capturePhoto() {
+  captureStatusKind.value = 'muted'
+  captureStatus.value = '正在将云台回到 0°、拍照并保存到 Windows…'
+  sendWs('ROBOT_CAPTURE_PHOTO')
+}
 function captureNoteSend() { sendWs('CAPTURE_NOTE', { note: captureNote.value }); captureNote.value = '' }
 
 async function importMedia() {

@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import re
 from pathlib import Path
-from urllib.parse import unquote, urlparse
+from urllib.parse import unquote, urljoin, urlparse, urlunparse
 from uuid import uuid4
 
 import httpx
@@ -29,6 +29,47 @@ DOWNLOAD_EXT_BY_CONTENT_TYPE = {
     "image/webp": ".webp",
 }
 MEDIA_EXTS = VIDEO_EXTS | AUDIO_EXTS | IMAGE_EXTS
+
+
+def resolve_robot_media_url(raw_url: str, robot_websocket_url: str) -> str:
+    """Turn a robot response into a URL the desktop can actually download.
+
+    Website imports already arrive as complete HTTP(S) URLs and do not use this function.
+    Robot firmware may instead return a complete URL, a host/path without a scheme, or a path
+    relative to its websocket endpoint. A filesystem URI is never reachable across machines and
+    is rejected with an explicit error instead of being mistaken for a successful recording.
+    """
+    value = str(raw_url or "").strip()
+    if not value:
+        raise ValueError("机器人成功响应中没有媒体地址")
+    local_posix = ("/home/", "/tmp/", "/var/", "/mnt/", "/Users/")
+    if (
+        value.lower().startswith("file:")
+        or re.match(r"^[a-zA-Z]:[\\/]", value)
+        or value.startswith("\\\\")
+        or value.startswith(local_posix)
+    ):
+        raise ValueError("机器人返回了其本机文件路径；请让机器人返回可下载的 HTTP(S) 地址")
+
+    parsed = urlparse(value)
+    if parsed.scheme in {"http", "https"}:
+        return value
+    if parsed.scheme:
+        raise ValueError(f"机器人返回了不支持的媒体地址协议：{parsed.scheme}")
+
+    socket = urlparse(str(robot_websocket_url or "").strip())
+    if socket.scheme not in {"ws", "wss"} or not socket.hostname:
+        raise ValueError("无法根据机器人 WebSocket 地址解析媒体下载地址")
+    download_scheme = "https" if socket.scheme == "wss" else "http"
+    netloc = socket.netloc.rsplit("@", 1)[-1]
+    base = urlunparse((download_scheme, netloc, "/", "", "", ""))
+
+    # Some firmware omits only the scheme: `10.73.2.199:8000/media/file.mp4`.
+    if re.match(r"^(?:\[[0-9a-fA-F:]+\]|[^/:\s]+):\d+(?:/|$)", value):
+        return f"{download_scheme}://{value}"
+    if re.match(r"^(?:\d{1,3}\.){3}\d{1,3}(?:/|$)", value):
+        return f"{download_scheme}://{value}"
+    return urljoin(base, value)
 
 
 def _content_type(content_type: str | None) -> str:
@@ -261,22 +302,31 @@ class MediaService:
         if parsed.scheme not in {"http", "https"}:
             raise ValueError("Only direct http(s) media URLs are supported")
 
-        async with httpx.AsyncClient(follow_redirects=True, timeout=60) as client:
-            async with client.stream("GET", url) as response:
-                response.raise_for_status()
-                content_type = response.headers.get("content-type")
-                if not _is_supported_download(str(response.url), content_type):
-                    raise ValueError("Only direct video, audio, or image URLs are supported")
-                target = generated_path(
-                    "data",
-                    "downloads",
-                    f"{filename_prefix}{_safe_download_name(str(response.url), content_type)}",
-                )
-                target.parent.mkdir(parents=True, exist_ok=True)
-                with target.open("wb") as handle:
-                    async for chunk in response.aiter_bytes():
-                        if chunk:
-                            handle.write(chunk)
+        target: Path | None = None
+        try:
+            async with httpx.AsyncClient(follow_redirects=True, timeout=60) as client:
+                async with client.stream("GET", url) as response:
+                    response.raise_for_status()
+                    content_type = response.headers.get("content-type")
+                    if not _is_supported_download(str(response.url), content_type):
+                        raise ValueError("Only direct video, audio, or image URLs are supported")
+                    target = generated_path(
+                        "data",
+                        "downloads",
+                        f"{filename_prefix}{_safe_download_name(str(response.url), content_type)}",
+                    )
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    with target.open("wb") as handle:
+                        async for chunk in response.aiter_bytes():
+                            if chunk:
+                                handle.write(chunk)
+
+            if not target.is_file() or target.stat().st_size == 0:
+                raise ValueError("下载完成但服务器返回了空文件")
+        except Exception:
+            if target:
+                target.unlink(missing_ok=True)
+            raise
 
         kind = self.infer_kind(target)
         item_metadata = {"source": "data/downloads", "source_url": url, "role": role_for_kind(kind)}

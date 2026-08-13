@@ -302,7 +302,8 @@ def build_router(
             )
         try:
             state = await robot.stop_recording()
-        except ConnectionError as exc:
+        except Exception as exc:
+            await capture.stop()
             raise HTTPException(status_code=503, detail=str(exc)) from exc
         session = await capture.stop()
         if session is not None and state.media_local_path:
