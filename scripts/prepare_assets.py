@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Fetch the assets the app needs but does not carry in source: subtitle fonts and an FFmpeg
-that can draw text.
+"""Fetch assets the app needs but does not carry in source: subtitle fonts, the local semantic
+model, and an FFmpeg that can draw text.
 
 Two things here are not obvious and are the reason this script exists rather than a README
 paragraph telling someone to download three files.
@@ -19,6 +19,7 @@ variable fonts, so it takes that default. Each is therefore pinned to a static w
 which is a modification, which is why the licences are checked below before it happens.
 
 Run:  python scripts/prepare_assets.py [--platform darwin-x86_64|win64|linux64] [--force]
+      python scripts/prepare_assets.py --semantic-only
 """
 
 from __future__ import annotations
@@ -42,6 +43,10 @@ LICENSE_DIR = ROOT / "backend" / "src" / "automated_video_editing_backend" / "as
 # Also outside FONT_DIR, for the same reason: these are WOFF2, which libass cannot parse.
 PREVIEW_DIR = ROOT / "backend" / "src" / "automated_video_editing_backend" / "assets" / "font_previews"
 VENDOR_DIR = ROOT / "backend" / "vendor" / "ffmpeg"
+SEMANTIC_DIR = (
+    ROOT / "backend" / "src" / "automated_video_editing_backend" / "assets"
+    / "semantic" / "bge-small-zh-v1.5"
+)
 
 # Weight to pin a variable font to. 700 is the usual subtitle weight: heavy enough to hold an
 # outline against moving footage without the counters filling in at small sizes.
@@ -149,6 +154,27 @@ FFMPEG_BUILDS = {
     "linux64": {
         "url": "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n8.1-latest-linux64-gpl-8.1.tar.xz",
         "member": "ffmpeg",
+    },
+}
+
+# CPU-only semantic matching. This is the MIT-licensed BAAI model converted to ONNX by the
+# Hugging Face Transformers.js maintainer and pinned to one verified revision. INT8 is enough
+# for short point descriptions and keeps the installed footprint below 25 MB.
+SEMANTIC_ASSETS = {
+    "model_int8.onnx": {
+        "url": "https://huggingface.co/Xenova/bge-small-zh-v1.5/resolve/75c43b0/onnx/model_int8.onnx?download=true",
+        "sha256": "b9837c19ce154ff0726d398ee77abbc03a7faf0476c6f93016c84e531be7ebb5",
+    },
+    "tokenizer.json": {
+        "url": "https://huggingface.co/Xenova/bge-small-zh-v1.5/resolve/75c43b0/tokenizer.json?download=true",
+        "sha256": "48cea5d44424912a6fd1ea647bf4fe50b55ab8b1e5879c3275f80e339e8fae26",
+    },
+    "LICENSE-BAAI-BGE.txt": {
+        "url": "https://raw.githubusercontent.com/FlagOpen/FlagEmbedding/master/LICENSE",
+        "sha256": "587a673933425dbc36ec61268d3b954051b2d3ef3c9b322ede357976055ffdd5",
+        # Kept with the model and checked at fetch time so a licensing change cannot enter a
+        # release silently.
+        "contains": "MIT License",
     },
 }
 
@@ -385,6 +411,28 @@ def verify_ffmpeg(path: Path) -> None:
     print(f"    ok: {result.stdout.splitlines()[0][:60]} (libass present)")
 
 
+def prepare_semantic(force: bool) -> None:
+    """Fetch and verify the offline Chinese embedding model and its tokenizer."""
+    SEMANTIC_DIR.mkdir(parents=True, exist_ok=True)
+    for filename, spec in SEMANTIC_ASSETS.items():
+        target = SEMANTIC_DIR / filename
+        if target.exists() and not force:
+            payload = target.read_bytes()
+        else:
+            print(f"  semantic/{filename}: fetching")
+            payload = fetch(spec["url"])
+            target.write_bytes(payload)
+        digest = spec.get("sha256")
+        if digest and hashlib.sha256(payload).hexdigest() != digest:
+            target.unlink(missing_ok=True)
+            raise SystemExit(f"semantic/{filename}: checksum mismatch")
+        marker = spec.get("contains")
+        if marker and marker not in payload.decode("utf-8", errors="replace"):
+            target.unlink(missing_ok=True)
+            raise SystemExit(f"semantic/{filename}: expected licence marker is missing")
+        print(f"    ok: {filename} ({len(payload) / 1e6:.1f} MB)")
+
+
 def current_platform() -> str:
     if sys.platform == "darwin":
         return "darwin-x86_64"
@@ -399,19 +447,24 @@ def main() -> int:
     parser.add_argument("--force", action="store_true", help="refetch even when present")
     parser.add_argument("--fonts-only", action="store_true")
     parser.add_argument("--ffmpeg-only", action="store_true")
+    parser.add_argument("--semantic-only", action="store_true")
     args = parser.parse_args()
 
-    if not args.ffmpeg_only:
+    selected = args.fonts_only or args.ffmpeg_only or args.semantic_only
+    if not selected or args.fonts_only:
         print("Fonts:")
         for spec in FONTS:
             prepare_font(spec, args.force)
-    if not args.fonts_only:
+    if not selected or args.ffmpeg_only:
         print("FFmpeg:")
         binary = prepare_ffmpeg(args.platform, args.force)
         if binary and args.platform == current_platform():
             verify_ffmpeg(binary)
         elif binary:
             print(f"    fetched for {args.platform}; not verifiable from {current_platform()}")
+    if not selected or args.semantic_only:
+        print("Semantic model:")
+        prepare_semantic(args.force)
     print("Done.")
     return 0
 

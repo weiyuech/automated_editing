@@ -27,7 +27,6 @@ async def test_sessions_notes_and_markers_survive_a_restart(tmp_path):
     # Nothing can still be recording after a restart.
     assert sessions[0].active is False
     assert reloaded.active_session() is None
-    assert reloaded.collect_notes() == ["这款鞋卖得最好"]
 
 
 @pytest.mark.asyncio

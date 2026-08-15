@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import random
 from pathlib import Path
 from typing import NamedTuple
@@ -12,12 +13,14 @@ from automated_video_editing_backend.core.models import (
     EditJobRequest,
     EditTimeline,
     MediaItem,
+    MusicAnalysis,
     SubtitleCue,
     SubtitleTrack,
     TimelineClip,
 )
 from automated_video_editing_backend.core.paths import generated_path
 from automated_video_editing_backend.services import slots, subtitles
+from automated_video_editing_backend.services.semantic import SemanticAlignment
 
 EPSILON = 0.05
 # Kept for the no-analysis fallback, where a source with no detected scenes still has to yield
@@ -88,6 +91,8 @@ class EditPlanner:
         voiceover: MediaItem | None = None,
         voiceover_duration: float | None = None,
         source_size: tuple[int, int] | None = None,
+        music_analysis: MusicAnalysis | None = None,
+        semantic_alignment: SemanticAlignment | None = None,
     ) -> EditTimeline:
         warnings: list[str] = []
         analysis_by_media = {item.media_id: item for item in analyses}
@@ -99,15 +104,57 @@ class EditPlanner:
         rng = random.Random(seed) if seed is not None else None
 
         target = float(getattr(request, "target_duration_seconds", 30.0) or 30.0)
-        scoped = self._scope(shots, request, target, pace, rng, warnings)
-        duration = self._running_time(scoped, target, voiceover_duration, warnings)
+        # Duration belongs to the complete assigned recording. Scoping first used to choose
+        # enough points for a 30-second request, discover a 45-second narration afterwards,
+        # then loop those points while unused forward footage remained outside the scope.
+        duration = self._running_time(shots, target, voiceover_duration, warnings)
+        scoped = self._scope(shots, request, duration, pace, rng, warnings)
 
-        beats = self._beats(analyses) if request.beat_sync and music else []
-        energy = self._energy(analyses) if contour == "follow_energy" else []
+        music_view = self._music_view(
+            music_analysis or self._legacy_music(analyses),
+            duration,
+            request.music_window_rank,
+            request.editorial_preset or "smart",
+        ) if music else None
+        beats = music_view["cut_events"] if request.beat_sync and music_view else []
+        energy = music_view["energy"] if contour == "follow_energy" and music_view else []
         longest = max((shot.length for shot in scoped), default=0.0)
         grid = slots.build_slots(duration, pace, contour, beats, energy, longest)
 
-        placed = self._fill(grid, scoped, request, rng, warnings)
+        semantic_diagnostics = (
+            semantic_alignment.diagnostics() if semantic_alignment is not None
+            else SemanticAlignment(reason="not evaluated").diagnostics()
+        )
+        placed: list[Placed] | None = None
+        if semantic_alignment is not None and semantic_alignment.active:
+            semantic_rng = self._copy_rng(rng)
+            semantic_warnings: list[str] = []
+            semantic_scoped = self._scope(
+                shots,
+                request,
+                duration,
+                pace,
+                semantic_rng,
+                semantic_warnings,
+                required_labels=semantic_alignment.mandatory_labels,
+            )
+            semantic_longest = max((shot.length for shot in semantic_scoped), default=0.0)
+            semantic_grid = slots.build_slots(
+                duration, pace, contour, beats, energy, semantic_longest
+            )
+            placed, problem = self._fill_semantic(
+                semantic_grid,
+                semantic_scoped,
+                semantic_alignment,
+                request,
+                semantic_rng,
+            )
+            semantic_diagnostics.update({"applied": placed is not None, "fallback_reason": problem})
+            if placed is not None:
+                warnings.extend(item for item in semantic_warnings if item not in warnings)
+        if placed is None:
+            placed = self._fill(grid, scoped, request, rng, warnings)
+            semantic_diagnostics.setdefault("applied", False)
         self._report_shortfall(placed, duration, pace, warnings)
         output = generated_path("exports", request.output_name)
         # Frame the picture before subtitle cues are wrapped. Both the renderer and libass then
@@ -125,6 +172,11 @@ class EditPlanner:
             title=request.title,
             clips=self._clips(placed),
             music_path=music.path if music else None,
+            music_start_seconds=float(music_view["start"]) if music_view else 0.0,
+            music_duration_seconds=duration if music else None,
+            music_loop=bool(music_view and music_view["loop"]),
+            music_evidence=(music_view["evidence"] if music_view else "none"),
+            editorial_preset=request.editorial_preset or "smart",
             voiceover_path=voiceover.path if voiceover else None,
             subtitles=self._subtitles(request, voiceover, width, height, warnings),
             output_width=width,
@@ -136,6 +188,33 @@ class EditPlanner:
             output_path=str(output),
             mute_original_audio=request.mute_original_audio,
             beat_sync=request.beat_sync,
+            planning_diagnostics={
+                "planner_version": 2,
+                "effective_duration_seconds": round(duration, 3),
+                "editorial_preset": request.editorial_preset or "legacy",
+                "resolved_policy": {
+                    "pace": request.pace,
+                    "contour": request.contour,
+                    "footage_mix": request.footage_mix,
+                    "emphasis": request.emphasis,
+                    "point_scope": request.point_scope,
+                    "recording_scope": request.recording_scope,
+                    "start_rotation": request.start_rotation,
+                },
+                "music": ({
+                    "evidence": music_view["evidence"],
+                    "source_duration_seconds": music_view["source_duration"],
+                    "start_seconds": music_view["start"],
+                    "duration_seconds": duration,
+                    "window_rank": request.music_window_rank,
+                    "beat_count": len(music_view["beats"]),
+                    "onset_count": len(music_view["onsets"]),
+                    "accent_count": len(music_view["accents"]),
+                    "cut_event_count": len(beats),
+                    "loop": music_view["loop"],
+                } if music_view else {"evidence": "none"}),
+                "semantic_alignment": semantic_diagnostics,
+            },
             warnings=warnings,
         )
 
@@ -254,13 +333,30 @@ class EditPlanner:
                 end = float(scene.get("end", start + FALLBACK_SHOT_SECONDS))
                 if end - start < slots.MIN_SLOT_SECONDS:
                     continue
-                shots.append(Shot(
-                    media, start, end,
-                    str(scene.get("kind") or "unknown"),
-                    str(scene.get("label") or ""),
-                    len(shots),
-                    float(scene.get("quality", 1.0) or 1.0),
-                ))
+                # Long continuous takes carry a local quality profile. Treat those windows as
+                # selectable source runs without pretending they are PySceneDetect cuts: this
+                # is what lets two candidates using different moments receive different
+                # quality/colour/hash evidence while all placement invariants stay unchanged.
+                profile = [
+                    item for item in (scene.get("quality_profile") or [])
+                    if float(item.get("end", 0.0)) - float(item.get("start", 0.0))
+                    >= slots.MIN_SLOT_SECONDS
+                ]
+                portions = profile or [{
+                    "start": start,
+                    "end": end,
+                    "quality": scene.get("quality", 1.0),
+                }]
+                for portion in portions:
+                    shots.append(Shot(
+                        media,
+                        float(portion.get("start", start)),
+                        float(portion.get("end", end)),
+                        str(scene.get("kind") or "unknown"),
+                        str(scene.get("label") or ""),
+                        len(shots),
+                        float(portion.get("quality", scene.get("quality", 1.0)) or 1.0),
+                    ))
         return shots
 
     # ── stage 1: how long the edit runs ─────────────────────────────────────────────────
@@ -277,11 +373,16 @@ class EditPlanner:
         if available + EPSILON < target:
             warnings.append(f"素材只够 {available:.0f} 秒，短于目标时长 {target:.0f} 秒")
 
-        # A narration is never cut off mid-sentence. If it outlasts the footage, the footage
-        # cycles to cover it; the target duration gives way.
+        # A narration is never cut off mid-sentence. The target gives way first; the picture
+        # cycles only when the narration outlasts the complete assigned recording.
         if voiceover_duration and available > 0:
             if voiceover_duration > duration + EPSILON:
-                warnings.append(f"画面循环 {voiceover_duration - duration:.0f} 秒以配合旁白")
+                if voiceover_duration > available + EPSILON:
+                    warnings.append(f"画面循环 {voiceover_duration - available:.0f} 秒以配合旁白")
+                else:
+                    warnings.append(
+                        f"旁白长于目标时长，成片延长至 {voiceover_duration:.0f} 秒"
+                    )
                 duration = voiceover_duration
             elif voiceover_duration + EPSILON < duration:
                 warnings.append(f"旁白比画面短 {duration - voiceover_duration:.0f} 秒，尾部无人声")
@@ -297,6 +398,7 @@ class EditPlanner:
         pace: str,
         rng: random.Random | None,
         warnings: list[str],
+        required_labels: set[str] | None = None,
     ) -> list[Shot]:
         """Narrow the footage to the recordings and places this edit uses.
 
@@ -308,7 +410,14 @@ class EditPlanner:
             shots, lambda shot: shot.media.id, request.recording_scope, target, pace, rng, None,
         )
         return self._scoped_by(
-            scoped, lambda shot: shot.label, request.point_scope, target, pace, rng, warnings,
+            scoped,
+            lambda shot: shot.label,
+            request.point_scope,
+            target,
+            pace,
+            rng,
+            warnings,
+            required_labels,
         )
 
     def _scoped_by(
@@ -320,6 +429,7 @@ class EditPlanner:
         pace: str,
         rng: random.Random | None,
         warnings: list[str] | None,
+        required: set[str] | None = None,
     ) -> list[Shot]:
         buckets: dict[str, list[Shot]] = {}
         for shot in shots:
@@ -335,6 +445,8 @@ class EditPlanner:
             return shots
 
         chosen = self._spread(names, wanted, rng)
+        if required:
+            chosen = list(dict.fromkeys([*chosen, *(name for name in names if name in required)]))
         # A thin draw would leave the picture looping while unused places sit outside the
         # scope, so the selection widens until it can actually cover the running time.
         chosen = self._widen(chosen, names, buckets, target, pace)
@@ -342,6 +454,13 @@ class EditPlanner:
             warnings.append(f"本条只用了 {len(chosen)}/{len(names)} 个点位")
         keep = set(chosen)
         return [shot for shot in shots if key(shot) in keep or not key(shot)]
+
+    def _copy_rng(self, rng: random.Random | None) -> random.Random | None:
+        if rng is None:
+            return None
+        copied = random.Random()
+        copied.setstate(rng.getstate())
+        return copied
 
     def _spread(self, names: list[str], wanted: int, rng: random.Random | None) -> list[str]:
         """Take `wanted` names spread across the whole list, not from its front."""
@@ -401,6 +520,173 @@ class EditPlanner:
     def _energy(self, analyses: list[AnalysisResult]) -> list[float]:
         return next((analysis.energy for analysis in analyses if analysis.energy), [])
 
+    def _legacy_music(self, analyses: list[AnalysisResult]) -> MusicAnalysis:
+        """Lift old AnalysisResult music fields into the richer internal shape."""
+        found = next((item for item in analyses if item.beats or item.energy), None)
+        if found is None:
+            return MusicAnalysis(evidence="unreadable")
+        return MusicAnalysis(
+            duration_seconds=found.music_duration_seconds,
+            tempo_bpm=found.tempo_bpm,
+            beats=found.beats,
+            onset_times=found.onset_times,
+            accent_times=found.accent_times,
+            onset_strength=found.onset_strength,
+            energy=found.energy,
+            section_boundaries=found.section_boundaries,
+            beat_reliability=found.beat_reliability,
+            evidence=(
+                found.music_evidence
+                if found.music_evidence != "none"
+                else ("structured" if len(found.beats) >= 2 else "ambient")
+            ),
+        )
+
+    def _music_view(
+        self, music: MusicAnalysis, duration: float, rank: int, preset: str = "smart",
+    ) -> dict:
+        """The exact excerpt used by both planning and rendering.
+
+        Candidate starts are musical boundaries and windows ending on a boundary.  Rank zero
+        chooses the strongest coherent window; later ranks create real batch variety without
+        moving to arbitrary seconds in the middle of a phrase.
+        """
+        source_duration = music.duration_seconds
+        if source_duration <= 0:
+            # Compatibility for hand-built/old test analyses that contain timestamped beats
+            # but did not record the source duration.
+            source_duration = max([duration, *music.beats, *music.onset_times], default=duration)
+        if source_duration <= duration + EPSILON:
+            beats = self._repeat_events(music.beats, source_duration, duration)
+            onsets = self._repeat_events(music.onset_times, source_duration, duration)
+            accents = self._repeat_events(music.accent_times, source_duration, duration)
+            return {
+                "start": 0.0,
+                "source_duration": source_duration,
+                "beats": beats,
+                "onsets": onsets,
+                "accents": accents,
+                "cut_events": self._cut_events(music.evidence, preset, beats, accents),
+                "energy": self._repeat_curve(music.energy, source_duration, duration),
+                "evidence": music.evidence,
+                "loop": source_duration + EPSILON < duration,
+            }
+
+        latest = source_duration - duration
+        boundaries = music.section_boundaries or [0.0, source_duration]
+        starts = {0.0, latest}
+        for boundary in boundaries:
+            starts.add(max(0.0, min(latest, boundary)))
+            starts.add(max(0.0, min(latest, boundary - duration)))
+        candidates = sorted(starts)
+        scored = sorted(
+            candidates,
+            key=lambda start: (-self._music_window_score(music, start, duration, preset), start),
+        )
+        chosen = scored[rank % len(scored)] if scored else 0.0
+        beats = [
+            round(value - chosen, 6)
+            for value in music.beats if chosen <= value <= chosen + duration
+        ]
+        onsets = [
+            round(value - chosen, 6)
+            for value in music.onset_times if chosen <= value <= chosen + duration
+        ]
+        accents = [
+            round(value - chosen, 6)
+            for value in music.accent_times if chosen <= value <= chosen + duration
+        ]
+        return {
+            "start": round(chosen, 3),
+            "source_duration": source_duration,
+            "beats": beats,
+            "onsets": onsets,
+            "accents": accents,
+            "cut_events": self._cut_events(music.evidence, preset, beats, accents),
+            "energy": self._slice_curve(music.energy, source_duration, chosen, duration),
+            "evidence": music.evidence,
+            "loop": False,
+        }
+
+    def _music_window_score(
+        self, music: MusicAnalysis, start: float, duration: float, preset: str = "smart",
+    ) -> float:
+        end = start + duration
+        boundaries = music.section_boundaries or [0.0, music.duration_seconds]
+        start_gap = min((abs(start - value) for value in boundaries), default=duration)
+        end_gap = min((abs(end - value) for value in boundaries), default=duration)
+        boundary = (math.exp(-start_gap / 2.0) + math.exp(-end_gap / 2.0)) / 2.0
+        beats = sum(1 for value in music.beats if start <= value <= end)
+        accents_in_window = sum(1 for value in music.accent_times if start <= value <= end)
+        density = min(1.0, beats / max(1.0, duration / 2.0))
+        accents = min(1.0, accents_in_window / max(1.0, duration / 3.0))
+        energy = self._curve_window(music.energy, music.duration_seconds, start, duration)
+        onset = self._curve_window(music.onset_strength, music.duration_seconds, start, duration)
+        dynamic = (max(energy) - min(energy)) if energy else 0.0
+        punch = sum(onset) / len(onset) if onset else 0.0
+        if preset == "dynamic":
+            return (
+                0.25 * boundary + 0.18 * density + 0.17 * accents
+                + 0.20 * punch + 0.12 * dynamic + 0.08 * music.beat_reliability
+            )
+        if preset == "immersive":
+            return (
+                0.42 * boundary + 0.17 * (1.0 - density) + 0.12 * (1.0 - accents)
+                + 0.15 * (1.0 - dynamic) + 0.08 * (1.0 - punch)
+                + 0.06 * music.beat_reliability
+            )
+        return (
+            0.40 * boundary + 0.18 * density + 0.12 * accents
+            + 0.10 * punch + 0.08 * dynamic + 0.12 * music.beat_reliability
+        )
+
+    def _cut_events(
+        self, evidence: str, preset: str, beats: list[float], accents: list[float],
+    ) -> list[float]:
+        if evidence != "structured":
+            return []
+        values = beats if preset != "dynamic" else [*beats, *accents]
+        return sorted({round(value, 6) for value in values if value >= 0})
+
+    def _curve_window(
+        self, curve: list[float], source_duration: float, start: float, duration: float,
+    ) -> list[float]:
+        if not curve or source_duration <= 0:
+            return []
+        left = max(0, min(len(curve) - 1, int(start / source_duration * len(curve))))
+        right = max(
+            left + 1,
+            min(len(curve), math.ceil((start + duration) / source_duration * len(curve))),
+        )
+        return curve[left:right]
+
+    def _slice_curve(
+        self, curve: list[float], source_duration: float, start: float, duration: float,
+    ) -> list[float]:
+        part = self._curve_window(curve, source_duration, start, duration)
+        if not part:
+            return []
+        low, high = min(part), max(part)
+        if high - low <= EPSILON:
+            return [0.5] * len(part)
+        return [(value - low) / (high - low) for value in part]
+
+    def _repeat_events(self, values: list[float], cycle: float, duration: float) -> list[float]:
+        if cycle <= 0:
+            return [value for value in values if value <= duration]
+        repeated: list[float] = []
+        offset = 0.0
+        while offset < duration:
+            repeated.extend(value + offset for value in values if value + offset <= duration)
+            offset += cycle
+        return repeated
+
+    def _repeat_curve(self, curve: list[float], cycle: float, duration: float) -> list[float]:
+        if not curve or cycle <= 0 or cycle >= duration:
+            return curve
+        repeats = max(1, math.ceil(duration / cycle))
+        return (curve * repeats)[: max(len(curve), int(len(curve) * duration / cycle))]
+
     # ── stage 4: filling the slots ──────────────────────────────────────────────────────
 
     def _fill(
@@ -450,6 +736,158 @@ class EditPlanner:
         for index in sorted(portions):
             placed.extend(self._place_run(portions[index], groups[index][0], rng, repeat))
         return placed
+
+    def _fill_semantic(
+        self,
+        grid: list[float],
+        shots: list[Shot],
+        alignment: SemanticAlignment,
+        request: EditJobRequest,
+        rng: random.Random | None,
+    ) -> tuple[list[Placed] | None, str]:
+        """Fill the established global rhythm inside monotonic semantic source windows.
+
+        This is a constrained wrapper around ``_fill``, not a second selector. Each chapter
+        still uses the existing quality, dwell/transit and seeded placement machinery. If a
+        described point cannot carry its whole chapter without crossing or replaying, the
+        wrapper returns no result and the caller invokes the unchanged planner.
+        """
+        records = self._semantic_slot_records(grid, alignment)
+        groups: list[tuple[str | None, list[float]]] = []
+        for label, duration in records:
+            if groups and groups[-1][0] == label:
+                groups[-1][1].append(duration)
+            else:
+                groups.append((label, [duration]))
+
+        placed: list[Placed] = []
+        cursor = 0.0
+        source_end = max((shot.end for shot in shots), default=0.0)
+        for group_index, (label, portion) in enumerate(groups):
+            candidates = self._source_after(shots, cursor, label)
+            wanted = sum(portion)
+            # `_fill` normally spreads cuts across the complete candidate range. That is good
+            # for a finished edit, but not for an intermediate semantic chapter: spreading the
+            # final matched point to the end of the recording can consume footage needed by a
+            # shorter narration's ordinary picture-led tail. Cap this chapter early enough to
+            # reserve the raw seconds still required by every later chapter. The final group is
+            # untouched and therefore keeps normal seeded spreading and diversity.
+            future_wanted = sum(
+                sum(later_portion) for _later_label, later_portion in groups[group_index + 1:]
+            )
+            if future_wanted > EPSILON:
+                candidates = self._source_through(
+                    candidates, max(cursor, source_end - future_wanted)
+                )
+            held = sum(shot.length for shot in candidates)
+            if held + EPSILON < wanted:
+                kind = f"point {label}" if label else "remaining forward footage"
+                return None, f"{kind} holds {held:.2f}s for a {wanted:.2f}s chapter"
+
+            local = self._fill(portion, candidates, request, rng, [])
+            actual = sum(item.duration for item in local)
+            if actual + max(EPSILON, wanted * 0.02) < wanted:
+                kind = f"point {label}" if label else "remaining forward footage"
+                return None, f"{kind} could place only {actual:.2f}/{wanted:.2f}s"
+            if placed and local and placed[-1].start + placed[-1].duration > local[0].start + 1e-6:
+                return None, "semantic chapters would move backwards in source time"
+            placed.extend(local)
+            if local:
+                cursor = local[-1].start + local[-1].duration
+
+        if not placed:
+            return None, "semantic schedule produced no clips"
+        planned = sum(item.duration for item in placed)
+        if planned + max(EPSILON, sum(grid) * 0.02) < sum(grid):
+            return None, f"semantic schedule is {sum(grid) - planned:.2f}s short"
+        return placed, ""
+
+    def _semantic_slot_records(
+        self, grid: list[float], alignment: SemanticAlignment
+    ) -> list[tuple[str | None, float]]:
+        """Split the global cut grid at narration chapters, then give each piece a point.
+
+        Neutral narration immediately before a matched chapter borrows that upcoming point as
+        a visual subject. It is not counted as a semantic match in diagnostics; this merely
+        prevents a generic opening sentence from consuming footage beyond the point it is
+        about to introduce. The post-narration tail remains neutral and uses ordinary forward
+        footage.
+        """
+        boundaries = [
+            chapter.end
+            for chapter in alignment.chapters[:-1]
+            if 0 < chapter.end < sum(grid)
+        ]
+        durations = self._split_grid(grid, boundaries)
+        edges: list[tuple[float, float]] = []
+        cursor = 0.0
+        for duration in durations:
+            edges.append((cursor, cursor + duration))
+            cursor += duration
+
+        def chapter_at(position: float):
+            return next(
+                (
+                    chapter for chapter in alignment.chapters
+                    if chapter.start - 1e-6 <= position < chapter.end + 1e-6
+                ),
+                None,
+            )
+
+        records: list[tuple[str | None, float]] = []
+        for start, end in edges:
+            chapter = chapter_at((start + end) / 2.0)
+            label = chapter.label if chapter else None
+            if chapter is not None and label is None and start < alignment.narration_duration:
+                label = next(
+                    (
+                        later.label for later in alignment.chapters
+                        if later.start >= chapter.end - 1e-6 and later.label
+                    ),
+                    None,
+                )
+            records.append((label, end - start))
+        return records
+
+    def _split_grid(self, grid: list[float], boundaries: list[float]) -> list[float]:
+        if not boundaries:
+            return grid
+        total = sum(grid)
+        edges = [0.0]
+        for duration in grid:
+            edges.append(edges[-1] + duration)
+        for boundary in sorted(set(boundaries)):
+            if boundary <= EPSILON or boundary >= total - EPSILON:
+                continue
+            nearest = min(edges, key=lambda edge: abs(edge - boundary))
+            # A nearby rhythmic edge already expresses the sentence change. Otherwise the
+            # meaning boundary is more important than preserving one oversized music slot.
+            if abs(nearest - boundary) > 0.35:
+                edges.append(boundary)
+        edges = sorted({round(edge, 9) for edge in edges})
+        return [edges[index + 1] - edges[index] for index in range(len(edges) - 1)]
+
+    def _source_after(
+        self, shots: list[Shot], cursor: float, label: str | None
+    ) -> list[Shot]:
+        out: list[Shot] = []
+        for shot in sorted(shots, key=lambda item: (item.start, item.order)):
+            if label is not None and shot.label != label:
+                continue
+            start = max(shot.start, cursor)
+            if shot.end - start < slots.MIN_SLOT_SECONDS:
+                continue
+            out.append(shot._replace(start=start))
+        return out
+
+    def _source_through(self, shots: list[Shot], limit: float) -> list[Shot]:
+        """Clip a candidate list at a forward reservation boundary."""
+        out: list[Shot] = []
+        for shot in shots:
+            end = min(shot.end, limit)
+            if end - shot.start >= slots.MIN_SLOT_SECONDS:
+                out.append(shot._replace(end=end))
+        return out
 
     def _groups(
         self,

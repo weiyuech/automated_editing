@@ -11,11 +11,19 @@ from hashlib import sha256
 from pathlib import Path
 from typing import Any
 
-from automated_video_editing_backend.core.models import AnalysisResult, MediaItem
+from automated_video_editing_backend.core.models import AnalysisResult, MediaItem, MusicAnalysis
 from automated_video_editing_backend.core.paths import generated_path
 from automated_video_editing_backend.services.capture import read_sidecar, sidecar_path
 from automated_video_editing_backend.services.render import RenderService
 from automated_video_editing_backend.services.scoring import score_shots
+
+# A detected scene can be several minutes of continuous robot footage. Three measurements for
+# that whole span cannot distinguish the clean, steady part from the lurch half a minute later,
+# and four candidate timelines then receive the same score however different their source
+# moments are. Keep scene boundaries intact, but measure them in local windows. Twelve seconds
+# is long enough to carry the longest normal/cinematic cut and short enough to expose changes
+# along an aisle.
+QUALITY_PROFILE_SECONDS = 12.0
 
 
 @lru_cache(maxsize=1)
@@ -34,7 +42,7 @@ class AnalysisService:
         # roughly a second of librosa each. The answer is a few hundred floats, so it is held
         # in memory rather than written anywhere: nothing to clean up, no storage to grow, and
         # it disappears with the process. Keyed on size and mtime so an edited file re-reads.
-        self._music_cache: dict[tuple[str, int, int], tuple[list[float], list[float]]] = {}
+        self._music_cache: dict[tuple[str, int, int], MusicAnalysis] = {}
         # The same amnesia, far more expensive: scene detection is a subprocess launch and a
         # full decode, around ten seconds a clip, and it ran once per job. A hundred outputs of
         # one recording analysed that recording a hundred times — some seventeen minutes spent
@@ -45,17 +53,30 @@ class AnalysisService:
     async def analyze_video(self, media: MediaItem, music: MediaItem | None = None) -> AnalysisResult:
         warnings: list[str] = []
         scenes = self.detect_scenes(Path(media.path), warnings)
-        beats, energy = self.analyze_music(Path(music.path), warnings) if music else ([], [])
+        music_result = self.analyze_music(Path(music.path), warnings) if music else None
         return AnalysisResult(
-            media_id=media.id, scenes=scenes, beats=beats, energy=energy, warnings=warnings,
+            media_id=media.id,
+            scenes=scenes,
+            beats=music_result.beats if music_result else [],
+            energy=music_result.energy if music_result else [],
+            music_duration_seconds=music_result.duration_seconds if music_result else 0.0,
+            tempo_bpm=music_result.tempo_bpm if music_result else None,
+            onset_times=music_result.onset_times if music_result else [],
+            accent_times=music_result.accent_times if music_result else [],
+            onset_strength=music_result.onset_strength if music_result else [],
+            section_boundaries=music_result.section_boundaries if music_result else [],
+            beat_reliability=music_result.beat_reliability if music_result else 0.0,
+            music_evidence=music_result.evidence if music_result else "none",
+            warnings=warnings,
         )
 
-    def analyze_music(self, audio_path: Path, warnings: list[str]) -> tuple[list[float], list[float]]:
-        """Beat times and a loudness curve, read from the track in one pass.
+    def analyze_music(self, audio_path: Path, warnings: list[str]) -> MusicAnalysis:
+        """Reusable musical structure and dynamics, read from the track in one pass.
 
-        Both come from the same decode, so asking for them together costs no more than asking
-        for either. They are used in different places and are independently optional: beats
-        move cut points onto the music, loudness lets cut length follow it.
+        The old result was just beats plus 64 loudness buckets.  That was enough to make cuts
+        move, but not enough to decide whether a track was rhythmic, distinguish strong accents
+        from ordinary beats, find coherent excerpt boundaries, or crop a long song without
+        stretching its whole energy curve across a short video.
         """
         try:
             stat = audio_path.stat()
@@ -70,7 +91,7 @@ class AnalysisService:
             self._music_cache[key] = result
         return result
 
-    def _read_music(self, audio_path: Path, warnings: list[str]) -> tuple[list[float], list[float]]:
+    def _read_music(self, audio_path: Path, warnings: list[str]) -> MusicAnalysis:
         cache_dir = generated_path("cache", "numba")
         cache_dir.mkdir(parents=True, exist_ok=True)
         os.environ.setdefault("NUMBA_CACHE_DIR", str(cache_dir))
@@ -79,29 +100,208 @@ class AnalysisService:
             import librosa
         except Exception as exc:
             warnings.append(f"librosa unavailable: {exc}")
-            return [], []
+            return MusicAnalysis(evidence="unreadable")
 
         try:
             y, sr = librosa.load(str(audio_path), mono=True)
         except Exception as exc:
             warnings.append(f"Music could not be read: {exc}")
-            return [], []
+            return MusicAnalysis(evidence="unreadable")
+
+        duration = float(librosa.get_duration(y=y, sr=sr))
+        hop_length = 512
+        onset_envelope = []
+        onset_values: list[float] = []
+        onset_times: list[float] = []
+        accent_times: list[float] = []
+        try:
+            onset_envelope = librosa.onset.onset_strength(y=y, sr=sr, hop_length=hop_length)
+            onset_values = self._normalise_curve(
+                [float(value) for value in onset_envelope], buckets=256,
+            )
+            onset_frames = librosa.onset.onset_detect(
+                onset_envelope=onset_envelope, sr=sr, hop_length=hop_length, backtrack=False,
+            )
+            onset_times = [
+                float(value) for value in librosa.frames_to_time(
+                    onset_frames, sr=sr, hop_length=hop_length,
+                )
+            ]
+            accent_times = self._accent_times(
+                onset_frames, onset_envelope, sr, hop_length, librosa,
+            )
+        except Exception as exc:
+            warnings.append(f"Onset analysis failed: {exc}")
 
         beats: list[float] = []
+        beat_frames = []
+        tempo_bpm: float | None = None
         try:
-            _tempo, beat_frames = librosa.beat.beat_track(y=y, sr=sr)
-            beats = [float(t) for t in librosa.frames_to_time(beat_frames, sr=sr)]
+            tempo, beat_frames = librosa.beat.beat_track(
+                y=y,
+                sr=sr,
+                hop_length=hop_length,
+                onset_envelope=onset_envelope if len(onset_envelope) else None,
+            )
+            tempo_value = float(tempo.flat[0] if hasattr(tempo, "flat") else tempo)
+            tempo_bpm = tempo_value if math.isfinite(tempo_value) and tempo_value > 0 else None
+            beats = [
+                float(t) for t in librosa.frames_to_time(
+                    beat_frames, sr=sr, hop_length=hop_length,
+                )
+            ]
         except Exception as exc:
             warnings.append(f"Beat detection failed: {exc}")
 
         energy: list[float] = []
         try:
-            rms = librosa.feature.rms(y=y)[0]
-            energy = self._normalise_curve([float(value) for value in rms])
+            rms = librosa.feature.rms(y=y, hop_length=hop_length)[0]
+            energy = self._normalise_curve([float(value) for value in rms], buckets=256)
         except Exception as exc:
             warnings.append(f"Loudness analysis failed: {exc}")
 
-        return beats, energy
+        sections = self._music_sections(
+            librosa, y, sr, duration, warnings, beat_frames, hop_length,
+        )
+        reliability = self._beat_reliability(beats, onset_envelope, sr, hop_length, duration)
+        evidence = "structured" if len(beats) >= 4 and reliability >= 0.28 else "ambient"
+        return MusicAnalysis(
+            duration_seconds=max(0.0, duration),
+            tempo_bpm=tempo_bpm,
+            beats=beats,
+            onset_times=onset_times,
+            accent_times=accent_times,
+            onset_strength=onset_values,
+            energy=energy,
+            section_boundaries=sections,
+            beat_reliability=reliability,
+            evidence=evidence,
+        )
+
+    def _accent_times(self, frames, envelope, sr: int, hop: int, librosa) -> list[float]:
+        """Strong, separated attacks suitable as optional edit points.
+
+        ``onset_detect`` deliberately finds note-level events. A dense instrumental track can
+        have dozens per second, and giving all of them to a dynamic edit makes a weak hi-hat as
+        influential as the downbeat. Keep the upper-strength band and enforce a small temporal
+        separation; ordinary beats remain available independently.
+        """
+        if len(frames) == 0 or len(envelope) == 0:
+            return []
+        import numpy as np
+
+        strengths = np.asarray([
+            float(envelope[min(len(envelope) - 1, max(0, int(frame)))])
+            for frame in frames
+        ])
+        positive = strengths[strengths > 0]
+        if len(positive) == 0:
+            return []
+        threshold = float(np.quantile(positive, 0.7))
+        ranked = sorted(
+            (
+                float(librosa.frames_to_time(frame, sr=sr, hop_length=hop)),
+                float(strength),
+            )
+            for frame, strength in zip(frames, strengths)
+            if strength >= threshold
+        )
+        kept: list[tuple[float, float]] = []
+        for moment, strength in ranked:
+            if kept and moment - kept[-1][0] < 0.18:
+                if strength > kept[-1][1]:
+                    kept[-1] = (moment, strength)
+                continue
+            kept.append((moment, strength))
+        return [round(moment, 6) for moment, _strength in kept]
+
+    def _music_sections(
+        self,
+        librosa,
+        y,
+        sr: int,
+        duration: float,
+        warnings: list[str],
+        beat_frames=None,
+        hop_length: int = 512,
+    ) -> list[float]:
+        """Coarse musical boundaries from beat-synchronous harmony and timbre.
+
+        Section finding is intentionally conservative. It supplies good excerpt candidates,
+        not a claim that a boundary is a verse or chorus. Tracks too short to contain several
+        sections simply expose their beginning and end.
+        """
+        if duration <= 0:
+            return []
+        try:
+            import numpy as np
+
+            hop = hop_length
+            chroma = librosa.feature.chroma_cqt(y=y, sr=sr, hop_length=hop)
+            mfcc = librosa.feature.mfcc(y=y, sr=sr, hop_length=hop, n_mfcc=13)
+            frames_available = min(chroma.shape[1], mfcc.shape[1])
+            if frames_available < 2:
+                return [0.0, duration]
+            features = np.vstack([
+                librosa.util.normalize(chroma[:, :frames_available], axis=1),
+                librosa.util.normalize(mfcc[:, :frames_available], axis=1),
+            ])
+            fixed = librosa.util.fix_frames(
+                beat_frames if beat_frames is not None else [],
+                x_min=0,
+                x_max=frames_available - 1,
+            )
+            # Structured tracks are clustered beat by beat, as the official librosa
+            # segmentation recipe recommends. Sparse/ambient tracks fall back to the raw
+            # feature clock rather than inventing a beat grid they do not have.
+            if len(fixed) >= 4:
+                data = librosa.util.sync(features, fixed, aggregate=np.median)
+                clock = fixed
+            else:
+                data = features
+                clock = np.arange(frames_available)
+            count = max(2, min(8, round(duration / 18.0) + 1))
+            boundaries = librosa.segment.agglomerative(data, k=min(count, data.shape[1]))
+            source_frames = [clock[min(len(clock) - 1, int(index))] for index in boundaries]
+            times = [
+                float(value) for value in librosa.frames_to_time(
+                    source_frames, sr=sr, hop_length=hop,
+                )
+            ]
+            return self._dedupe_boundaries([0.0, *times, duration], duration)
+        except Exception as exc:
+            warnings.append(f"Music section analysis failed: {exc}")
+            return [0.0, duration]
+
+    def _dedupe_boundaries(self, values: list[float], duration: float) -> list[float]:
+        ordered = sorted(max(0.0, min(duration, float(value))) for value in values)
+        kept: list[float] = []
+        for value in ordered:
+            if not kept or value - kept[-1] >= 1.0:
+                kept.append(round(value, 3))
+        if not kept or kept[0] > 0:
+            kept.insert(0, 0.0)
+        if duration - kept[-1] >= 0.5:
+            kept.append(round(duration, 3))
+        return kept
+
+    def _beat_reliability(self, beats, onset, sr: int, hop: int, duration: float) -> float:
+        if len(beats) < 2 or duration <= 0 or len(onset) == 0:
+            return 0.0
+        intervals = [beats[index + 1] - beats[index] for index in range(len(beats) - 1)]
+        mean = sum(intervals) / len(intervals)
+        if mean <= 0:
+            return 0.0
+        variance = sum((value - mean) ** 2 for value in intervals) / len(intervals)
+        regularity = max(0.0, 1.0 - math.sqrt(variance) / mean)
+        indexed = [
+            float(onset[min(len(onset) - 1, max(0, round(beat * sr / hop)))])
+            for beat in beats
+        ]
+        peak = max((float(value) for value in onset), default=0.0)
+        strength = (sum(indexed) / len(indexed) / peak) if peak > 0 else 0.0
+        density = min(1.0, len(beats) / max(1.0, duration / 2.0))
+        return round(max(0.0, min(1.0, 0.5 * regularity + 0.35 * strength + 0.15 * density)), 4)
 
     def _normalise_curve(self, values: list[float], buckets: int = 64) -> list[float]:
         """Flatten a frame-level curve to a short, evenly sampled 0..1 envelope.
@@ -155,22 +355,54 @@ class AnalysisService:
         Runs beside detection and is cached with it: the numbers depend on the file, and a
         hundred outputs of one recording need them computed once.
         """
-        spans = [(float(scene.get("start", 0.0)), float(scene.get("end", 0.0))) for scene in scenes]
-        scores, problem = score_shots(video_path, spans)
+        windows: list[tuple[float, float]] = []
+        owners: list[int] = []
+        for index, scene in enumerate(scenes):
+            start = float(scene.get("start", 0.0))
+            end = float(scene.get("end", start))
+            cursor = start
+            while end - cursor > QUALITY_PROFILE_SECONDS:
+                windows.append((cursor, cursor + QUALITY_PROFILE_SECONDS))
+                owners.append(index)
+                cursor += QUALITY_PROFILE_SECONDS
+            if end - cursor >= 0.5:
+                windows.append((cursor, end))
+                owners.append(index)
+
+        scores, problem = score_shots(video_path, windows)
         if problem:
             warnings.append(problem)
-        for scene, score in zip(scenes, scores):
-            scene["quality"] = round(score.quality, 4)
-            scene["sharpness"] = round(score.sharpness, 4)
-            scene["exposure"] = round(score.exposure, 4)
-            scene["motion"] = round(score.motion, 4)
-            scene["steadiness"] = round(score.steadiness, 4)
-            scene["colour"] = [round(value, 2) for value in score.colour]
-            scene["fingerprint"] = score.fingerprint
+        profiles: list[list[dict[str, Any]]] = [[] for _scene in scenes]
+        for span, owner, score in zip(windows, owners, scores):
+            profiles[owner].append({
+                "start": round(span[0], 3),
+                "end": round(span[1], 3),
+                "quality": round(score.quality, 4),
+                "sharpness": round(score.sharpness, 4),
+                "exposure": round(score.exposure, 4),
+                "motion": round(score.motion, 4),
+                "steadiness": round(score.steadiness, 4),
+                "colour": [round(value, 2) for value in score.colour],
+                "fingerprint": score.fingerprint,
+            })
+
+        for scene, profile in zip(scenes, profiles):
+            if not profile:
+                continue
+            scene["quality_profile"] = profile
+            total = sum(max(0.0, item["end"] - item["start"]) for item in profile) or 1.0
+            for field in ("quality", "sharpness", "exposure", "motion", "steadiness"):
+                scene[field] = round(sum(
+                    float(item[field]) * max(0.0, item["end"] - item["start"])
+                    for item in profile
+                ) / total, 4)
+            middle = profile[len(profile) // 2]
+            scene["colour"] = list(middle["colour"])
+            scene["fingerprint"] = middle["fingerprint"]
         if scores:
             weak = sum(1 for score in scores if score.quality < 0.35)
             if weak:
-                warnings.append(f"{weak}/{len(scores)} 个镜头质量偏低，已在选择时降权")
+                warnings.append(f"{weak}/{len(scores)} 个画面区间质量偏低，已在选择时降权")
 
     def _source_key(self, video_path: Path) -> tuple | None:
         """What makes one analysis of a file different from another.
@@ -256,7 +488,7 @@ class AnalysisService:
                 {
                     "start": round(start, 3),
                     "end": round(end, 3),
-                    "score": 1.0,
+                    **self._boundary_evidence(scenes, start),
                     **({"label": label} if label else {}),
                     "from_marker": start in labels,
                 }
@@ -310,7 +542,7 @@ class AnalysisService:
                 {
                     "start": round(start, 3),
                     "end": round(end, 3),
-                    "score": 1.0,
+                    **self._boundary_evidence(scenes, start),
                     "kind": kind,
                     **({"label": label} if label else {}),
                     "from_marker": start in edges,
@@ -324,6 +556,32 @@ class AnalysisService:
                 f"({dwell} parked, {len(merged) - dwell} travelling or failed)"
             )
         return merged
+
+    def _boundary_evidence(self, scenes: list[dict[str, Any]], start: float) -> dict[str, Any]:
+        """Carry detector evidence through semantic point/marker subdivision.
+
+        Robot timestamps add boundaries but do not replace visual ones. The earlier merge
+        rebuilt every scene with ``score=1`` and silently erased PySceneDetect's content,
+        colour, edge and adaptive-ratio metrics. Candidate scoring then claimed confidence at
+        every robot arrival and none at the real visual cuts. Only an actual detector boundary
+        receives these fields; a robot-only division deliberately remains unscored.
+        """
+        source = next(
+            (
+                scene for scene in scenes
+                if abs(float(scene.get("start", 0.0)) - start) <= 0.05
+            ),
+            None,
+        )
+        if source is None:
+            return {}
+        fields = {
+            key: source[key]
+            for key in ("score", "boundary_score", "boundary_metrics")
+            if key in source
+        }
+        fields["from_scene_detector"] = True
+        return fields
 
     def _cruise_spans(self, segments: list[Any]) -> list[tuple[float, float, str, str]]:
         """Turn recorded cruise segments into (start, end, kind, label) spans.
@@ -367,7 +625,7 @@ class AnalysisService:
 
     def detect_beats(self, audio_path: Path, warnings: list[str]) -> list[float]:
         """Beat times only. Kept because callers and tests ask for exactly this."""
-        return self.analyze_music(audio_path, warnings)[0]
+        return self.analyze_music(audio_path, warnings).beats
 
     def _scene_input(self, video_path: Path, warnings: list[str]) -> Path:
         """What to run detection over: the recording itself where possible.

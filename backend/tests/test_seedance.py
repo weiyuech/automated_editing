@@ -1,15 +1,19 @@
-from pathlib import Path
 import shutil
 import tempfile
+from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 from uuid import uuid4
 
 import pytest
-from urllib.parse import parse_qs, urlparse
 
-from automated_video_editing_backend.core.models import SeedanceAsset, SeedanceGenerateRequest, utc_now
+from automated_video_editing_backend.core.models import (
+    SeedanceAsset,
+    SeedanceGenerateRequest,
+    utc_now,
+)
+from automated_video_editing_backend.core.paths import generated_path
 from automated_video_editing_backend.services.media import MediaService
 from automated_video_editing_backend.services.render import RenderService
-from automated_video_editing_backend.core.paths import generated_path
 from automated_video_editing_backend.services.seedance import SeedanceService
 from automated_video_editing_backend.services.settings import SettingsService
 
@@ -29,13 +33,143 @@ def seedance_root():
 
 def test_seedance_quota_uses_configured_daily_limit(tmp_path, seedance_root):
     settings = SettingsService(path=tmp_path / "settings.json")
-    settings.replace_for_development({"seedance": {"daily_limit": 10}})
+    settings.replace_for_development({"seedance": {"daily_limit": 10, "default_duration_seconds": 5}})
     service = SeedanceService(settings, MediaService(path=Path(tempfile.mkdtemp()) / "media-library.json"), RenderService(), root=seedance_root)
 
     quota = service.quota()
 
     assert quota.limit == 10
     assert quota.remaining == 10 - quota.used
+    assert quota.seconds_limit == 50
+    assert quota.remaining_seconds == 50 - quota.used_seconds
+    assert quota.default_duration_seconds == 5
+
+
+def test_seedance_long_video_spends_actual_seconds_and_default_equivalents(tmp_path, seedance_root):
+    settings = SettingsService(path=tmp_path / "settings.json")
+    settings.replace_for_development({"seedance": {"daily_limit": 10, "default_duration_seconds": 5}})
+    service = SeedanceService(
+        settings,
+        MediaService(path=Path(tempfile.mkdtemp()) / "media-library.json"),
+        RenderService(),
+        root=seedance_root,
+    )
+
+    quota = service.quota()
+    service._increment_usage(quota.date, video_seconds=15)
+    quota = service.quota()
+
+    assert quota.used == 1
+    assert quota.count_remaining == 9
+    assert quota.used_seconds == 15
+    assert quota.remaining_seconds == 35
+    assert quota.remaining == 7
+
+
+@pytest.mark.asyncio
+async def test_seedance_video_under_five_seconds_spends_one_full_allowance(
+    monkeypatch, tmp_path, seedance_root,
+):
+    settings = SettingsService(path=tmp_path / "settings.json")
+    settings.replace_for_development({
+        "seedance": {
+            "enabled": True,
+            "api_key": "ark-key",
+            "model": "seedance-model",
+            "daily_limit": 10,
+            "default_duration_seconds": 2,
+        }
+    })
+    service = SeedanceService(
+        settings,
+        MediaService(path=Path(tempfile.mkdtemp()) / "media-library.json"),
+        RenderService(),
+        root=seedance_root,
+    )
+
+    async def fake_submit(_asset_id):
+        return None
+
+    monkeypatch.setattr(service, "_submit_and_download", fake_submit)
+
+    result = await service.generate(
+        SeedanceGenerateRequest(prompt="two-second effect", duration_seconds=2)
+    )
+
+    quota = service.quota()
+
+    try:
+        assert result.asset.duration_seconds == 2
+        assert quota.seconds_limit == 50
+        assert quota.used == 1
+        assert quota.used_seconds == 5
+        assert quota.remaining_seconds == 45
+        assert quota.count_remaining == 9
+        assert quota.remaining == 9
+    finally:
+        Path(result.asset.metadata_path).unlink(missing_ok=True)
+        Path(result.asset.output_path).unlink(missing_ok=True)
+
+
+def test_seedance_default_duration_does_not_change_five_second_allowance_unit(tmp_path, seedance_root):
+    settings = SettingsService(path=tmp_path / "settings.json")
+    settings.replace_for_development({"seedance": {"daily_limit": 10, "default_duration_seconds": 15}})
+    service = SeedanceService(
+        settings,
+        MediaService(path=Path(tempfile.mkdtemp()) / "media-library.json"),
+        RenderService(),
+        root=seedance_root,
+    )
+
+    quota = service.quota()
+
+    assert quota.seconds_limit == 50
+    assert quota.remaining == 10
+    assert quota.default_duration_seconds == 15
+    assert quota.minimum_billable_seconds == 5
+
+
+def test_seedance_legacy_count_usage_preserves_spent_allowance(tmp_path, seedance_root):
+    settings = SettingsService(path=tmp_path / "settings.json")
+    settings.replace_for_development({"seedance": {"daily_limit": 10, "default_duration_seconds": 5}})
+    service = SeedanceService(
+        settings,
+        MediaService(path=Path(tempfile.mkdtemp()) / "media-library.json"),
+        RenderService(),
+        root=seedance_root,
+    )
+    today = service.quota().date
+    service.usage_path.write_text(f'{{"{today}": 3}}', encoding="utf-8")
+
+    quota = service.quota()
+
+    assert quota.used == 3
+    assert quota.used_seconds == 15
+    assert quota.remaining_seconds == 35
+    assert quota.remaining == 7
+
+
+@pytest.mark.asyncio
+async def test_seedance_rejects_video_that_exceeds_remaining_seconds(tmp_path, seedance_root):
+    settings = SettingsService(path=tmp_path / "settings.json")
+    settings.replace_for_development({"seedance": {"daily_limit": 10, "default_duration_seconds": 5}})
+    service = SeedanceService(
+        settings,
+        MediaService(path=Path(tempfile.mkdtemp()) / "media-library.json"),
+        RenderService(),
+        root=seedance_root,
+    )
+    quota = service.quota()
+    service._increment_usage(quota.date, video_seconds=45)
+
+    with pytest.raises(ValueError, match="5s remaining, 10s requested"):
+        await service.generate(
+            SeedanceGenerateRequest(
+                title="too-long",
+                prompt="make it cinematic",
+                duration_seconds=10,
+            )
+        )
 
 
 @pytest.mark.asyncio
@@ -298,8 +432,8 @@ def test_deleting_an_effect_removes_its_files(tmp_path, seedance_root):
 def test_image_size_defaults_to_the_source_dimensions(tmp_path, seedance_root):
     """Ark accepts 'WIDTHxHEIGHT' or 2k/3k/4k. Pinning a preset upscaled every result, so a
     766x576 screenshot came back at 2464x1856 and read as an upscale rather than an edit."""
-    import numpy as np
     import cv2
+    import numpy as np
 
     settings = SettingsService(path=tmp_path / "settings.json")
     service = SeedanceService(settings, MediaService(path=tmp_path / "media-library.json"),

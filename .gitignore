@@ -13,6 +13,7 @@ frontend/node_modules/
 frontend/dist/
 frontend/out/
 release/
+output/pdf/*.local.pdf
 
 # Generated/runtime files
 .cache/
@@ -31,6 +32,7 @@ previews/
 # is absent, and tests/test_subtitles.py fails rather than letting a build ship without them.
 backend/vendor/
 backend/src/automated_video_editing_backend/assets/fonts/
+backend/src/automated_video_editing_backend/assets/semantic/
 
 # OS/editor
 .DS_Store

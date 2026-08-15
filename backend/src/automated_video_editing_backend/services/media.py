@@ -10,7 +10,11 @@ import httpx
 from pydantic import ValidationError
 
 from automated_video_editing_backend.core.models import MediaItem
-from automated_video_editing_backend.core.paths import GENERATED_DIRS, ensure_inside_root, generated_path
+from automated_video_editing_backend.core.paths import (
+    GENERATED_DIRS,
+    ensure_inside_root,
+    generated_path,
+)
 
 VIDEO_EXTS = {".mp4", ".mov", ".m4v", ".avi", ".mkv", ".webm"}
 AUDIO_EXTS = {".mp3", ".wav", ".aac", ".m4a", ".flac"}
@@ -233,18 +237,17 @@ class MediaService:
         quietly ignoring half. Recomputed on listing rather than at import, because a cruise
         writes its spans after the recording already exists.
         """
-        from automated_video_editing_backend.services.capture import read_sidecar
+        from automated_video_editing_backend.services.capture import inspect_sidecar
 
         for item in self._items.values():
             if item.kind != "video":
                 continue
-            sidecar = read_sidecar(item.path)
-            segments = (sidecar or {}).get("segments") or []
-            item.metadata["cruise_points"] = len({
-                f"{segment.get('path_name')}#{segment.get('goal_id')}"
-                for segment in segments
-                if isinstance(segment, dict)
-            })
+            capability = inspect_sidecar(item.path)
+            item.metadata["cruise_points"] = capability["point_count"]
+            item.metadata["successful_cruise_points"] = capability["successful_points"]
+            item.metadata["failed_cruise_points"] = capability["failed_points"]
+            item.metadata["point_evidence"] = capability["evidence"]
+            item.metadata["point_evidence_message"] = capability["message"]
 
     def get(self, media_id: str) -> MediaItem | None:
         return self._items.get(media_id)

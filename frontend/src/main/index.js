@@ -2,7 +2,7 @@ import { app, BrowserWindow, ipcMain, dialog, shell } from 'electron'
 import { execFile, spawn } from 'node:child_process'
 import { randomBytes } from 'node:crypto'
 import { createServer } from 'node:net'
-import { existsSync, mkdirSync, appendFileSync } from 'node:fs'
+import { existsSync, mkdirSync, appendFileSync, copyFileSync, readFileSync } from 'node:fs'
 import { extname, join, relative, resolve, sep } from 'node:path'
 
 const SOURCE_ROOT = resolve(__dirname, '../../../')
@@ -23,6 +23,43 @@ function ensureRuntimeDirs() {
   const root = appRoot()
   for (const name of ['data', '.cache', 'logs', 'exports', 'previews']) {
     mkdirSync(join(root, name), { recursive: true })
+  }
+}
+
+function migrateLegacySettings() {
+  if (!app.isPackaged) return
+
+  const target = join(appRoot(), 'data', 'settings.local.json')
+  if (existsSync(target)) return
+
+  // Electron has used both the package name and the Chinese product name as userData folder
+  // names across earlier builds. Credentials must survive a normal same-machine upgrade, even
+  // if that naming convention changed. Copy only a recognisable settings object, never log its
+  // contents, and never overwrite settings already created by the current installation.
+  const appData = app.getPath('appData')
+  const roots = [
+    app.getPath('userData'),
+    join(appData, 'automated-video-editing-frontend'),
+    join(appData, '自动视频剪辑')
+  ]
+  const candidates = [...new Set(roots.flatMap((root) => [
+    join(root, 'runtime', 'data', 'settings.local.json'),
+    join(root, 'data', 'settings.local.json')
+  ]))]
+
+  for (const candidate of candidates) {
+    if (candidate === target || !existsSync(candidate)) continue
+    try {
+      const parsed = JSON.parse(readFileSync(candidate, 'utf8'))
+      const recognised = parsed && typeof parsed === 'object' &&
+        ['llm', 'tts', 'seedance', 'robot', 'automation'].some((key) => key in parsed)
+      if (!recognised) continue
+      mkdirSync(join(appRoot(), 'data'), { recursive: true })
+      copyFileSync(candidate, target)
+      return
+    } catch {
+      // An invalid legacy file is ignored; SettingsService will create a clean current file.
+    }
   }
 }
 
@@ -106,6 +143,7 @@ async function waitForBackend(timeoutMs = 60000) {
 }
 
 async function startBackend() {
+  migrateLegacySettings()
   ensureRuntimeDirs()
   if (backendProcess) return
   backendPort = await findBackendPort()

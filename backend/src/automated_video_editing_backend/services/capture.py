@@ -6,7 +6,12 @@ from pathlib import Path
 from pydantic import ValidationError
 
 from automated_video_editing_backend.core.events import EventHub
-from automated_video_editing_backend.core.models import CaptureSession, CruiseSegment, TimelineMarker, utc_now
+from automated_video_editing_backend.core.models import (
+    CaptureSession,
+    CruiseSegment,
+    TimelineMarker,
+    utc_now,
+)
 from automated_video_editing_backend.core.paths import generated_path
 from automated_video_editing_backend.core.store import read_json, write_json
 
@@ -35,6 +40,103 @@ def read_sidecar(video_path: str | Path) -> dict | None:
     except (OSError, json.JSONDecodeError):
         return None
     return payload if isinstance(payload, dict) else None
+
+
+def inspect_sidecar(video_path: str | Path) -> dict:
+    """Describe the point evidence attached to a video without decoding the video.
+
+    ``read_sidecar`` deliberately returns ``None`` for both absence and corruption because
+    analysis must always be able to fall back to pixels.  The UI and planner diagnostics need
+    the distinction: a broken file is actionable, while an absent one is ordinary footage.
+    """
+    path = sidecar_path(video_path)
+    if not path.exists():
+        return {
+            "evidence": "none", "point_count": 0, "successful_points": 0,
+            "failed_points": 0, "message": "未识别点位，将按画面内容剪辑",
+        }
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {
+            "evidence": "invalid", "point_count": 0, "successful_points": 0,
+            "failed_points": 0, "message": "点位文件无法读取",
+        }
+    if not isinstance(payload, dict):
+        return {
+            "evidence": "invalid", "point_count": 0, "successful_points": 0,
+            "failed_points": 0, "message": "点位文件格式无效",
+        }
+
+    segments = [item for item in (payload.get("segments") or []) if isinstance(item, dict)]
+    markers = [item for item in (payload.get("markers") or []) if isinstance(item, dict)]
+    segment_identities = {
+        f"{item.get('path_name')}#{item.get('goal_id')}" for item in segments
+        if item.get("path_name") and item.get("goal_id") is not None
+    }
+    usable_segments = [
+        item for item in segments
+        if item.get("path_name") and item.get("goal_id") is not None
+        and item.get("transit_start_seconds") is not None
+        and (
+            item.get("status") in {"failed", "skipped"}
+            or item.get("arrived_at_seconds") is not None
+        )
+    ]
+    if usable_segments:
+        identities = {
+            f"{item.get('path_name')}#{item.get('goal_id')}" for item in usable_segments
+        }
+        successful = {
+            f"{item.get('path_name')}#{item.get('goal_id')}" for item in usable_segments
+            if item.get("status") == "arrived"
+        }
+        failed = identities - successful
+        return {
+            "evidence": "full", "point_count": len(identities),
+            "successful_points": len(successful), "failed_points": len(failed),
+            "message": f"已识别 {len(identities)} 个点位 · 信息完整",
+        }
+
+    # Older sidecars and hand-authored marker files may identify points without carrying
+    # enough timestamps to split transit from dwell.  They still answer the UI's point-count
+    # question; the pixel analyser simply keeps its ordinary-scene fallback for the edit.
+    if segment_identities:
+        successful = {
+            f"{item.get('path_name')}#{item.get('goal_id')}" for item in segments
+            if item.get("path_name") and item.get("goal_id") is not None
+            and item.get("status") == "arrived"
+        }
+        failed = segment_identities - successful
+        return {
+            "evidence": "markers_only", "point_count": len(segment_identities),
+            "successful_points": len(successful), "failed_points": len(failed),
+            "message": f"已识别 {len(segment_identities)} 个点位 · 基础信息",
+        }
+
+    usable_markers = [
+        marker for marker in markers
+        if marker.get("timestamp") is not None and str(marker.get("label") or "").strip()
+    ]
+    if usable_markers:
+        labels = {str(marker.get("label")).strip() for marker in usable_markers}
+        return {
+            "evidence": "markers_only", "point_count": len(labels),
+            "successful_points": len(labels), "failed_points": 0,
+            "message": f"已识别 {len(labels)} 个点位 · 基础信息",
+        }
+
+    # Manual capture writes the same sidecar shape with empty point arrays. It is valid
+    # ordinary footage, not a broken cruise file.
+    if not segments and not markers:
+        return {
+            "evidence": "none", "point_count": 0, "successful_points": 0,
+            "failed_points": 0, "message": "未识别点位，将按画面内容剪辑",
+        }
+    return {
+        "evidence": "invalid", "point_count": 0, "successful_points": 0,
+        "failed_points": 0, "message": "点位文件没有可用的到达信息",
+    }
 
 
 class CaptureService:
@@ -107,21 +209,6 @@ class CaptureService:
         }
         target = sidecar_path(video)
         return target if write_json(target, payload) else None
-
-    def collect_notes(self, session_id: str | None = None) -> list[str]:
-        """Notes to hand the voiceover drafter.
-
-        Defaults to the most recent session that actually recorded something, so a fresh
-        empty session does not silently blank out the notes from the run just finished.
-        """
-        if session_id is not None:
-            session = self._sessions.get(session_id)
-            return list(session.notes) if session else []
-
-        for session in reversed(list(self._sessions.values())):
-            if session.notes:
-                return list(session.notes)
-        return []
 
     def _session_title(self, title: str) -> str:
         """Stamp every session with its local start time: '产品晨拍 08-04 17:20'.

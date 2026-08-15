@@ -31,6 +31,8 @@ for package in (
     "llvmlite",
     "soundfile",
     "sklearn",
+    "onnxruntime",
+    "tokenizers",
 ):
     package_datas, package_binaries, package_hidden = collect_all(package)
     datas += package_datas
@@ -42,6 +44,8 @@ for distribution in (
     "pydantic",
     "uvicorn",
     "python-multipart",
+    "onnxruntime",
+    "tokenizers",
 ):
     datas += copy_metadata(distribution)
 

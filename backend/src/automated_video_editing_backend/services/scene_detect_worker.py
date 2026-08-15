@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import sys
 from pathlib import Path
+from typing import Any
 
 # A shot shorter than a cut is not a shot. Kept in step with MIN_SLOT_SECONDS in `slots`, and
 # expressed in seconds here because the detector wants frames and only it knows the rate.
@@ -43,31 +44,52 @@ def open_best(path: Path):
     return open_video(str(path))
 
 
-def detect(path: Path) -> list[dict[str, float]]:
-    from scenedetect import AdaptiveDetector, SceneManager
+def detect(path: Path) -> list[dict[str, Any]]:
+    from scenedetect import AdaptiveDetector, SceneManager, StatsManager
     from scenedetect.detectors import ContentDetector
 
     video = open_best(path)
     rate = float(video.frame_rate or 30.0)
-    manager = SceneManager()
+    stats = StatsManager()
+    manager = SceneManager(stats_manager=stats)
     # Adaptive rather than Content: its threshold is a rolling average of recent frame deltas
     # instead of a fixed number, which is what stops a moving camera reading as a cut. A robot
     # gliding between two points is exactly that case, and a fixed threshold either invents
     # cuts in the glide or misses the real ones between similar-looking places.
-    manager.add_detector(
-        AdaptiveDetector(
-            min_scene_len=max(1, int(MIN_SHOT_SECONDS * rate)),
-            weights=ContentDetector.Components(
-                delta_hue=1.0, delta_sat=1.0, delta_lum=1.0, delta_edges=EDGE_WEIGHT,
-            ),
-        )
+    detector = AdaptiveDetector(
+        min_scene_len=max(1, int(MIN_SHOT_SECONDS * rate)),
+        weights=ContentDetector.Components(
+            delta_hue=1.0, delta_sat=1.0, delta_lum=1.0, delta_edges=EDGE_WEIGHT,
+        ),
     )
+    manager.add_detector(detector)
     manager.detect_scenes(video=video)
 
-    scenes = [
-        {"start": round(float(start.seconds), 3), "end": round(float(end.seconds), 3), "score": 1.0}
-        for start, end in manager.get_scene_list()
-    ]
+    metric_keys = detector.get_metrics()
+    adaptive_key = next(key for key in metric_keys if key.startswith("adaptive_ratio"))
+    scenes = []
+    for index, (start, end) in enumerate(manager.get_scene_list()):
+        metrics = stats.get_metrics(start, metric_keys)
+        values = dict(zip(metric_keys, metrics))
+        content = float(values.get("content_val") or 0.0)
+        adaptive = float(values.get(adaptive_key) or 0.0)
+        # Confidence is diagnostic, not a second cut threshold. The detector already decided
+        # the boundary; normalising both its absolute and locally-adaptive evidence lets later
+        # selection prefer strong edit points without re-decoding the video.
+        confidence = 1.0 if index == 0 else min(
+            1.0,
+            max(content / max(1.0, detector.min_content_val), adaptive / max(1.0, detector.adaptive_threshold)) / 2.0,
+        )
+        scenes.append({
+            "start": round(float(start.seconds), 3),
+            "end": round(float(end.seconds), 3),
+            "score": round(confidence, 4),
+            "boundary_score": round(confidence, 4),
+            "boundary_metrics": {
+                key: round(float(value), 4) if value is not None else None
+                for key, value in values.items()
+            },
+        })
     if scenes:
         return scenes
     return [{"start": 0.0, "end": round(float(video.duration.seconds), 3), "score": 1.0}]

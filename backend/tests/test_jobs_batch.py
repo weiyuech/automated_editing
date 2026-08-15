@@ -1,6 +1,7 @@
-import pytest
 import tempfile
 from pathlib import Path
+
+import pytest
 
 from automated_video_editing_backend.core.models import EditBatchRequest, EditJobRequest
 from automated_video_editing_backend.services.jobs import JobService
@@ -10,6 +11,24 @@ from automated_video_editing_backend.services.media import MediaService
 class DummyEvents:
     async def publish(self, *_args, **_kwargs):
         return None
+
+
+def test_three_sources_are_dealt_four_three_three_across_ten_outputs():
+    service = JobService(DummyEvents(), None, None, None, None)
+
+    dealt = service._deal_sources(["source-a", "source-b", "source-c"], 10)
+
+    assert dealt == [
+        "source-a", "source-b", "source-c",
+        "source-a", "source-b", "source-c",
+        "source-a", "source-b", "source-c",
+        "source-a",
+    ]
+
+
+class CompatibilitySemantic:
+    def compatibility(self, source, voice):
+        return 0.9 if source.metadata.get("topic") == voice.metadata.get("topic") else 0.2
 
 
 @pytest.mark.asyncio
@@ -47,6 +66,35 @@ async def test_job_service_auto_names_exports_and_creates_batch(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_professional_batch_balances_outputs_without_mixing_recordings(tmp_path):
+    """Five selected recordings and ten outputs means two intact timelines per recording,
+    never ten timelines each made from all five sources."""
+    from collections import Counter
+
+    media = MediaService(path=Path(tempfile.mkdtemp()) / "media-library.json")
+    videos = [
+        media.import_path(str(_write(tmp_path / f"source-{index}.mp4")))
+        for index in range(5)
+    ]
+    service = JobService(DummyEvents(), media, None, None, None)
+
+    async def noop(_job_id):
+        return None
+
+    service._run = noop
+    jobs = await service.create_batch(EditBatchRequest(
+        media_ids=[video.id for video in videos], output_count=10, seed=27,
+    ))
+
+    assert all(len(job.request.media_ids) == 1 for job in jobs)
+    assert Counter(job.request.media_ids[0] for job in jobs) == Counter({
+        video.id: 2 for video in videos
+    })
+    assert {job.request.recording_scope for job in jobs} == {"all"}
+    assert {job.request.start_rotation for job in jobs} == {0}
+
+
+@pytest.mark.asyncio
 async def test_every_output_gets_both_pools_and_pairs_stay_distinct(tmp_path):
     """Two music and two voiceovers over four outputs must spend all four combinations."""
     media = MediaService(path=Path(tempfile.mkdtemp()) / "media-library.json")
@@ -74,6 +122,42 @@ async def test_every_output_gets_both_pools_and_pairs_stay_distinct(tmp_path):
     pairs = [(job.request.music_media_id, job.request.voiceover_media_id) for job in batch]
     assert all(music and voice for music, voice in pairs)
     assert len(set(pairs)) == 4, pairs
+
+
+@pytest.mark.asyncio
+async def test_voiceover_deck_stays_balanced_but_pairs_with_matching_source_content(tmp_path):
+    media = MediaService(path=Path(tempfile.mkdtemp()) / "media-library.json")
+    videos = [
+        media.import_path(str(_write(tmp_path / "showroom.mp4"))),
+        media.import_path(str(_write(tmp_path / "warehouse.mp4"))),
+    ]
+    voices = [
+        media.import_path(str(_write(tmp_path / "showroom.mp3"))),
+        media.import_path(str(_write(tmp_path / "warehouse.mp3"))),
+    ]
+    for item, topic in zip(videos, ("showroom", "warehouse")):
+        item.metadata["topic"] = topic
+    for item, topic in zip(voices, ("showroom", "warehouse")):
+        item.metadata.update({"source": "data/tts", "role": "tts_voice", "topic": topic})
+    service = JobService(
+        DummyEvents(), media, None, None, None, semantic=CompatibilitySemantic(),
+    )
+
+    async def noop(_job_id):
+        return None
+
+    service._run = noop
+    jobs = await service.create_batch(EditBatchRequest(
+        media_ids=[item.id for item in videos],
+        voiceover_media_ids=[item.id for item in voices],
+        output_count=2,
+        seed=4,
+    ))
+
+    for job in jobs:
+        source = media.get(job.request.media_ids[0])
+        voice = media.get(job.request.voiceover_media_id)
+        assert source.metadata["topic"] == voice.metadata["topic"]
 
 
 @pytest.mark.asyncio
@@ -437,6 +521,7 @@ def test_export_is_named_after_the_edit_title(tmp_path):
     """The 剪辑标题 box was ignored: every export came out as 导出 regardless of what you
     typed. A Chinese title also had to survive, since the old sanitiser stripped non-ASCII."""
     import re
+
     from automated_video_editing_backend.core.events import EventHub
     from automated_video_editing_backend.services.jobs import JobService
     from automated_video_editing_backend.services.render import RenderService
@@ -564,7 +649,8 @@ async def test_a_batch_makes_only_as_many_as_can_differ(tmp_path):
 async def test_the_days_allowance_is_spent_across_batches_and_survives_a_restart(tmp_path):
     """A limit that resets when the process does is not a limit."""
     from automated_video_editing_backend.core.models import (
-        AutomationSettingsUpdate, SettingsUpdateRequest,
+        AutomationSettingsUpdate,
+        SettingsUpdateRequest,
     )
     from automated_video_editing_backend.services.settings import SettingsService
 
@@ -615,7 +701,8 @@ async def test_without_settings_only_the_material_limit_applies(tmp_path):
 @pytest.mark.asyncio
 async def test_global_framing_preset_is_frozen_onto_new_jobs(tmp_path):
     from automated_video_editing_backend.core.models import (
-        AutomationSettingsUpdate, SettingsUpdateRequest,
+        AutomationSettingsUpdate,
+        SettingsUpdateRequest,
     )
     from automated_video_editing_backend.services.settings import SettingsService
 

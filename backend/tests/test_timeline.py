@@ -122,12 +122,20 @@ def test_target_duration_is_a_ceiling_and_short_footage_says_so():
     assert any("素材只够" in warning for warning in timeline.warnings)
 
 
-def test_footage_cycles_to_cover_a_longer_voiceover():
-    """Narration is never cut off mid-sentence; the picture repeats to reach the end of it."""
+def test_long_voiceover_extends_the_edit_without_looping_available_footage():
+    """The target gives way to narration, but unused forward footage is consumed first."""
     timeline = _plan([(0, 120)], 30.0, voiceover_duration=45.0)
 
     assert sum(clip.duration for clip in timeline.clips) == 45.0
-    assert any("画面循环" in warning for warning in timeline.warnings)
+    assert not any("画面循环" in warning for warning in timeline.warnings)
+    assert any("成片延长至 45 秒" in warning for warning in timeline.warnings)
+
+
+def test_picture_cycles_only_when_voiceover_outlasts_all_footage():
+    timeline = _plan([(0, 20)], 30.0, voiceover_duration=45.0)
+
+    assert sum(clip.duration for clip in timeline.clips) == 45.0
+    assert any("画面循环 25 秒" in warning for warning in timeline.warnings)
 
 
 def test_short_voiceover_leaves_the_video_alone_but_warns():
@@ -143,6 +151,36 @@ def test_seeds_pick_different_cuts_from_the_same_footage():
     pictures = {tuple(_picture(_plan([(0, 120)], 30.0, variant_seed=seed))) for seed in range(10)}
 
     assert len(pictures) > 1, "every seed produced the identical picture"
+
+
+def test_local_quality_profile_reaches_placement_inside_one_long_take():
+    video = MediaItem(path="/tmp/profiled.mp4", kind="video")
+    request = EditJobRequest(
+        title="Profiled", media_ids=[video.id], target_duration_seconds=12.0,
+        pace="normal", contour="flat", variant_seed=3,
+    )
+    analysis = AnalysisResult(media_id=video.id, scenes=[{
+        "start": 0.0,
+        "end": 36.0,
+        "quality": 0.55,
+        "quality_profile": [
+            {"start": 0.0, "end": 12.0, "quality": 0.1},
+            {"start": 12.0, "end": 24.0, "quality": 0.5},
+            {"start": 24.0, "end": 36.0, "quality": 1.0},
+        ],
+    }])
+
+    timeline = EditPlanner().plan(request, [video], [analysis], None)
+    used = [
+        sum(clip.duration for clip in timeline.clips if low <= clip.start < high)
+        for low, high in ((0, 12), (12, 24), (24, 36))
+    ]
+
+    assert used[2] > used[0]
+    assert all(
+        earlier.start + earlier.duration <= later.start + 1e-6
+        for earlier, later in zip(timeline.clips, timeline.clips[1:])
+    )
 
 
 def test_a_seed_reproduces_its_own_picture_exactly():

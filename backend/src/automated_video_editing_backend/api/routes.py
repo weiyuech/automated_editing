@@ -4,9 +4,9 @@ from pathlib import Path
 from typing import Annotated
 
 import httpx
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, Header, HTTPException
 from fastapi.responses import FileResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from automated_video_editing_backend.core.models import (
     CameraAngle,
@@ -18,26 +18,27 @@ from automated_video_editing_backend.core.models import (
     FramingPreferenceSaveRequest,
     MoveCommand,
     RobotGoalCommand,
-    SettingsUpdateRequest,
-    TimelineDraftRequest,
     SeedanceFrameRequest,
     SeedanceGenerateRequest,
+    SettingsUpdateRequest,
+    TimelineDraftRequest,
     TTSGenerateRequest,
 )
 from automated_video_editing_backend.core.paths import RootPathError, ensure_inside_root
 from automated_video_editing_backend.core.security import require_http_token, token_matches
+from automated_video_editing_backend.services import subtitles as subtitle_layer
+from automated_video_editing_backend.services.admin_access import AdminAccessService
 from automated_video_editing_backend.services.capture import CaptureService
 from automated_video_editing_backend.services.cruise import CruiseService
 from automated_video_editing_backend.services.cruise_routes import CruiseRouteStore
-from automated_video_editing_backend.services.jobs import JobService
 from automated_video_editing_backend.services.framing_test import FramingTestService
+from automated_video_editing_backend.services.jobs import JobService
 from automated_video_editing_backend.services.llm import LLMService
 from automated_video_editing_backend.services.media import MediaService
 from automated_video_editing_backend.services.media_vault import MediaVaultService
 from automated_video_editing_backend.services.rename import MediaRenameService
 from automated_video_editing_backend.services.robot import RobotService
 from automated_video_editing_backend.services.seedance import SeedanceService
-from automated_video_editing_backend.services import subtitles as subtitle_layer
 from automated_video_editing_backend.services.settings import SettingsService
 from automated_video_editing_backend.services.tts import TTSService
 
@@ -48,6 +49,11 @@ class ImportMediaRequest(BaseModel):
 
 class DownloadMediaRequest(BaseModel):
     url: str
+
+
+class EditingCapabilityRequest(BaseModel):
+    media_ids: list[str] = Field(default_factory=list, max_length=20)
+    music_media_ids: list[str] = Field(default_factory=list, max_length=100)
 
 
 class CaptureStartRequest(BaseModel):
@@ -64,6 +70,11 @@ class SwitchMapRequest(BaseModel):
 
 class RenameMediaRequest(BaseModel):
     name: str
+
+
+class AdminUnlockRequest(BaseModel):
+    username: str = Field(min_length=1, max_length=128)
+    password: str = Field(min_length=1, max_length=256)
 
 
 Secured = Annotated[None, Depends(require_http_token)]
@@ -141,8 +152,14 @@ def build_router(
     seedance: SeedanceService,
     renamer: MediaRenameService,
     framing_test: FramingTestService,
+    admin_access: AdminAccessService,
 ) -> APIRouter:
     router = APIRouter(dependencies=[Depends(require_http_token)])
+
+    async def require_settings_admin(
+        x_admin_token: str | None = Header(default=None),
+    ) -> None:
+        admin_access.require(x_admin_token)
 
     @router.get("/health")
     async def health(_: Secured = None) -> dict[str, str]:
@@ -428,6 +445,10 @@ def build_router(
     async def jobs_list(_: Secured = None):
         return jobs.list_jobs()
 
+    @router.post("/editing/capabilities")
+    async def editing_capabilities(request: EditingCapabilityRequest, _: Secured = None):
+        return await jobs.editing_capabilities(request.media_ids, request.music_media_ids)
+
     @router.post("/jobs")
     async def jobs_create(request: EditJobRequest, _: Secured = None):
         try:
@@ -516,22 +537,39 @@ def build_router(
     async def settings_get(_: Secured = None):
         return settings.summary()
 
-    @router.put("/settings")
+    @router.post("/settings/admin/unlock")
+    async def settings_admin_unlock(request: AdminUnlockRequest, _: Secured = None):
+        return admin_access.unlock(request.username, request.password)
+
+    @router.get("/settings/admin/status")
+    async def settings_admin_status(
+        x_admin_token: str | None = Header(default=None), _: Secured = None
+    ):
+        return admin_access.status(x_admin_token)
+
+    @router.post("/settings/admin/lock")
+    async def settings_admin_lock(
+        x_admin_token: str | None = Header(default=None), _: Secured = None
+    ):
+        admin_access.lock(x_admin_token)
+        return {"unlocked": False}
+
+    @router.put("/settings", dependencies=[Depends(require_settings_admin)])
     async def settings_update(request: SettingsUpdateRequest, _: Secured = None):
         summary = settings.update(request)
         if request.robot:
             await robot.configure_websocket_url(summary.robot.websocket_url)
         return summary
 
-    @router.post("/settings/test/llm")
+    @router.post("/settings/test/llm", dependencies=[Depends(require_settings_admin)])
     async def settings_test_llm(_: Secured = None):
         return await llm.test()
 
-    @router.post("/settings/test/tts")
+    @router.post("/settings/test/tts", dependencies=[Depends(require_settings_admin)])
     async def settings_test_tts(_: Secured = None):
         return await tts.test()
 
-    @router.post("/settings/test/seedance")
+    @router.post("/settings/test/seedance", dependencies=[Depends(require_settings_admin)])
     async def settings_test_seedance(_: Secured = None):
         return await seedance.test()
 
@@ -542,23 +580,18 @@ def build_router(
     @router.post("/tts/generate")
     async def tts_generate(request: TTSGenerateRequest, _: Secured = None):
         try:
-            # Notes are unfiltered jottings: reading them aloud verbatim would narrate
-            # "运镜有点抖". Sorting content from production chatter is the LLM's job, so
-            # notes without the LLM is not a usable combination.
-            if request.include_notes and not request.use_llm:
-                raise ValueError("Notes need the LLM to draft from them")
-
-            notes = capture.collect_notes() if request.include_notes else []
-            if not request.text.strip() and not notes:
-                raise ValueError("Voiceover needs text, or notes to draw on")
+            # Capture notes describe the picture for local semantic matching. They are never
+            # narration input: a camera/location reminder must not become customer-facing speech.
+            if not request.text.strip():
+                raise ValueError("Voiceover needs text")
 
             if request.use_llm:
-                final_text = await llm.draft_voiceover(request.text, notes)
+                final_text = await llm.draft_voiceover(request.text)
             else:
                 final_text = request.text
 
             if not final_text.strip():
-                raise ValueError("Nothing usable was found in the text or notes")
+                raise ValueError("Nothing usable was found in the text")
             return await tts.synthesize(request, final_text)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc

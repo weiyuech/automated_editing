@@ -93,6 +93,11 @@ class RenderService:
             next_index += 1
         music_input_index = next_index
         if timeline.music_path:
+            if timeline.music_loop:
+                # The planner only enables this when the selected track is shorter than the
+                # picture. Loop at demux time, then trim the resulting stream to the exact
+                # planned duration below; no silent tail and no unbounded output.
+                args += ["-stream_loop", "-1"]
             args += ["-i", timeline.music_path]
             next_index += 1
         voiceover_input_index = next_index
@@ -177,9 +182,32 @@ class RenderService:
             filter_parts.append(f"[origraw]volume={bed}[orig]")
             sources.append("[orig]")
         if timeline.music_path:
-            # Full volume on its own; ducked to a bed only when a voice shares the track.
+            # Analysis and render use the same excerpt. Previously the entire song's energy
+            # was compressed over a short edit while playback always began at 0:00.
             bed = MUSIC_BED_VOLUME if timeline.voiceover_path else 1.0
-            filter_parts.append(f"[{music_input_index}:a:0]volume={bed}[bgm]")
+            duration = timeline.music_duration_seconds or sum(
+                max(0.0, clip.duration) for clip in timeline.clips
+            )
+            if (
+                timeline.music_duration_seconds is None
+                and timeline.music_start_seconds == 0
+                and not timeline.music_loop
+            ):
+                # A hand-built/old timeline did not select an excerpt. Preserve its exact
+                # full-track rendering contract; planner-v2 timelines always fill the fields
+                # above and take the bounded branch below.
+                filter_parts.append(f"[{music_input_index}:a:0]volume={bed}[bgm]")
+            else:
+                fade = min(0.8, max(0.12, duration * 0.025))
+                fade_out = max(0.0, duration - fade)
+                filter_parts.append(
+                    f"[{music_input_index}:a:0]"
+                    f"atrim=start={timeline.music_start_seconds:.3f}:duration={duration:.3f},"
+                    "asetpts=PTS-STARTPTS,"
+                    f"afade=t=in:st=0:d={fade:.3f},"
+                    f"afade=t=out:st={fade_out:.3f}:d={fade:.3f},"
+                    f"volume={bed}[bgm]"
+                )
             sources.append("[bgm]")
         if timeline.voiceover_path:
             steps = [f"[{voiceover_input_index}:a:0]volume=1.0"]

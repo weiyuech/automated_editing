@@ -163,8 +163,10 @@ The **拍摄** section holds:
   Chinese, and 清单 is the term robot-live-system already uses.
 - **运行状态** — live per-point progress from the `CRUISE_*` events, plus the markers
   recorded for the run.
-- **备注** — notes attached to the running session, used later as raw material for the
-  voiceover drafter.
+- **画面匹配备注** — one compact recording-level map such as
+  `点位1：产品展示区；点位2：仓库`. It is saved beside that recording and may later align
+  narration sentences to point footage. It is never sent to the LLM and never becomes spoken
+  copy. Bare notes without an explicit point marker are stored but deliberately not guessed.
 
 ## API
 

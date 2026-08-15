@@ -14,17 +14,27 @@ from automated_video_editing_backend.core.models import (
     FOOTAGE_MIX_LEVELS,
     EditBatchRequest,
     EditJobRequest,
-    TimelineDraftRequest,
     JobRecord,
     JobStatus,
+    TimelineDraftRequest,
     utc_now,
 )
 from automated_video_editing_backend.core.paths import GENERATED_DIRS
-from automated_video_editing_backend.services.naming import safe_stem
+from automated_video_editing_backend.core.store import write_json
 from automated_video_editing_backend.services.analysis import AnalysisService
-from automated_video_editing_backend.services.capture import read_sidecar
+from automated_video_editing_backend.services.capture import inspect_sidecar
+from automated_video_editing_backend.services.editorial import (
+    FAMILY_LABELS,
+    TimelineCandidate,
+    resolve_family_policy,
+    score_timeline,
+    select_slot_candidate,
+    smart_family,
+)
 from automated_video_editing_backend.services.media import MediaService
+from automated_video_editing_backend.services.naming import safe_stem
 from automated_video_editing_backend.services.render import RenderService
+from automated_video_editing_backend.services.semantic import SemanticAlignment, SemanticService
 from automated_video_editing_backend.services.settings import SettingsService
 from automated_video_editing_backend.services.timeline import EditPlanner
 
@@ -41,7 +51,8 @@ class JobService:
         analysis: AnalysisService,
         planner: EditPlanner,
         renderer: RenderService,
-        settings: "SettingsService | None" = None,
+        settings: SettingsService | None = None,
+        semantic: SemanticService | None = None,
     ) -> None:
         self.events = events
         self.media = media
@@ -51,6 +62,7 @@ class JobService:
         # Optional so the planner can be exercised without a settings file; without one there
         # is no day's allowance to spend and only the material limit applies.
         self.settings = settings
+        self.semantic = semantic or SemanticService()
         self._jobs: dict[str, JobRecord] = {}
         self._allocated_output_names: set[str] = set()
         self._render_slots = asyncio.Semaphore(1)
@@ -61,13 +73,107 @@ class JobService:
     def get(self, job_id: str) -> JobRecord | None:
         return self._jobs.get(job_id)
 
+    async def editing_capabilities(
+        self, media_ids: list[str], music_media_ids: list[str],
+    ) -> dict:
+        """Cheap, honest recognition status for the one automatic-editing UI."""
+        videos = [self.media.get(media_id) for media_id in dict.fromkeys(media_ids)]
+        videos = [item for item in videos if item is not None and item.kind == "video"]
+        point_items = [inspect_sidecar(item.path) for item in videos]
+        usable = [item for item in point_items if item["evidence"] in {"full", "markers_only"}]
+        points = sum(item["point_count"] for item in usable)
+        successful = sum(item["successful_points"] for item in usable)
+        failed = sum(item["failed_points"] for item in usable)
+        if not videos:
+            point_evidence, point_message = "none", "先选择视频素材"
+        elif usable:
+            if len(usable) < len(videos):
+                point_evidence = "partial"
+                suffix = "部分素材带点位信息"
+            elif all(item["evidence"] == "full" for item in usable):
+                point_evidence = "full"
+                suffix = "信息完整"
+            else:
+                point_evidence = "markers_only"
+                suffix = "基础信息"
+            outcome = "全部到达" if failed == 0 and successful else f"{successful} 个到达 · {failed} 个未完成"
+            point_message = f"已识别 {points} 个点位 · {suffix} · {outcome}"
+        elif any(item["evidence"] == "invalid" for item in point_items):
+            point_evidence, point_message = "invalid", "发现点位文件，但没有可用的到达信息"
+        else:
+            point_evidence, point_message = "none", "未识别点位 · 将按画面内容剪辑"
+
+        described = [self.semantic.source_description_count(item) for item in videos]
+        description_count = sum(described)
+        described_sources = sum(count > 0 for count in described)
+        if not videos:
+            semantic_evidence, semantic_message = "none", "先选择视频素材"
+        elif description_count == 0:
+            semantic_evidence = "none"
+            semantic_message = "未识别画面匹配备注 · 继续自动剪辑"
+        elif described_sources < len(videos):
+            semantic_evidence = "partial"
+            semantic_message = f"已识别 {description_count} 个点位描述 · 部分素材可参与旁白匹配"
+        else:
+            semantic_evidence = "full"
+            semantic_message = f"已识别 {description_count} 个点位描述 · 有旁白时自动匹配画面"
+
+        music_items = [self.media.get(media_id) for media_id in dict.fromkeys(music_media_ids)]
+        music_items = [item for item in music_items if item is not None and item.kind == "audio"]
+        async def inspect_music(item):
+            warnings: list[str] = []
+            result = await asyncio.to_thread(self.analysis.analyze_music, Path(item.path), warnings)
+            return result, warnings
+
+        inspected = await asyncio.gather(*(inspect_music(item) for item in music_items))
+        music_results = [result for result, _warnings in inspected]
+        music_warnings = [warning for _result, warnings in inspected for warning in warnings]
+        if not music_items:
+            music_evidence, music_message = "none", "未添加音乐 · 将按画面节奏剪辑"
+        elif all(item.evidence == "unreadable" for item in music_results):
+            music_evidence, music_message = "unreadable", "音乐无法读取 · 将按画面节奏处理"
+        elif all(item.evidence == "structured" for item in music_results):
+            music_evidence = "structured"
+            music_message = f"已分析 {len(music_results)} 首 · 节拍清晰 · 自动选段"
+        elif all(item.evidence == "ambient" for item in music_results):
+            music_evidence = "ambient"
+            music_message = f"已分析 {len(music_results)} 首 · 氛围型 · 自动适配"
+        else:
+            music_evidence = "mixed"
+            music_message = f"已分析 {len(music_results)} 首 · 将按每首结构自动适配"
+        return {
+            "points": {
+                "evidence": point_evidence,
+                "count": points,
+                "successful": successful,
+                "failed": failed,
+                "message": point_message,
+            },
+            "semantic": {
+                "evidence": semantic_evidence,
+                "count": description_count,
+                "source_count": described_sources,
+                "message": semantic_message,
+            },
+            "music": {
+                "evidence": music_evidence,
+                "count": len(music_results),
+                "message": music_message,
+                "warnings": music_warnings,
+            },
+        }
+
     async def create(self, request: EditJobRequest) -> JobRecord:
         self._resolve_framing(request)
         self._validate_job_request(request)
         self._resolve_policy(request)
         if not request.output_name or request.output_name == "export.mp4":
             request.output_name = self._next_output_name(request.title)
-        job = JobRecord(request=request)
+        return await self._announce(request)
+
+    async def _announce(self, request: EditJobRequest, timeline=None) -> JobRecord:
+        """Publish and queue one job, including a timeline already selected by a batch."""
+        job = JobRecord(request=request, timeline=timeline)
         self._jobs[job.id] = job
         await self.events.publish("JOB_CREATED", job.model_dump(mode="json"))
         asyncio.create_task(self._run(job.id))
@@ -86,21 +192,25 @@ class JobService:
         # being announced must not split one batch between landscape and portrait.
         self._resolve_framing(request)
         self._validate_batch_request(request)
+        if request.editorial_preset is not None:
+            return await self._create_automatic_batch(request)
         count = self._allowed_output_count(request)
         batch_seed = request.seed if request.seed is not None else random.SystemRandom().randrange(MAX_SEED)
         rng = random.Random(batch_seed)
+        source_ids = self._deal_sources(request.media_ids, count)
         music_ids = self._deal_pool(request.music_media_ids, count, rng)
-        voiceover_ids = self._deal_pool(request.voiceover_media_ids, count, rng)
+        voiceover_ids = self._deal_voiceovers(source_ids, request.voiceover_media_ids, rng)
         self._avoid_repeat_pairs(music_ids, voiceover_ids, rng)
         variant_seeds = self._deal_variant_seeds(request.cut_variation, count, rng)
-        signatures = self._deal_signatures(request, count, rng)
+        signatures = self._deal_source_signatures(request, source_ids, rng)
         jobs: list[JobRecord] = []
         for index in range(count):
-            media_ids = list(request.media_ids)
-            rng.shuffle(media_ids)
             job_request = EditJobRequest(
                 title=f"{request.title} {index + 1:03d}",
-                media_ids=media_ids,
+                # One source recording is one narrative. Mixing five independent recordings
+                # inside all ten outputs destroys each recording's chronology; dealing the
+                # sources gives the requested two intact outputs per source instead.
+                media_ids=[source_ids[index]],
                 music_media_id=music_ids[index],
                 voiceover_media_id=voiceover_ids[index],
                 output_name=self._next_output_name(request.title),
@@ -124,6 +234,195 @@ class JobService:
         if self.settings is not None:
             self.settings.record_outputs(len(jobs))
         return jobs
+
+    async def _create_automatic_batch(self, request: EditBatchRequest) -> list[JobRecord]:
+        """Plan a portfolio first and render only the selected outputs.
+
+        Four candidate timelines per requested delivery is enough to vary source intervals,
+        coherent policy choices, and music windows without multiplying the expensive render
+        count. Video and music analysis are shared across the whole batch.
+        """
+        count = request.output_count
+        if self.settings is not None:
+            count = min(count, self.settings.output_quota().remaining_today)
+        if count <= 0:
+            raise ValueError("今日自动剪辑产出已达上限，可在设置中调整每日上限")
+
+        batch_seed = request.seed if request.seed is not None else random.SystemRandom().randrange(MAX_SEED)
+        rng = random.Random(batch_seed)
+        media_items = [self.media.get(media_id) for media_id in request.media_ids]
+        media_items = [item for item in media_items if item is not None]
+        item_by_id = {item.id: item for item in media_items}
+        analyses = [await self.analysis.analyze_video(item) for item in media_items]
+        analysis_by_id = {analysis.media_id: analysis for analysis in analyses}
+        point_capability = {
+            item.id: inspect_sidecar(item.path)["evidence"] in {"full", "markers_only"}
+            for item in media_items
+        }
+        source_ids = self._deal_sources(request.media_ids, count)
+
+        music_ids = self._deal_pool(request.music_media_ids, count, rng)
+        voiceover_ids = self._deal_voiceovers(source_ids, request.voiceover_media_ids, rng)
+        self._avoid_repeat_pairs(music_ids, voiceover_ids, rng)
+        music_analyses = {}
+        for media_id in {value for value in music_ids if value}:
+            music = self.media.get(media_id)
+            if music is not None:
+                music_analyses[media_id] = await asyncio.to_thread(
+                    self.analysis.analyze_music, Path(music.path), [],
+                )
+
+        selected: list[TimelineCandidate] = []
+        rejected: list[dict] = []
+        for slot in range(count):
+            source_id = source_ids[slot]
+            source = item_by_id[source_id]
+            source_analysis = analysis_by_id[source_id]
+            has_points = point_capability[source_id]
+            music_id = music_ids[slot]
+            voiceover_id = voiceover_ids[slot]
+            music = self.media.get(music_id) if music_id else None
+            voiceover = self.media.get(voiceover_id) if voiceover_id else None
+            voiceover_duration = self._audio_duration(voiceover)
+            semantic_alignment = self.semantic.align(source, voiceover, voiceover_duration)
+            music_analysis = music_analyses.get(music_id)
+            structured_music = bool(music_analysis and music_analysis.evidence == "structured")
+            requested = request.editorial_preset or "smart"
+            family = (
+                smart_family(slot, count, has_points, structured_music)
+                if requested == "smart" else requested
+            )
+            candidates: list[TimelineCandidate] = []
+            for attempt in range(4):
+                variant_seed = rng.randrange(MAX_SEED)
+                candidate_rng = random.Random(variant_seed)
+                ordered_media = [source]
+                job_request = EditJobRequest(
+                    title=f"{request.title} {slot + 1:03d}",
+                    media_ids=[source_id],
+                    music_media_id=music_id,
+                    voiceover_media_id=voiceover_id,
+                    output_name=f".candidate-{batch_seed}-{slot}-{attempt}.mp4",
+                    target_duration_seconds=request.target_duration_seconds,
+                    mute_original_audio=request.mute_original_audio,
+                    beat_sync=request.beat_sync,
+                    output_aspect_ratio=request.output_aspect_ratio,
+                    output_crop_x=request.output_crop_x,
+                    output_crop_y=request.output_crop_y,
+                    variant_seed=variant_seed,
+                    batch_seed=batch_seed,
+                    editorial_preset=family,
+                    music_window_rank=slot + attempt,
+                    subtitles=request.subtitles,
+                    subtitle_font=request.subtitle_font,
+                    subtitle_size=request.subtitle_size,
+                )
+                resolve_family_policy(
+                    job_request, family, candidate_rng,
+                    has_points=has_points, has_music=structured_music,
+                )
+                timeline = self.planner.plan(
+                    job_request,
+                    ordered_media,
+                    [source_analysis],
+                    music,
+                    voiceover,
+                    voiceover_duration=voiceover_duration,
+                    source_size=self._source_size(ordered_media),
+                    music_analysis=music_analysis,
+                    semantic_alignment=semantic_alignment,
+                )
+                self._resolve_original_audio(
+                    request.mute_original_audio, [item.path for item in ordered_media], timeline,
+                )
+                score, components = score_timeline(
+                    timeline, [source_analysis], family, music_analysis,
+                )
+                self._assert_batch_timeline_integrity(timeline, source_id)
+                candidates.append(TimelineCandidate(
+                    slot=slot,
+                    request=job_request,
+                    timeline=timeline,
+                    score=score,
+                    components=components,
+                    preset=family,
+                    music_id=music_id,
+                ))
+            chosen = select_slot_candidate(candidates, selected)
+            selected.append(chosen)
+            for candidate in candidates:
+                if candidate is not chosen:
+                    rejected.append({
+                        "slot": slot + 1,
+                        "source_media_id": source_id,
+                        "preset": candidate.preset,
+                        "score": candidate.score,
+                        "variant_seed": candidate.request.variant_seed,
+                        "reason": "同一输出位中质量或与已选结果的差异度较低",
+                    })
+
+        jobs: list[JobRecord] = []
+        for index, candidate in enumerate(selected):
+            candidate.request.output_name = self._next_output_name(request.title)
+            candidate.request.title = f"{request.title} {index + 1:03d}"
+            candidate.timeline.title = candidate.request.title
+            candidate.timeline.output_path = str(
+                GENERATED_DIRS["exports"] / candidate.request.output_name
+            )
+            candidate.timeline.planning_diagnostics.update({
+                "batch_seed": batch_seed,
+                "portfolio_index": index + 1,
+                "portfolio_size": len(selected),
+                "preset_label": FAMILY_LABELS[candidate.preset],
+                "quality_score": candidate.score,
+                "score_components": candidate.components,
+                "source_media_id": candidate.request.media_ids[0],
+                "source_path": candidate.timeline.clips[0].source_path if candidate.timeline.clips else "",
+                "source_allocation": "one_recording_per_output",
+            })
+            jobs.append(await self._announce(candidate.request, candidate.timeline))
+
+        self._write_batch_manifest(request, batch_seed, selected, rejected)
+        if self.settings is not None:
+            self.settings.record_outputs(len(jobs))
+        return jobs
+
+    def _write_batch_manifest(self, request, batch_seed, selected, rejected) -> None:
+        path = GENERATED_DIRS["logs"] / f"batch-plan-{batch_seed}.json"
+        write_json(path, {
+            "planner_version": 2,
+            "batch_seed": batch_seed,
+            "requested_preset": request.editorial_preset,
+            "requested_count": request.output_count,
+            "source_allocation": "one_recording_per_output",
+            "source_output_counts": {
+                media_id: sum(
+                    1 for item in selected if item.request.media_ids == [media_id]
+                )
+                for media_id in dict.fromkeys(request.media_ids)
+            },
+            "candidate_count": len(selected) + len(rejected),
+            "selected_count": len(selected),
+            "selected": [
+                {
+                    "index": index + 1,
+                    "output_name": item.request.output_name,
+                    "preset": item.preset,
+                    "preset_label": FAMILY_LABELS[item.preset],
+                    "score": item.score,
+                    "components": item.components,
+                    "variant_seed": item.request.variant_seed,
+                    "source_media_id": item.request.media_ids[0],
+                    "source_path": item.timeline.clips[0].source_path if item.timeline.clips else "",
+                    "music_media_id": item.music_id,
+                    "music_start_seconds": item.timeline.music_start_seconds,
+                    "music_duration_seconds": item.timeline.music_duration_seconds,
+                    "clips": [clip.model_dump(mode="json") for clip in item.timeline.clips],
+                }
+                for index, item in enumerate(selected)
+            ],
+            "rejected": rejected,
+        })
 
     def _allowed_output_count(self, request: EditBatchRequest) -> int:
         """How many outputs this batch may actually make.
@@ -150,28 +449,32 @@ class JobService:
     def _distinct_capacity(self, request: EditBatchRequest) -> int:
         """How many meaningfully different videos this request can yield.
 
-        Editing choices times soundtracks times narrations. The sampling seed is deliberately
-        not a factor: it varies which seconds are used, which on footage of one place is a
-        difference nobody watching would name.
+        Capacity is additive across independent source recordings because an output belongs to
+        exactly one of them. Within a source it is editing choices times soundtracks times
+        narrations. The sampling seed is deliberately not a factor: it varies which seconds
+        are used, which on footage of one place is a difference nobody watching would name.
         """
-        labelled, several, musical = self._what_the_footage_supports(request)
-        axes = [
-            len(request.paces or EDIT_PACE_LEVELS),
-            len([
-                level for level in (request.contours or EDIT_CONTOUR_LEVELS)
-                if musical or level != "follow_energy"
-            ]),
-            len(request.footage_mixes or FOOTAGE_MIX_LEVELS) if labelled else 1,
-            len(request.emphases or EDIT_EMPHASIS_LEVELS) if labelled else 1,
-            len(request.point_scopes or EDIT_SCOPE_LEVELS) if labelled else 1,
-            len(request.recording_scopes or EDIT_SCOPE_LEVELS) if several else 1,
-            request.start_rotations if labelled else 1,
-            max(1, len(dict.fromkeys(request.music_media_ids))),
-            max(1, len(dict.fromkeys(request.voiceover_media_ids))),
-        ]
-        capacity = 1
-        for size in axes:
-            capacity *= max(1, size)
+        capacity = 0
+        for media_id in dict.fromkeys(request.media_ids):
+            scoped = request.model_copy(deep=True)
+            scoped.media_ids = [media_id]
+            labelled, _several, musical = self._what_the_footage_supports(scoped)
+            axes = [
+                len(scoped.paces or EDIT_PACE_LEVELS),
+                len([
+                    level for level in (scoped.contours or EDIT_CONTOUR_LEVELS)
+                    if musical or level != "follow_energy"
+                ]),
+                len(scoped.footage_mixes or FOOTAGE_MIX_LEVELS) if labelled else 1,
+                len(scoped.emphases or EDIT_EMPHASIS_LEVELS) if labelled else 1,
+                len(scoped.point_scopes or EDIT_SCOPE_LEVELS) if labelled else 1,
+                max(1, len(dict.fromkeys(scoped.music_media_ids))),
+                max(1, len(dict.fromkeys(scoped.voiceover_media_ids))),
+            ]
+            source_capacity = 1
+            for size in axes:
+                source_capacity *= max(1, size)
+            capacity += source_capacity
         return capacity
 
     async def create_from_timeline(self, timeline) -> JobRecord:
@@ -201,6 +504,7 @@ class JobService:
             ),
             output_crop_x=timeline.output_crop_x,
             output_crop_y=timeline.output_crop_y,
+            editorial_preset=timeline.editorial_preset,
             # Read back off the timeline the client sent rather than defaulted to False. The
             # timeline is what gets rendered here, so a record saying otherwise would describe
             # an export that never happened.
@@ -227,6 +531,8 @@ class JobService:
             output_crop_x=request.output_crop_x,
             output_crop_y=request.output_crop_y,
             variant_seed=request.variant_seed,
+            editorial_preset=request.editorial_preset,
+            music_window_rank=request.music_window_rank,
             footage_mix=request.footage_mix,
             emphasis=request.emphasis,
             pace=request.pace,
@@ -249,11 +555,18 @@ class JobService:
         voiceover = self.media.get(job_request.voiceover_media_id) if job_request.voiceover_media_id else None
         analyses = []
         for item in media_items:
-            analyses.append(await self.analysis.analyze_video(item, music))
+            analyses.append(await self.analysis.analyze_video(item))
+        music_analysis = None
+        if music:
+            music_analysis = await asyncio.to_thread(
+                self.analysis.analyze_music, Path(music.path), [],
+            )
         timeline = self.planner.plan(
             job_request, media_items, analyses, music, voiceover,
             voiceover_duration=self._audio_duration(voiceover),
             source_size=self._source_size(media_items),
+            music_analysis=music_analysis,
+            semantic_alignment=self._semantic_alignment(media_items, voiceover),
         )
         self._resolve_original_audio(
             job_request.mute_original_audio, [item.path for item in media_items], timeline,
@@ -382,10 +695,13 @@ class JobService:
                     job.request, media_items, analyses, music, voiceover,
                     voiceover_duration=self._audio_duration(voiceover),
                     source_size=self._source_size(media_items),
+                    semantic_alignment=self._semantic_alignment(media_items, voiceover),
                 )
                 self._resolve_original_audio(
                     job.request.mute_original_audio, [item.path for item in media_items], timeline,
                 )
+                if job.request.batch_seed is not None and len(job.request.media_ids) == 1:
+                    self._assert_batch_timeline_integrity(timeline, job.request.media_ids[0])
                 # Kept on the record, not just used and dropped. `is_path_in_use` reads it to
                 # refuse a rename of anything a running render is reading from, and could not
                 # see an auto-planned job at all while this was a local variable.
@@ -432,6 +748,8 @@ class JobService:
                     "output_aspect_ratio": job.request.output_aspect_ratio,
                     "output_crop_x": timeline.output_crop_x,
                     "output_crop_y": timeline.output_crop_y,
+                    "editorial_preset": timeline.editorial_preset,
+                    "planning_diagnostics": timeline.planning_diagnostics,
                     # Re-cutting a file that already has text painted into it drags the old
                     # subtitles along at the wrong times, so the UI has to be able to say so.
                     "has_burned_subtitles": subtitled,
@@ -454,6 +772,8 @@ class JobService:
                         "output_aspect_ratio": job.request.output_aspect_ratio,
                         "output_crop_x": timeline.output_crop_x,
                         "output_crop_y": timeline.output_crop_y,
+                        "editorial_preset": timeline.editorial_preset,
+                        "planning_diagnostics": timeline.planning_diagnostics,
                         "has_burned_subtitles": False,
                     },
                 )
@@ -461,7 +781,7 @@ class JobService:
             job.progress = 1
             job.message = "Export complete"
             job.result_path = result_path
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - job failures are recorded and surfaced
             job.status = JobStatus.FAILED
             job.error = str(exc)
             job.message = "Export failed"
@@ -480,6 +800,16 @@ class JobService:
         except (TypeError, ValueError):
             pass
         return self.renderer.probe_duration(item.path)
+
+    def _semantic_alignment(
+        self, media_items: list, voiceover,
+    ) -> SemanticAlignment:
+        """Semantic evidence is meaningful only inside one recording's chronology."""
+        if len(media_items) != 1:
+            return SemanticAlignment(reason="timeline contains multiple recordings")
+        return self.semantic.align(
+            media_items[0], voiceover, self._audio_duration(voiceover)
+        )
 
     def _source_size(self, items) -> tuple[int, int] | None:
         return self._source_size_from_path(items[0].path) if items else None
@@ -561,7 +891,7 @@ class JobService:
         stamp = datetime.now().astimezone().strftime("%m-%d %H-%M")
         prefix = safe_stem(title, "导出")
         exports_dir = GENERATED_DIRS["exports"]
-        for index in range(0, 10000):
+        for index in range(10000):
             suffix = "" if index == 0 else f"_{index:02d}"
             name = f"{prefix} {stamp}{suffix}.mp4"
             if name in self._allocated_output_names:
@@ -571,6 +901,65 @@ class JobService:
             self._allocated_output_names.add(name)
             return name
         raise RuntimeError("Unable to allocate export filename")
+
+    def _deal_sources(self, media_ids: list[str], count: int) -> list[str]:
+        """Balance deliveries across recordings without ever mixing them.
+
+        When there are at least as many outputs as sources this is round-robin, so five inputs
+        and ten outputs is exactly two each. When there are fewer outputs, sample the ordered
+        source list at evenly spaced midpoints rather than silently taking only its beginning.
+        No random draw is involved: source ownership should be transparent and stable even
+        when a user changes the batch seed to re-roll the cuts.
+        """
+        sources = list(dict.fromkeys(media_ids))
+        if not sources or count <= 0:
+            return []
+        if count >= len(sources):
+            return [sources[index % len(sources)] for index in range(count)]
+        return [
+            sources[min(len(sources) - 1, int((index + 0.5) * len(sources) / count))]
+            for index in range(count)
+        ]
+
+    def _deal_source_signatures(
+        self,
+        request: EditBatchRequest,
+        source_ids: list[str],
+        rng: random.Random,
+    ) -> list[dict[str, object]]:
+        """Deal professional policies against each source's own evidence.
+
+        A batch may contain one cruise sidecar and four ordinary imports. Resolving capability
+        once for the whole batch made the plain videos receive point policies that could not do
+        anything. Grouping output slots by their assigned source keeps the same public controls
+        while every resolved field is truthful for the recording that output actually uses.
+        """
+        signatures: list[dict[str, object] | None] = [None] * len(source_ids)
+        indexes_by_source: dict[str, list[int]] = {}
+        for index, media_id in enumerate(source_ids):
+            indexes_by_source.setdefault(media_id, []).append(index)
+        for media_id, indexes in indexes_by_source.items():
+            scoped = request.model_copy(deep=True)
+            scoped.media_ids = [media_id]
+            scoped.recording_scopes = []
+            scoped.start_rotations = 1
+            dealt = self._deal_signatures(scoped, len(indexes), rng)
+            for index, signature in zip(indexes, dealt):
+                signatures[index] = signature
+        return [signature or {} for signature in signatures]
+
+    def _assert_batch_timeline_integrity(self, timeline, source_id: str) -> None:
+        """Fail before rendering if a batch timeline violates its source contract."""
+        if not timeline.clips:
+            raise RuntimeError("Batch planner produced an empty timeline")
+        if any(clip.media_id != source_id for clip in timeline.clips):
+            raise RuntimeError("Batch planner mixed multiple source recordings in one output")
+        looping = any("画面循环" in warning for warning in timeline.warnings)
+        if not looping and any(
+            first.start + first.duration > second.start + 1e-6
+            for first, second in zip(timeline.clips, timeline.clips[1:])
+        ):
+            raise RuntimeError("Batch planner produced a non-chronological source timeline")
 
     def _deal_signatures(
         self,
@@ -596,7 +985,7 @@ class JobService:
         one-level axis: leaving it in and overriding it afterwards would spend deck positions
         on choices already made.
         """
-        labelled, several, musical = self._what_the_footage_supports(request)
+        labelled, _several, musical = self._what_the_footage_supports(request)
         axes: list[tuple[str, list]] = [
             ("pace", list(request.paces or EDIT_PACE_LEVELS)),
             ("contour", [
@@ -606,8 +995,11 @@ class JobService:
             ("footage_mix", list(request.footage_mixes or FOOTAGE_MIX_LEVELS) if labelled else []),
             ("emphasis", list(request.emphases or EDIT_EMPHASIS_LEVELS) if labelled else []),
             ("point_scope", list(request.point_scopes or EDIT_SCOPE_LEVELS) if labelled else []),
-            ("recording_scope", list(request.recording_scopes or EDIT_SCOPE_LEVELS) if several else []),
-            ("start_rotation", list(range(request.start_rotations)) if labelled else []),
+            # A batch output belongs to one recording and follows it forward. These older API
+            # fields remain serialised for compatibility but no longer act as hidden diversity
+            # axes that contradict the product's timeline-integrity rule.
+            ("recording_scope", []),
+            ("start_rotation", []),
         ]
         live = [(name, levels) for name, levels in axes if levels]
         columns = {name: self._deal_pool(levels, count, rng) for name, levels in live}
@@ -649,8 +1041,8 @@ class JobService:
             item = self.media.get(media_id)
             if item is None:
                 continue
-            sidecar = read_sidecar(item.path)
-            if sidecar and sidecar.get("segments"):
+            capability = inspect_sidecar(item.path)
+            if capability["evidence"] in {"full", "markers_only"}:
                 labelled = True
                 break
         return labelled, len(media_ids) > 1, bool(request.music_media_ids) and request.beat_sync
@@ -726,6 +1118,57 @@ class JobService:
             dealt.extend(shuffled[:output_count - len(dealt)])
         return dealt
 
+    def _deal_voiceovers(
+        self,
+        source_ids: list[str],
+        media_ids: list[str],
+        rng: random.Random,
+    ) -> list[str | None]:
+        """Keep the balanced voiceover deck, then improve source/content compatibility.
+
+        Swapping positions never changes how many times a selected narration is used. With no
+        explicit point descriptions or no TTS text all affinities are neutral and this is
+        byte-for-byte the old dealt pool. Where both sides have meaning, model similarity (or
+        the local lexical fallback) prevents a warehouse script being assigned to a showroom
+        while the matching pair sits in another output slot.
+        """
+        dealt = self._deal_pool(media_ids, len(source_ids), rng)
+        choices = [item for item in dict.fromkeys(dealt) if item]
+        if len(source_ids) < 2 or len(choices) < 2:
+            return dealt
+
+        scores: dict[tuple[int, str], float] = {}
+        for index, source_id in enumerate(source_ids):
+            source = self.media.get(source_id)
+            for voice_id in choices:
+                voice = self.media.get(voice_id)
+                affinity = self.semantic.compatibility(source, voice) if source is not None else None
+                # Unknown means a generic narration, not a bad one. It should preserve the old
+                # deck rather than be pushed below a measured but weak match.
+                scores[index, voice_id] = 0.5 if affinity is None else affinity
+
+        for _pass in range(len(dealt)):
+            best: tuple[float, int, int] | None = None
+            for first in range(len(dealt) - 1):
+                a = dealt[first]
+                if not a:
+                    continue
+                for second in range(first + 1, len(dealt)):
+                    b = dealt[second]
+                    if not b or a == b:
+                        continue
+                    gain = (
+                        scores[first, b] + scores[second, a]
+                        - scores[first, a] - scores[second, b]
+                    )
+                    if gain > 1e-6 and (best is None or gain > best[0]):
+                        best = (gain, first, second)
+            if best is None:
+                break
+            _gain, first, second = best
+            dealt[first], dealt[second] = dealt[second], dealt[first]
+        return dealt
+
     def _avoid_repeat_pairs(
         self,
         music_ids: list[str | None],
@@ -748,9 +1191,11 @@ class JobService:
             if pair not in seen or len(seen) >= distinct:
                 seen.add(pair)
                 continue
-            for offset in range(index + 1, len(voiceover_ids)):
-                candidate = (music_ids[index], voiceover_ids[offset])
+            for offset in range(index + 1, len(music_ids)):
+                candidate = (music_ids[offset], voiceover_ids[index])
                 if candidate not in seen:
-                    voiceover_ids[index], voiceover_ids[offset] = voiceover_ids[offset], voiceover_ids[index]
+                    # Music carries no recording-specific meaning. Swapping it preserves a
+                    # semantic source/voiceover pairing established by `_deal_voiceovers`.
+                    music_ids[index], music_ids[offset] = music_ids[offset], music_ids[index]
                     break
             seen.add((music_ids[index], voiceover_ids[index]))
