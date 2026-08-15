@@ -7,23 +7,15 @@ from automated_video_editing_backend.services.settings import SettingsService
 
 DOUBAO_API_URL = "https://ark.cn-beijing.volces.com/api/v3/chat/completions"
 
-# Written in Chinese because the notes, the operator, and the TTS voice are all Chinese.
+# Written in Chinese because the operator and the TTS voice are Chinese.
 VOICEOVER_SYSTEM_PROMPT = """你为机器人拍摄的短视频撰写口播文稿。
 
-你会收到两类输入，它们的地位并不相同：
-- 文案或要求：运营希望表达的内容。有它时，以它为准，决定内容与语气。
-- 备注：拍摄现场随手记录的观察，是素材，绝不是要照着念出来的句子。
-
-备注是混杂的。只取其中描述画面内容的部分——商品、卖点、价格、值得一提的细节。
-凡是关于拍摄和现场执行的，一律安静丢弃：运镜抖动、灯光、电量、重拍、机器人状态、
-给自己的提醒。任何对素材本身的吐槽都不许出现在口播里。
+你会收到运营希望表达的文案或要求。以它为唯一事实来源，整理成适合短视频配音的自然口播。
 
 规则：
 - 用中文输出。
-- 只使用文案或备注中已有的信息。不得编造价格、品牌、名称或任何未给出的说法。
-- 文案与备注冲突时，以文案为准。
-- 只有备注、没有文案时，从可用的备注中组织口播。
-- 如果筛选后没有任何可用信息，返回空字符串，不要用套话凑数。
+- 只使用文案中已有的信息。不得编造价格、品牌、名称或任何未给出的说法。
+- 如果文案没有可用信息，返回空字符串，不要用套话凑数。
 - 只返回口播正文，不要前言、标题、解释或引号。"""
 
 
@@ -49,19 +41,15 @@ class LLMService:
                 message="LLM responded",
                 details={"model": cfg.get("model"), "sample": text[:80]},
             )
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - provider health check reports every failure
             return ProviderTestResult(ok=False, provider="doubao", message=str(exc))
 
-    async def draft_voiceover(
-        self,
-        raw_text: str,
-        notes: list[str] | None = None,
-    ) -> str:
-        """Draft narration from the operator's text and, optionally, capture notes.
+    async def draft_voiceover(self, raw_text: str) -> str:
+        """Draft narration solely from text the operator deliberately supplied for speech.
 
-        Notes are raw jottings made while filming and are a mixed bag: some describe the
-        subject, some complain about the footage. The prompt's main job is discarding the
-        second kind, so a shaky-camera note never becomes a spoken line.
+        Capture notes have a different job: they describe which point contains which subject
+        so the local semantic matcher can align an existing narration with the picture. Keeping
+        them out of this service makes it impossible for a filming reminder to become dialogue.
         """
         cfg = self.settings.llm_config()
         if not bool(cfg.get("enabled")):
@@ -69,13 +57,7 @@ class LLMService:
         if not self._configured(cfg):
             raise ValueError("LLM is enabled but settings are incomplete")
 
-        note_lines = [note.strip() for note in (notes or []) if note and note.strip()]
-        user = "\n\n".join(
-            [
-                "备注（原始记录，无顺序）：\n" + ("\n".join(f"- {line}" for line in note_lines) or "（无）"),
-                f"文案或要求：\n{raw_text.strip() or '（无）'}",
-            ]
-        )
+        user = f"文案或要求：\n{raw_text.strip() or '（无）'}"
         return await self._chat(
             cfg,
             system=VOICEOVER_SYSTEM_PROMPT,

@@ -1,10 +1,11 @@
 # Shot Scoring
 
-A plan for making the editor able to tell a good shot from a bad one.
+A design record for making the editor able to tell a usable shot from a damaged one.
 
-Today it cannot. Selection is positional — stride, gaps, seeded offsets — so a blurry frame, a
-blown-out window, a violent pan and a well-composed shot are all equally likely to be used.
-Nothing in the pipeline asks whether a shot is worth using.
+The cheap technical scorer, cached analysis, PyAV-backed scene detection, local quality
+profiles, quality-weighted allocation, and portfolio similarity terms are now implemented.
+The remaining limit is aesthetic/semantic judgement: no uncalibrated model is presented as a
+substitute for human ratings we do not yet have.
 
 Scoring is worth more than the quality it buys, which is why it comes before the remaining
 diversity work rather than after it. See §6.
@@ -226,9 +227,9 @@ entirely.
 | 0 | Cache analysis per source | none | low | 18 min → 11 s on a 100-output batch | **done** |
 | 1 | PyAV backend, AdaptiveDetector, edges | `av` | low | scene detection runs *at all*, for the first time | **done** |
 | 2 | Sharpness / exposure / motion band | none | low | shots are measured; scores differ 0.43 vs 1.00 on test footage | **done** |
-| 3 | Weighted placement | none | **medium** — touches the placement core | quality reaches the screen | **next** |
-| 4 | Similarity as a score term | none | low | smooth between cuts, varied across the piece | |
-| 5 | DOVER-Mobile | torch | medium | "good" rather than "not broken" | |
+| 3 | Local profiles + quality-weighted allocation | none | medium | quality reaches the screen while chronology stays hard | **done** |
+| 4 | Similarity as candidate score terms | none | low | adjacent visual flow plus whole-output non-repetition | **done** |
+| 5 | DOVER-Mobile | torch | medium | "good" rather than "not broken" | **deferred: no labelled validation** |
 | 6 | Score-derived segments | none | medium | 15 → 1440 on plain footage | |
 
 Steps 0–2 are free of dependency risk and independently useful; 3 is the one that touches code

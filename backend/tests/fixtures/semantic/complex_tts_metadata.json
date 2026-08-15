@@ -1,0 +1,32 @@
+{
+  "title": "工厂参观口播",
+  "text": "今天带大家看看这座工厂如何完成从展示到交付。首先看到的是公司方案与样品集中呈现的区域。继续向前，机械臂正在进行自动装配，旁边设备同步检查质量。完成包装的货品会暂存在这里，随后统一安排发运。最后提醒，来访登记和咨询需要在最开始经过的服务台办理。",
+  "duration_ms": 27000,
+  "words": [
+    {"word": "今天", "start_time": 0, "end_time": 350},
+    {"word": "带大家看看", "start_time": 380, "end_time": 1100},
+    {"word": "这座工厂", "start_time": 1150, "end_time": 1800},
+    {"word": "如何完成", "start_time": 1850, "end_time": 2500},
+    {"word": "从展示到交付。", "start_time": 2550, "end_time": 3400},
+    {"word": "首先看到的", "start_time": 4200, "end_time": 4850},
+    {"word": "是公司方案", "start_time": 4900, "end_time": 5550},
+    {"word": "与样品", "start_time": 5600, "end_time": 6150},
+    {"word": "集中呈现的", "start_time": 6200, "end_time": 7050},
+    {"word": "区域。", "start_time": 7100, "end_time": 8000},
+    {"word": "继续向前，", "start_time": 8900, "end_time": 9650},
+    {"word": "机械臂正在", "start_time": 9700, "end_time": 10450},
+    {"word": "进行自动装配，", "start_time": 10500, "end_time": 11600},
+    {"word": "旁边设备", "start_time": 11650, "end_time": 12350},
+    {"word": "同步检查质量。", "start_time": 12400, "end_time": 14200},
+    {"word": "完成包装的货品", "start_time": 15000, "end_time": 16150},
+    {"word": "会暂存在这里，", "start_time": 16200, "end_time": 17350},
+    {"word": "随后统一", "start_time": 17400, "end_time": 18100},
+    {"word": "安排发运。", "start_time": 18150, "end_time": 19600},
+    {"word": "最后提醒，", "start_time": 20500, "end_time": 21300},
+    {"word": "来访登记和咨询", "start_time": 21350, "end_time": 22650},
+    {"word": "需要在最开始", "start_time": 22700, "end_time": 23800},
+    {"word": "经过的服务台", "start_time": 23850, "end_time": 25200},
+    {"word": "办理。", "start_time": 25250, "end_time": 26400}
+  ],
+  "phonemes": []
+}

@@ -415,6 +415,33 @@ p { margin: 6px 0 0; color: var(--text-muted); }
 .source-pick span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .secret-state { font-size: 11px; color: var(--rose); }
 .secret-state.ok { color: var(--teal); }
+.settings-access-shell { position: relative; min-height: calc(100vh - 112px); }
+.settings-access-toolbar {
+  display: flex; justify-content: flex-end; align-items: center; gap: 10px;
+  margin-bottom: 12px; color: var(--text-muted); font-size: 12px;
+}
+.settings-access-toolbar button { padding: 7px 11px; }
+.settings-protected-content { transition: filter .18s ease, opacity .18s ease; }
+.settings-protected-content.locked {
+  filter: blur(8px); opacity: .56; pointer-events: none; user-select: none;
+}
+.topbar.settings-topbar-locked {
+  filter: blur(8px); opacity: .56; pointer-events: none; user-select: none;
+}
+.settings-unlock-layer {
+  position: absolute; inset: 0; z-index: 10; display: flex; align-items: flex-start;
+  justify-content: center; padding: min(16vh, 140px) 24px 40px;
+  background: rgba(248, 247, 255, .16);
+}
+.settings-unlock-card {
+  width: min(390px, 100%); display: flex; flex-direction: column; gap: 14px;
+  padding: 24px; border: 1px solid var(--border-strong); border-radius: 12px;
+  background: rgba(255, 255, 255, .9); backdrop-filter: blur(22px);
+  box-shadow: 0 24px 70px rgba(82, 70, 170, .22);
+}
+.settings-unlock-card > strong { font-size: 20px; color: var(--text); }
+.settings-unlock-card > p { margin: -6px 0 2px; }
+.settings-unlock-card .inline-status { margin: 0; }
 
 /* ── Scrolling and growth ─────────────────────────────────────────────────────
    Three rules: never clip (always offer a scrollbar), cap lists so one long list
@@ -440,8 +467,8 @@ p { margin: 6px 0 0; color: var(--text-muted); }
    also stops the robot panel being stretched into a mostly-empty box. */
 .settings-scroll { display: flex; flex-direction: column; gap: 12px; max-height: 520px; overflow-y: auto; padding-right: 4px; }
 
-/* 自动剪辑工作台 holds a lot: title, duration, three media pools, five editing policies, a seed,
-   and the subtitle controls. Left to grow it pushed everything below it off the screen, so it is
+/* 自动剪辑工作台 holds title, duration, three media pools, an outcome direction,
+   capability status and subtitle controls. Left to grow it pushed everything below it off the screen, so it is
    given the same bounded, scrolling body the settings panels use. 「创建剪辑任务」 stays outside
    the scroll — the one thing you always want in reach should not be the thing you have to hunt
    for. */
@@ -454,12 +481,22 @@ p { margin: 6px 0 0; color: var(--text-muted); }
    this one they are shorter. Scrolling still chains out to the panel at either end. */
 .workbench-scroll .pool-list { max-height: 132px; }
 
-/* 自动剪辑工作台 的剪辑风格选择
-   The two groups sit on a hue ramp — violet for the rules that shape any footage, teal for the
-   ones that divide up a cruise route. Colour carries the grouping, so which rules need a
-   cruise is legible without reading five labels. Rows step in intensity within their group. */
+.editing-mode-switch { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+.editing-mode-switch button {
+  min-height: 62px; display: flex; flex-direction: column; align-items: flex-start;
+  justify-content: center; gap: 4px; padding: 10px 12px; text-align: left;
+}
+.editing-mode-switch span { color: var(--text); font-size: 14px; font-weight: 800; }
+.editing-mode-switch small { color: var(--text-muted); font-size: 11px; line-height: 1.35; }
+.editing-mode-switch button.active {
+  border-color: var(--purple); background: linear-gradient(135deg, rgba(120, 92, 255, .17), rgba(102, 130, 255, .09));
+  box-shadow: inset 0 0 0 1px rgba(120, 92, 255, .12);
+}
+.editing-mode-switch button.active span { color: var(--purple-strong); }
+
 :root { --policy-tint-0: 262; --policy-tint-1: 196; }
 .policy-block { display: flex; flex-direction: column; gap: 14px; border: 1px solid var(--border); border-radius: 10px; padding: 12px; background: rgba(255, 255, 255, .28); }
+.professional-policy-block .pool-title { margin: -12px -12px 0; border-radius: 9px 9px 0 0; }
 .policy-group { display: flex; flex-direction: column; gap: 8px; padding-left: 11px; border-left: 3px solid hsl(var(--tint) 72% 66%); border-radius: 3px; }
 .policy-group.dim { opacity: .5; }
 .policy-group-head { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
@@ -481,6 +518,30 @@ p { margin: 6px 0 0; color: var(--text-muted); }
 /* 自动 is a choice, not an absent one, so it reads differently from a pinned level. */
 .policy-choices button.auto { font-weight: 600; }
 .policy-choices button.auto.active { border-style: dashed; border-width: 1.5px; }
+
+/* Customers pick an outcome, not a matrix of internal weights. Each button says what the
+   resulting video feels like; the capability panel underneath explains which evidence the
+   automatic planner can actually use for this batch. */
+.editorial-direction-block .pool-title { margin: -12px -12px 0; border-radius: 9px 9px 0 0; }
+.editorial-direction-block .pool-title small { color: var(--text-muted); font-weight: 500; }
+.editorial-presets { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+.editorial-preset { min-height: 68px; display: flex; flex-direction: column; align-items: flex-start; justify-content: center; gap: 4px; padding: 10px 12px; text-align: left; }
+.editorial-preset span { color: var(--text); font-size: 14px; font-weight: 800; }
+.editorial-preset small { color: var(--text-muted); font-size: 11px; line-height: 1.35; font-weight: 500; }
+.editorial-preset.active { border-color: #8b5cf6; background: linear-gradient(135deg, rgba(139, 92, 246, .16), rgba(56, 189, 248, .09)); box-shadow: inset 0 0 0 1px rgba(139, 92, 246, .14); }
+.editorial-preset.active span { color: #6d3dcc; }
+.capability-panel { overflow: hidden; border: 1px solid var(--border); border-radius: 8px; background: rgba(255, 255, 255, .42); }
+.capability-head { display: flex; align-items: center; justify-content: space-between; padding: 8px 10px; color: var(--text-muted); font-size: 11px; font-weight: 800; }
+.capability-head small { font-weight: 500; }
+.capability-row { display: grid; grid-template-columns: 8px 34px minmax(0, 1fr); align-items: center; gap: 8px; padding: 8px 10px; border-top: 1px solid var(--border); color: var(--text-soft); font-size: 12px; }
+.capability-row i { width: 7px; height: 7px; border-radius: 50%; background: #a9b0bd; }
+.capability-row i.success { background: #22a874; box-shadow: 0 0 0 3px rgba(34, 168, 116, .1); }
+.capability-row i.warning { background: #d99416; box-shadow: 0 0 0 3px rgba(217, 148, 22, .1); }
+.capability-row i.danger { background: #dd5c65; box-shadow: 0 0 0 3px rgba(221, 92, 101, .1); }
+.capability-name { color: var(--text-muted); font-weight: 800; }
+@media (max-width: 760px) {
+  .editing-mode-switch, .editorial-presets { grid-template-columns: 1fr; }
+}
 
 /* 字幕. Boxed off from the two checkboxes above it because switching it on reveals its own
    controls, and an inline checkbox that grows two rows underneath reads as a glitch. */

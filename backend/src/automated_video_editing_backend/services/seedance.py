@@ -29,9 +29,12 @@ from automated_video_editing_backend.services.naming import safe_stem, stamped_n
 from automated_video_editing_backend.services.render import RenderService
 from automated_video_editing_backend.services.settings import SettingsService
 
-
 # Seedream refuses any output smaller than this, so small sources must be scaled up.
 SEEDREAM_MIN_PIXELS = 3_686_400
+# The provider charges every short video as at least five seconds. This is deliberately separate
+# from the operator's preferred default duration: changing a 2-second default must not turn ten
+# paid generations into twenty-five.
+MINIMUM_BILLABLE_VIDEO_SECONDS = 5
 
 
 def _tos_error_message(response: Any, cfg: dict[str, Any]) -> str:
@@ -131,10 +134,35 @@ class SeedanceService:
     def quota(self) -> SeedanceQuota:
         cfg = self.settings.seedance_config()
         limit = int(cfg.get("daily_limit") or 10)
+        default_duration = max(2, min(15, int(cfg.get("default_duration_seconds") or 5)))
+        seconds_limit = limit * MINIMUM_BILLABLE_VIDEO_SECONDS
         today = date.today().isoformat()
         usage = self._read_usage()
-        used = int(usage.get(today, 0))
-        return SeedanceQuota(date=today, used=used, limit=limit, remaining=max(0, limit - used))
+        today_usage = usage.get(today, {})
+        used = int(today_usage.get("count", 0))
+        used_seconds = int(today_usage.get("video_seconds", 0))
+        count_remaining = max(0, limit - used)
+        remaining_seconds = max(0, seconds_limit - used_seconds)
+        # ``remaining`` remains the simple number older clients display. It now reports how
+        # many minimum-billed effects fit inside both limits, so one 15-second generation
+        # correctly consumes three of a 10 x 5-second daily allowance while a 2-second
+        # generation still consumes one full allowance.
+        remaining = min(
+            count_remaining,
+            remaining_seconds // MINIMUM_BILLABLE_VIDEO_SECONDS,
+        )
+        return SeedanceQuota(
+            date=today,
+            used=used,
+            limit=limit,
+            remaining=remaining,
+            count_remaining=count_remaining,
+            used_seconds=used_seconds,
+            seconds_limit=seconds_limit,
+            remaining_seconds=remaining_seconds,
+            default_duration_seconds=default_duration,
+            minimum_billable_seconds=MINIMUM_BILLABLE_VIDEO_SECONDS,
+        )
 
     async def test(self) -> ProviderTestResult:
         """Verify Ark authentication and the video-task API without buying a generation."""
@@ -179,7 +207,10 @@ class SeedanceService:
         source = await self._resolve_source(request)
         # Ark's video endpoint rejects JSON floats such as 4.0 even though the value is
         # mathematically whole. Normalise once and keep every downstream representation whole.
-        duration = int(round(request.duration_seconds or cfg.get("default_duration_seconds") or 5))
+        duration = max(
+            2,
+            min(15, int(round(request.duration_seconds or cfg.get("default_duration_seconds") or 5))),
+        )
         cache_key = self._cache_key(request.prompt, source["path"], source["url"], cfg, duration, kind)
         if request.reuse_existing:
             existing = self._find_existing(cache_key)
@@ -187,13 +218,29 @@ class SeedanceService:
                 return SeedanceGenerateResult(media_item=self._media_item_for_asset(existing), asset=existing, reused=True, quota=self.quota())
 
         quota = self.quota()
-        if quota.remaining <= 0:
+        if quota.count_remaining <= 0:
             raise ValueError(f"Seedance daily limit reached ({quota.limit})")
+        billable_seconds = max(duration, MINIMUM_BILLABLE_VIDEO_SECONDS) if kind == "video" else 0
+        if kind == "video" and billable_seconds > quota.remaining_seconds:
+            raise ValueError(
+                f"Seedance daily duration limit reached "
+                f"({quota.remaining_seconds}s remaining, {billable_seconds}s requested)"
+            )
 
         self._validate_config(cfg, source, kind)
         if not source.get("url") and source.get("path"):
             source["object_key"], source["url"] = await self._upload_source_to_tos(Path(source["path"]), cfg)
-        self._increment_usage(quota.date)
+        # Uploading can yield to another request. Recheck immediately before the synchronous
+        # usage write so two simultaneous submissions cannot both spend the same allowance.
+        quota = self.quota()
+        if quota.count_remaining <= 0:
+            raise ValueError(f"Seedance daily limit reached ({quota.limit})")
+        if kind == "video" and billable_seconds > quota.remaining_seconds:
+            raise ValueError(
+                f"Seedance daily duration limit reached "
+                f"({quota.remaining_seconds}s remaining, {billable_seconds}s requested)"
+            )
+        self._increment_usage(quota.date, video_seconds=billable_seconds)
         quota = self.quota()
 
         asset_id = uuid4().hex
@@ -698,21 +745,36 @@ class SeedanceService:
             parts.append(str(url or ""))
         return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()
 
-    def _read_usage(self) -> dict[str, int]:
+    def _read_usage(self) -> dict[str, dict[str, int]]:
         data, _problem = read_json(self.usage_path)
         if not isinstance(data, dict):
             return {}
-        return {str(key): int(value) for key, value in data.items()}
+        usage: dict[str, dict[str, int]] = {}
+        for key, value in data.items():
+            if isinstance(value, dict):
+                count = max(0, int(value.get("count", 0)))
+                video_seconds = max(0, int(value.get("video_seconds", 0)))
+            else:
+                # Old releases stored only a count. Treat every old generation as one
+                # minimum-billed effect: this preserves the allowance already spent today.
+                count = max(0, int(value))
+                video_seconds = count * MINIMUM_BILLABLE_VIDEO_SECONDS
+            usage[str(key)] = {"count": count, "video_seconds": video_seconds}
+        return usage
 
-    def _increment_usage(self, day: str) -> None:
-        """Spend one of the day's generations.
+    def _increment_usage(self, day: str, video_seconds: int = 0) -> None:
+        """Spend one generation and, for video, its actual duration allowance.
 
-        Written whole and moved into place. This limit stands between the operator and a paid
+        Written whole and moved into place. These limits stand between the operator and a paid
         API, and a torn write would read back as unparseable, which reads as nothing spent
         today — handing back the whole day's budget by accident.
         """
         usage = self._read_usage()
-        usage[day] = int(usage.get(day, 0)) + 1
+        today = usage.get(day, {"count": 0, "video_seconds": 0})
+        usage[day] = {
+            "count": int(today.get("count", 0)) + 1,
+            "video_seconds": int(today.get("video_seconds", 0)) + max(0, int(video_seconds)),
+        }
         write_json(self.usage_path, usage)
 
     def _base_url(self, cfg: dict[str, Any]) -> str:

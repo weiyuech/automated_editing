@@ -17,6 +17,10 @@ dependencies = [
   "numpy>=1.26,<2.3",
   "opencv-python-headless>=4.9",
   "scenedetect[opencv]>=0.6.4",
+  # CPU-only local semantic matching. The 24 MB INT8 model is fetched as a pinned asset by
+  # scripts/prepare_assets.py; no network call is made while editing.
+  "onnxruntime>=1.19,<2",
+  "tokenizers>=0.20,<1",
   # PySceneDetect's OpenCV backend answers NaN when asked a video's position in milliseconds,
   # which kills its decode thread on every file tried here. PyAV reads timestamps from the
   # container instead, and is what makes scene detection run at all.

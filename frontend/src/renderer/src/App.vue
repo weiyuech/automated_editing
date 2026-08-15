@@ -20,10 +20,13 @@
     <div class="sidebar-resizer" title="拖动调整侧栏宽度" @pointerdown="beginSidebarResize"></div>
 
     <main class="main">
-      <header class="topbar">
+      <header
+        class="topbar"
+        :class="{ 'settings-topbar-locked': active === 'settings' && !settingsAdminUnlocked }"
+      >
         <div>
           <h1>{{ current.label }}</h1>
-          <p>{{ current.description }}</p>
+          <p v-if="current.description">{{ current.description }}</p>
         </div>
         <button class="primary" :disabled="!bridgeReady" @click="pingBackend">测试连接</button>
       </header>
@@ -150,7 +153,7 @@
                   </div>
                 </div>
               </div>
-              <p class="framing-preview-caption">{{ framingAspectRatio ? '完整测试画面仍然可见；只有亮框内会进入成片。' : '未选择固定画幅：成片保持原始画面。' }}</p>
+              <p v-if="framingAspectRatio" class="framing-preview-caption">完整测试画面仍然可见；只有亮框内会进入成片。</p>
             </div>
 
             <div v-else class="framing-empty-preview">
@@ -334,13 +337,14 @@
           </div>
         </Panel>
 
-        <Panel title="备注" class="wide">
+        <Panel title="画面匹配备注" class="wide">
           <div class="form-stack">
-            <textarea v-model="captureNote" class="field text" placeholder="拍摄备注、运镜、成片质量..."></textarea>
+            <textarea v-model="captureNote" class="field text" placeholder="例如：点位1：产品展示区；点位2：仓库，存放成品与货物"></textarea>
             <div class="button-row">
               <button :disabled="!captureNote.trim() || !activeSession" @click="captureNoteSend">添加备注</button>
             </div>
-            <p v-if="!activeSession" class="form-hint">备注会记到当前采集里，先开始录制或巡游。</p>
+            <p class="form-hint">用于自动匹配旁白与点位画面，不会写入口播。</p>
+            <p v-if="!activeSession" class="form-hint">先开始录制或巡游，备注会随当前素材保存。</p>
             <pre v-else>{{ activeSessionSummary }}</pre>
           </div>
         </Panel>
@@ -513,8 +517,8 @@
         </Panel>
       </section>
 
-      <section v-else-if="active === 'studio'" class="grid two">
-        <Panel title="源视频素材">
+      <section v-else-if="active === 'studio' || active === 'assets'" class="grid two">
+        <Panel v-if="active === 'studio'" title="源视频素材">
           <div class="source-toolbar">
             <span>已选择 {{ selectedSourceIds.length }} / {{ MAX_SOURCE_VIDEOS }} 个</span>
             <button @click="selectAllSources">选择导入视频</button>
@@ -557,7 +561,7 @@
           </div>
         </Panel>
 
-        <Panel title="自动剪辑工作台">
+        <Panel v-if="active === 'studio'" title="自动剪辑工作台">
           <div class="form-stack">
             <!-- Everything up to the button scrolls; the button itself does not, so the action
                  is always reachable without scrolling back down to find it. -->
@@ -621,7 +625,71 @@
                 </div>
               </div>
             </div>
-            <div class="policy-block">
+            <div class="editing-mode-switch" role="tablist" aria-label="剪辑方式">
+              <button
+                role="tab"
+                :aria-selected="editingMode === 'smart'"
+                :class="{ active: editingMode === 'smart' }"
+                @click="editingMode = 'smart'"
+              >
+                <span>智能剪辑</span>
+                <small>选择成片方向，系统自动完成</small>
+              </button>
+              <button
+                role="tab"
+                :aria-selected="editingMode === 'professional'"
+                :class="{ active: editingMode === 'professional' }"
+                @click="editingMode = 'professional'"
+              >
+                <span>专业剪辑</span>
+                <small>调整剪辑策略，系统自动执行</small>
+              </button>
+            </div>
+            <div v-if="editingMode === 'smart'" class="policy-block editorial-direction-block">
+              <div class="pool-title">
+                <span>成片方向</span>
+                <small>只选结果倾向，具体剪法由系统完成</small>
+              </div>
+              <div class="editorial-presets">
+                <button
+                  v-for="preset in EDITORIAL_PRESETS"
+                  :key="preset.value"
+                  class="editorial-preset"
+                  :class="{ active: editorialPreset === preset.value }"
+                  @click="editorialPreset = preset.value"
+                >
+                  <span>{{ preset.label }}</span>
+                  <small>{{ preset.description }}</small>
+                </button>
+              </div>
+              <div class="capability-panel" aria-live="polite">
+                <div class="capability-head">
+                  <span>本次素材识别</span>
+                  <small v-if="editingCapabilitiesLoading">分析中…</small>
+                </div>
+                <div class="capability-row">
+                  <i :class="selectedSourceIds.length ? 'success' : 'muted'"></i>
+                  <span class="capability-name">画面</span>
+                  <span>{{ sourceCapabilityMessage }}</span>
+                </div>
+                <div class="capability-row">
+                  <i :class="capabilityTone(editingCapabilities.points?.evidence)"></i>
+                  <span class="capability-name">点位</span>
+                  <span>{{ editingCapabilities.points?.message }}</span>
+                </div>
+                <div class="capability-row">
+                  <i :class="capabilityTone(editingCapabilities.semantic?.evidence)"></i>
+                  <span class="capability-name">旁白匹配</span>
+                  <span>{{ editingCapabilities.semantic?.message }}</span>
+                </div>
+                <div class="capability-row">
+                  <i :class="capabilityTone(editingCapabilities.music?.evidence)"></i>
+                  <span class="capability-name">音乐</span>
+                  <span>{{ editingCapabilities.music?.message }}</span>
+                </div>
+              </div>
+            </div>
+            <div v-else class="policy-block professional-policy-block">
               <div class="pool-title">
                 <span>剪辑风格</span>
                 <button @click="resetPolicies">全部自动</button>
@@ -635,9 +703,7 @@
               >
                 <div class="policy-group-head">
                   <span class="policy-group-name">{{ group.label }}</span>
-                  <span class="policy-group-hint">
-                    {{ group.live ? group.hint : `${group.hint} · 当前素材无点位，这几项不会生效` }}
-                  </span>
+                  <span class="policy-group-hint">{{ group.status }}</span>
                 </div>
                 <div
                   v-for="(axis, axisIndex) in group.axes"
@@ -651,23 +717,15 @@
                       v-for="option in axis.options"
                       :key="option.value"
                       :class="{ active: policies[axis.key] === option.value, auto: option.value === 'auto' }"
-                      :title="option.hint"
+                      :disabled="!optionApplies(axis, option)"
+                      :title="policyOptionHint(axis, option)"
                       @click="policies[axis.key] = option.value"
                     >{{ option.label }}</button>
                   </div>
                 </div>
               </div>
-              <p class="form-hint">
-                {{ policySummary }}
-                <template v-if="hasCruisePoints">所选素材共 {{ selectedCruisePoints }} 个点位。</template>
-              </p>
-            </div>
-            <div class="field-row">
-              <span>随机种子（留空自动生成）</span>
-              <input v-model="batchSeed" class="field" type="number" min="0" placeholder="填入旧种子可复现整批" />
             </div>
             <label class="check-row"><input v-model="muteOriginalAudio" type="checkbox" /> 静音原视频噪声</label>
-            <label class="check-row"><input v-model="beatSync" type="checkbox" /> 按音乐节拍剪辑</label>
             <div class="subtitle-block">
               <label
                 class="check-row"
@@ -719,16 +777,13 @@
             <p v-if="jobStatus" class="inline-status" :class="jobStatusKind">{{ jobStatus }}</p>
           </div>
         </Panel>
-        <Panel title="旁白制作" class="wide">
+        <Panel v-if="active === 'assets'" title="旁白制作" class="wide">
           <div class="voiceover-layout">
             <div class="form-stack">
               <input v-model="voiceoverTitle" class="field" placeholder="旁白素材名称" />
               <textarea v-model="voiceoverText" class="field text voice-text" placeholder="脚本文本或大模型提示词"></textarea>
               <div class="voice-options">
                 <label class="check-row"><input v-model="voiceoverUseLlm" type="checkbox" /> 大模型辅助</label>
-                <label class="check-row" :class="{ disabled: !voiceoverUseLlm }">
-                  <input v-model="voiceoverIncludeNotes" type="checkbox" :disabled="!voiceoverUseLlm" /> 包含拍摄备注
-                </label>
               </div>
               <div class="voice-actions">
                 <button class="primary" :disabled="!canGenerateVoiceover || isGeneratingVoiceover" @click="generateVoiceover">{{ isGeneratingVoiceover ? '生成中...' : '生成旁白' }}</button>
@@ -761,7 +816,7 @@
             </div>
           </div>
         </Panel>
-        <Panel title="特效制作" class="wide">
+        <Panel v-if="active === 'assets'" title="特效制作" class="wide">
           <div class="effect-layout">
             <div class="form-stack">
               <div class="segmented compact-segmented">
@@ -813,9 +868,10 @@
               </template>
               <textarea v-model="seedancePrompt" class="field text effect-text" placeholder="特效提示词"></textarea>
               <div class="settings-pair">
-                <input v-if="seedanceOutput === 'video'" v-model.number="seedanceDuration" class="field" type="number" min="4" max="15" step="1" placeholder="特效秒数" />
+                <input v-if="seedanceOutput === 'video'" v-model.number="seedanceDuration" class="field" type="number" min="2" max="15" step="1" placeholder="特效秒数（2–15）" />
                 <input class="field" :value="seedanceQuotaText" disabled />
               </div>
+              <p v-if="seedanceOutput === 'video'" class="form-hint">按默认时长估算；实际可生成次数与每次生成时长有关。</p>
               <button class="primary" :disabled="!canGenerateSeedance" @click="generateSeedanceEffect">{{ isGeneratingSeedance ? '提交中...' : '生成特效' }}</button>
               <p v-if="seedanceStatus" class="inline-status" :class="seedanceStatusKind">{{ seedanceStatus }}</p>
             </div>
@@ -848,7 +904,7 @@
           </div>
         </Panel>
 
-        <Panel title="手动微调" class="wide">
+        <Panel v-if="active === 'studio'" title="手动微调" class="wide">
           <div class="tune">
             <div class="tune-row">
               <select v-model="tuneSourceId" class="field">
@@ -998,7 +1054,17 @@
         </Panel>
       </section>
 
-      <section v-else-if="active === 'settings'" class="grid two">
+      <section v-else-if="active === 'settings'" class="settings-access-shell">
+        <div v-if="settingsAdminUnlocked" class="settings-access-toolbar">
+          <span>管理员模式</span>
+          <button type="button" @click="lockSettings">锁定设置</button>
+        </div>
+        <div
+          class="grid two settings-protected-content"
+          :class="{ locked: !settingsAdminUnlocked }"
+          :inert="!settingsAdminUnlocked"
+          :aria-hidden="!settingsAdminUnlocked"
+        >
         <Panel title="大模型服务">
           <div class="form-stack settings-form">
             <div class="settings-scroll">
@@ -1127,10 +1193,11 @@
               <label class="field-row"><span>每日生成上限</span>
                 <input v-model.number="settingsForm.seedance.daily_limit" class="field" type="number" min="1" max="100" step="1" />
               </label>
-              <label class="field-row"><span>视频时长（秒）</span>
-                <input v-model.number="settingsForm.seedance.default_duration_seconds" class="field" type="number" min="4" max="15" step="1" />
+              <label class="field-row"><span>默认视频时长（秒）</span>
+                <input v-model.number="settingsForm.seedance.default_duration_seconds" class="field" type="number" min="2" max="15" step="1" />
               </label>
             </div>
+            <p class="form-hint">默认时长用于估算每日额度；单条视频越长，可生成次数越少。</p>
             <div class="settings-pair">
               <label class="field-row"><span>视频分辨率</span>
                 <input v-model="settingsForm.seedance.resolution" class="field" placeholder="720p" />
@@ -1172,15 +1239,52 @@
           </div>
           <p v-if="settingsStatus" class="inline-status" :class="settingsStatusKind">{{ settingsStatus }}</p>
         </Panel>
+        </div>
+        <div v-if="!settingsAdminUnlocked" class="settings-unlock-layer">
+          <form class="settings-unlock-card" @submit.prevent="unlockSettings">
+            <strong>管理员验证</strong>
+            <p>请输入管理员账号和密码以查看设置。</p>
+            <label class="field-row">
+              <span>管理员账号</span>
+              <input
+                v-model.trim="settingsAdminUsername"
+                class="field"
+                autocomplete="username"
+                placeholder="管理员账号"
+                autofocus
+              />
+            </label>
+            <label class="field-row">
+              <span>密码</span>
+              <input
+                v-model="settingsAdminPassword"
+                class="field"
+                type="password"
+                autocomplete="current-password"
+                placeholder="密码"
+              />
+            </label>
+            <button
+              class="primary"
+              type="submit"
+              :disabled="isUnlockingSettings || !settingsAdminUsername || !settingsAdminPassword"
+            >
+              {{ isUnlockingSettings ? '验证中...' : '进入设置' }}
+            </button>
+            <p v-if="settingsAdminStatus" class="inline-status" :class="settingsAdminStatusKind">
+              {{ settingsAdminStatus }}
+            </p>
+          </form>
+        </div>
       </section>
     </main>
     <div v-if="showFramingSetupPrompt" class="modal-backdrop" @click.self="showFramingSetupPrompt = false">
       <div class="modal-card framing-setup-modal">
         <strong>尚未选择固定画幅</strong>
-        <p>可到「硬件与镜头」直接选择居中 16:9 / 9:16；只有自定义位置需要取景测试。</p>
+        <p>可到「镜头设置」直接选择居中 16:9 / 9:16；只有自定义位置需要取景测试。</p>
         <p class="form-hint">如果继续，当前这批会保持原始画面和尺寸，不会自动裁成 16:9。</p>
         <div class="button-row">
-          <button class="primary" @click="goToFramingSetup">去硬件与镜头</button>
+          <button class="primary" @click="goToFramingSetup">去镜头设置</button>
           <button @click="continueWithoutFramingPreference">仍然继续</button>
           <button @click="showFramingSetupPrompt = false">取消</button>
         </div>
@@ -1197,12 +1301,13 @@ import LogList from './components/LogList.vue'
 
 const nav = [
   { key: 'dashboard', label: '总览', icon: '01', description: '查看系统状态和最近活动。' },
-  { key: 'shoot', label: '拍摄', icon: '02', description: '原地采集，或按清单顺序巡游拍摄。' },
-  { key: 'robot', label: '硬件与镜头', icon: '03', description: '连接机器人、切换地图、手动控制云台。点位工作在「巡游拍摄」。' },
+  { key: 'robot', label: '镜头设置', icon: '02', description: '' },
+  { key: 'shoot', label: '拍摄', icon: '03', description: '原地采集，或按清单顺序巡游拍摄。' },
   { key: 'media', label: '媒体库', icon: '04', description: '查看日历、存储、导入、导出和清理。' },
-  { key: 'studio', label: '剪辑台', icon: '05', description: '从素材和音乐节拍创建自动剪辑。' },
-  { key: 'queue', label: '渲染队列', icon: '06', description: '跟踪导出任务和 FFmpeg 进度。' },
-  { key: 'settings', label: '设置', icon: '07', description: '配置服务、剪辑能力和机器人硬件连接。' }
+  { key: 'assets', label: '资产制作', icon: '05', description: '制作旁白和图片、视频特效。' },
+  { key: 'studio', label: '剪辑台', icon: '06', description: '选择素材，创建自动剪辑或进行手动微调。' },
+  { key: 'queue', label: '渲染队列', icon: '07', description: '跟踪导出任务和 FFmpeg 进度。' },
+  { key: 'settings', label: '设置', icon: '08', description: '配置服务、剪辑能力和机器人硬件连接。' }
 ]
 
 const MAX_SOURCE_VIDEOS = 20
@@ -1330,8 +1435,8 @@ const isCreatingJob = ref(false)
 const jobStatus = ref('')
 const jobStatusKind = ref('muted')
 const muteOriginalAudio = ref(true)
-const beatSync = ref(true)
-const batchSeed = ref('')
+const editingMode = ref('smart')
+const editorialPreset = ref('smart')
 
 // Subtitles come from the narration's own per-word timestamps, so there is nothing to write
 // without a voiceover. The control is disabled rather than hidden, with the reason spelled out —
@@ -1443,17 +1548,21 @@ async function refreshSubtitleFonts() {
   }
 }
 
-// Every axis offers 自动 as its own choice rather than defaulting to a middle setting. The
-// two are not the same thing: 自动 rolls per output, and a batch whose axes are all pinned is
-// a batch of identical videos. Keeping it a visible option is what makes that legible.
-//
-// `needs` is what an axis acts on, and it is the reason the list is confusing without it.
-// Rhythm shapes any footage; the rest divide up cruise points and can do nothing at all to an
-// ordinary clip. Grouping and colouring by `needs` is what turns five flat rows into two
-// answerable questions: how it should be cut, and which of the route it should show.
+// The customer chooses an editorial outcome. Pace, point allocation, music contour and all
+// candidate-selection maths remain backend decisions and are written to the batch manifest.
+const EDITORIAL_PRESETS = [
+  { value: 'smart', label: '智能推荐', description: '根据素材结构自动分配' },
+  { value: 'showcase', label: '完整展示', description: '优先覆盖点位与重要画面' },
+  { value: 'dynamic', label: '动感巡游', description: '紧凑、流动，强调行进感' },
+  { value: 'immersive', label: '沉浸参观', description: '长镜头、平稳，保留空间感' }
+]
+
+// 专业剪辑 brings back the earlier dimensions as a second way to describe the result. It
+// does not create a second planner: these fields are the existing detailed policy contract
+// accepted by the same batch endpoint and timeline engine used by the preset experience.
 const POLICY_GROUPS = [
-  { needs: 'any', label: '节奏', hint: '任何素材都适用' },
-  { needs: 'cruise', label: '画面与点位', hint: '需要巡游素材（带点位信息）' }
+  { needs: 'any', label: '节奏', hint: '任何素材均适用' },
+  { needs: 'cruise', label: '画面与点位', hint: '巡游素材专属' }
 ]
 
 const POLICY_AXES = [
@@ -1463,10 +1572,10 @@ const POLICY_AXES = [
     field: 'paces',
     needs: 'any',
     options: [
-      { value: 'auto', label: '自动', hint: '每条随机' },
-      { value: 'fast', label: '快切', hint: '平均 2 秒一刀' },
-      { value: 'normal', label: '常规', hint: '平均 5 秒一刀' },
-      { value: 'cinematic', label: '慢镜', hint: '平均 8 秒一刀，点位更少' }
+      { value: 'auto', label: '自动', hint: '每条自动选择' },
+      { value: 'fast', label: '快切', hint: '平均约 2 秒一刀' },
+      { value: 'normal', label: '常规', hint: '平均约 5 秒一刀' },
+      { value: 'cinematic', label: '慢镜', hint: '平均约 8 秒一刀' }
     ]
   },
   {
@@ -1475,12 +1584,12 @@ const POLICY_AXES = [
     field: 'contours',
     needs: 'any',
     options: [
-      { value: 'auto', label: '自动', hint: '每条随机' },
-      { value: 'flat', label: '平稳', hint: '全片一个节奏' },
-      { value: 'accelerate', label: '渐快', hint: '越剪越紧' },
-      { value: 'decelerate', label: '渐慢', hint: '收在长镜头上' },
-      { value: 'arc', label: '弧线', hint: '两头慢中间快' },
-      { value: 'follow_energy', label: '跟音乐', hint: '跟随音乐强弱，需要音乐与节拍剪辑' }
+      { value: 'auto', label: '自动', hint: '每条自动选择' },
+      { value: 'flat', label: '平稳', hint: '全片保持一个节奏' },
+      { value: 'accelerate', label: '渐快', hint: '剪辑逐渐加快' },
+      { value: 'decelerate', label: '渐慢', hint: '剪辑逐渐放缓' },
+      { value: 'arc', label: '弧线', hint: '两端舒缓，中段加快' },
+      { value: 'follow_energy', label: '跟音乐', hint: '跟随音乐强弱变化' }
     ]
   },
   {
@@ -1489,10 +1598,10 @@ const POLICY_AXES = [
     field: 'footage_mixes',
     needs: 'cruise',
     options: [
-      { value: 'auto', label: '自动', hint: '每条随机' },
-      { value: 'dwell_heavy', label: '多停留', hint: '偏向停在点位上拍到的画面' },
-      { value: 'balanced', label: '均衡', hint: '停留与行进各半' },
-      { value: 'transit_heavy', label: '多行进', hint: '偏向移动中拍到的画面' }
+      { value: 'auto', label: '自动', hint: '每条自动选择' },
+      { value: 'dwell_heavy', label: '多停留', hint: '偏向点位停留画面' },
+      { value: 'balanced', label: '均衡', hint: '平衡停留与行进画面' },
+      { value: 'transit_heavy', label: '多行进', hint: '偏向移动中的画面' }
     ]
   },
   {
@@ -1501,9 +1610,9 @@ const POLICY_AXES = [
     field: 'emphases',
     needs: 'cruise',
     options: [
-      { value: 'auto', label: '自动', hint: '每条随机' },
-      { value: 'target', label: '按比例', hint: '素材多的点位占得多' },
-      { value: 'coverage', label: '保覆盖', hint: '每个点位平分时长' }
+      { value: 'auto', label: '自动', hint: '每条自动选择' },
+      { value: 'target', label: '按比例', hint: '按可用素材分配时长' },
+      { value: 'coverage', label: '保覆盖', hint: '尽量覆盖每个点位' }
     ]
   },
   {
@@ -1511,22 +1620,14 @@ const POLICY_AXES = [
     label: '点位取用',
     field: 'point_scopes',
     needs: 'cruise',
-    // 自动 spans a half to all of what the pace can carry. Naming two fractions was false
-    // precision — the fraction only reaches the edit as a whole number of points, so
-    // "一半" and "三分之二" were often the same video, and together they covered barely a
-    // third of the usable range.
-    autoLevels: 4,
     options: [
-      { value: 'auto', label: '自动', hint: '每条随机取一半到全部点位' },
-      { value: 'all', label: '全部', hint: '每条都用上所有点位' }
+      { value: 'auto', label: '自动', hint: '自动选择点位范围' },
+      { value: 'all', label: '全部', hint: '使用全部可容纳点位' }
     ]
   }
 ]
-const policies = ref(Object.fromEntries(POLICY_AXES.map((axis) => [axis.key, 'auto'])))
 
-// How many cruise points the chosen sources carry between them. Zero means every rule below
-// the divider has nothing to divide, and the backend will not deal them — so the panel says
-// so rather than offering settings that quietly do nothing.
+const policies = ref(Object.fromEntries(POLICY_AXES.map((axis) => [axis.key, 'auto'])))
 const selectedCruisePoints = computed(() =>
   selectedSourceIds.value.reduce((total, id) => {
     const item = media.value.find((entry) => entry.id === id)
@@ -1539,65 +1640,83 @@ function axisApplies(axis) {
   return axis.needs === 'any' || hasCruisePoints.value
 }
 
-// Grouped and ordered so the panel reads as two questions — how to cut it, and which of the
-// route to show — rather than as five unrelated rows.
-const policyGroups = computed(() =>
-  POLICY_GROUPS.map((group) => ({
-    ...group,
-    live: group.needs === 'any' || hasCruisePoints.value,
-    axes: POLICY_AXES.filter((axis) => axis.needs === group.needs)
-  }))
-)
+const policyGroups = computed(() => POLICY_GROUPS.map((group) => ({
+  ...group,
+  live: group.needs === 'any' || hasCruisePoints.value,
+  status: group.needs === 'any'
+    ? group.hint
+    : hasCruisePoints.value
+      ? `已识别 ${selectedCruisePoints.value} 个点位`
+      : `${group.hint} · 当前未识别点位`,
+  axes: POLICY_AXES.filter((axis) => axis.needs === group.needs)
+})))
 
 function resetPolicies() {
   policies.value = Object.fromEntries(POLICY_AXES.map((axis) => [axis.key, 'auto']))
 }
 
-// The backend also varies the opening point and, with several recordings, how many of them
-// each output uses. Neither has a control here, but both are dealt, so both count.
-const UNSHOWN_AXES = 4 * 4
-
-// An upper bound, not a promise. The backend drops any dimension the footage cannot support —
-// footage the robot never classified has no points to rotate or lean towards — so the real
-// number is this or lower, and it cannot be known here without reading each clip's cruise data.
-// Only axes that can act on this footage count, so the number moves when the selection does
-// rather than promising variety the sources cannot supply.
-const signatureCeiling = computed(() =>
-  POLICY_AXES.reduce((total, axis) => {
-    if (policies.value[axis.key] !== 'auto' || !axisApplies(axis)) return total
-    // Not the button count: an axis whose 自动 covers a range offers more levels than it
-    // shows buttons for.
-    return total * (axis.autoLevels ?? axis.options.length - 1)
-  }, hasCruisePoints.value ? UNSHOWN_AXES : 1)
-)
-
-// One line, in the place the choices are made. The combination count was its own read-only
-// box, which gave a bare number the weight of a setting while answering the wrong question:
-// what an operator wants to know is whether these outputs will differ, not what the arithmetic
-// came to. Said as a sentence it also has room to say why — 自动 is what creates the variety,
-// so pinning is what takes it away.
-const policySummary = computed(() => {
-  const pinned = POLICY_AXES.filter(
-    (axis) => policies.value[axis.key] !== 'auto' && axisApplies(axis)
-  )
-  const wanted = normalizedAutomationOutputCount.value
-  const head = pinned.length
-    ? `已固定 ${pinned.map((axis) => axis.label).join('、')}，固定得越多每条越像。`
-    : '全部自动：每条各自随机，改成固定会让输出更相似。'
-  return signatureCeiling.value >= wanted
-    ? `${head}${wanted} 条可以各不相同。`
-    : `${head}但 ${wanted} 条只有 ${signatureCeiling.value} 种组合，平均每种重复约 ${Math.ceil(wanted / signatureCeiling.value)} 条。`
+const editingCapabilities = ref({
+  points: { evidence: 'none', message: '先选择视频素材' },
+  semantic: { evidence: 'none', message: '先选择视频素材' },
+  music: { evidence: 'none', message: '未添加音乐 · 将按画面节奏剪辑' }
 })
+const editingCapabilitiesLoading = ref(false)
+const musicCanDriveRhythm = computed(() => (
+  !editingCapabilitiesLoading.value
+  && ['structured', 'mixed'].includes(editingCapabilities.value.music?.evidence)
+))
 
-// Sent as a list per axis: empty means "spread across every level", one entry pins it.
-const policyFields = computed(() =>
-  Object.fromEntries(
-    POLICY_AXES.map((axis) => [
+function optionApplies(axis, option) {
+  if (!axisApplies(axis)) return false
+  if (option.value === 'follow_energy') return musicCanDriveRhythm.value
+  return true
+}
+
+function policyOptionHint(axis, option) {
+  if (option.value === 'follow_energy' && !musicCanDriveRhythm.value) {
+    return editingCapabilitiesLoading.value ? '正在分析音乐节拍' : '需要先选择节拍清晰的音乐'
+  }
+  return option.hint
+}
+
+// Empty lists mean 自动; a one-item list pins that dimension. Preset mode never includes
+// these fields, so switching views cannot leak a professional choice into a smart batch.
+const policyFields = computed(() => Object.fromEntries(
+  POLICY_AXES.map((axis) => {
+    const selected = policies.value[axis.key]
+    const option = axis.options.find((item) => item.value === selected)
+    return [
       axis.field,
-      policies.value[axis.key] === 'auto' ? [] : [policies.value[axis.key]]
-    ])
-  )
+      selected === 'auto' || !option || !optionApplies(axis, option) ? [] : [selected]
+    ]
+  })
+))
+
+const editingPolicyPayload = computed(() => editingMode.value === 'smart'
+  ? { editorial_preset: editorialPreset.value }
+  : policyFields.value
 )
+
+watch(
+  [editingCapabilitiesLoading, musicCanDriveRhythm],
+  ([loading, usable]) => {
+    if (!loading && !usable && policies.value.contour === 'follow_energy') {
+      policies.value.contour = 'auto'
+    }
+  }
+)
+
+const sourceCapabilityMessage = computed(() => selectedSourceIds.value.length
+  ? `已选 ${selectedSourceIds.value.length} 段 · 将自动识别镜头与画面质量`
+  : '先选择视频素材'
+)
+
+function capabilityTone(evidence) {
+  if (evidence === 'full' || evidence === 'structured') return 'success'
+  if (['partial', 'markers_only', 'mixed', 'ambient'].includes(evidence)) return 'warning'
+  if (evidence === 'invalid' || evidence === 'unreadable') return 'danger'
+  return 'muted'
+}
 const settingsForm = ref({
   llm: { enabled: false, provider: 'doubao', api_key: '', model: '', timeout_ms: 20000 },
   tts: { enabled: false, provider: 'volcengine_sync', app_id: '', access_token: '', voice_type: 'BV001_streaming', cluster: 'volcano_tts', encoding: 'mp3', speed_ratio: 1.0 },
@@ -1638,6 +1757,14 @@ const isTestingTts = ref(false)
 const isTestingSeedance = ref(false)
 const settingsStatus = ref('')
 const settingsStatusKind = ref('muted')
+const settingsAdminUnlocked = ref(false)
+const settingsAdminToken = ref('')
+const settingsAdminUsername = ref('')
+const settingsAdminPassword = ref('')
+const isUnlockingSettings = ref(false)
+const settingsAdminStatus = ref('')
+const settingsAdminStatusKind = ref('danger')
+let settingsAdminExpiryTimer = null
 const framingPreviewReady = computed(() => Boolean(
   framingTest.value?.ready && framingTest.value?.preview_id
 ))
@@ -1714,18 +1841,8 @@ const savedOutputCrop = computed(() => ({
 }))
 const voiceoverTitle = ref('')
 const voiceoverText = ref('')
-const voiceoverIncludeNotes = ref(false)
 const voiceoverUseLlm = ref(false)
-// Text alone is enough, and so are notes alone; the backend rejects the empty case.
-const canGenerateVoiceover = computed(() =>
-  Boolean(voiceoverText.value.trim()) || (voiceoverIncludeNotes.value && voiceoverUseLlm.value)
-)
-
-// Notes are only usable through the LLM, so turning it off must not leave a checked box
-// that silently does nothing.
-watch(voiceoverUseLlm, (enabled) => {
-  if (!enabled) voiceoverIncludeNotes.value = false
-})
+const canGenerateVoiceover = computed(() => Boolean(voiceoverText.value.trim()))
 const isGeneratingVoiceover = ref(false)
 const voiceoverStatus = ref('')
 const voiceoverStatusKind = ref('muted')
@@ -1817,12 +1934,22 @@ const canGenerateSeedance = computed(() => {
   // Picking a video but never confirming a frame would quietly drop it and generate from the
   // prompt alone, so the chosen video would have had no effect on the result.
   if (seedanceSourceMode.value === 'stamp' && selectedSeedanceVideoId.value && !grabbedFrame.value) return false
+  if (seedanceQuota.value?.count_remaining === 0) return false
+  if (seedanceOutput.value === 'video') {
+    const duration = Number(seedanceDuration.value)
+    if (!Number.isFinite(duration) || duration < 2 || duration > 15) return false
+    const billed = Math.max(duration, Number(seedanceQuota.value?.minimum_billable_seconds || 5))
+    if (seedanceQuota.value && billed > seedanceQuota.value.remaining_seconds) return false
+  }
   // Both outputs accept a prompt on its own; a source picture only steers the result.
   return true
 })
 const seedanceQuotaText = computed(() => {
   if (!seedanceQuota.value) return '今日额度：--'
-  return `今日剩余 ${seedanceQuota.value.remaining} / ${seedanceQuota.value.limit}`
+  if (seedanceOutput.value === 'image') {
+    return `今日剩余 ${seedanceQuota.value.count_remaining} / ${seedanceQuota.value.limit} 次`
+  }
+  return `今日剩余约 ${seedanceQuota.value.remaining} 次`
 })
 const seedanceConfiguredLabel = computed(() => {
   const cfg = settings.value?.seedance
@@ -1909,11 +2036,20 @@ const storagePercent = computed(() => {
 })
 const automationPairingSummary = computed(() => {
   const count = normalizedAutomationOutputCount.value
+  const sources = selectedSourceIds.value.length
   const parts = []
   if (selectedAutomationMusicIds.value.length) parts.push('1 个音乐')
   if (selectedAutomationVoiceoverIds.value.length) parts.push('1 个旁白')
-  if (!parts.length) return `${count} 条输出，无音频`
-  return `${count} 条输出，每条 ${parts.join(' + ')}`
+  let allocation = ''
+  if (sources > 0 && count < sources) {
+    allocation = `覆盖 ${count} / ${sources} 段素材`
+  } else if (sources > 0 && count % sources === 0) {
+    allocation = `${sources} 段素材各 ${count / sources} 条`
+  } else if (sources > 0) {
+    allocation = `${sources} 段素材均衡分配`
+  }
+  const audio = parts.length ? `每条 ${parts.join(' + ')}` : '无音频'
+  return [ `${count} 条输出`, allocation, audio ].filter(Boolean).join(' · ')
 })
 const normalizedAutomationOutputCount = computed(() => Math.min(100, Math.max(1, Number(automationOutputCount.value || 1))))
 const targetDurationSeconds = computed(() => {
@@ -2111,6 +2247,46 @@ async function refreshMedia() {
   if (selectedSeedanceImageId.value && !imageItems.value.some((item) => item.id === selectedSeedanceImageId.value)) selectedSeedanceImageId.value = ''
   if (selectedSeedanceVideoId.value && !sourceVideoItems.value.some((item) => item.id === selectedSeedanceVideoId.value)) selectedSeedanceVideoId.value = ''
 }
+
+let editingCapabilityRequest = 0
+let editingCapabilityTimer = null
+async function refreshEditingCapabilities() {
+  const requestId = ++editingCapabilityRequest
+  if (!apiConfig.value) return
+  editingCapabilitiesLoading.value = true
+  try {
+    const result = await api('/editing/capabilities', {
+      method: 'POST',
+      body: JSON.stringify({
+        media_ids: selectedSourceIds.value.slice(0, MAX_SOURCE_VIDEOS),
+        music_media_ids: selectedAutomationMusicIds.value.slice(0, MAX_AUTOMATION_ITEMS)
+      })
+    })
+    if (requestId === editingCapabilityRequest) editingCapabilities.value = result
+  } catch (err) {
+    if (requestId === editingCapabilityRequest) {
+      editingCapabilities.value = {
+        points: { evidence: 'invalid', message: '素材识别暂时不可用' },
+        semantic: { evidence: 'invalid', message: '旁白匹配识别暂时不可用' },
+        music: { evidence: 'unreadable', message: '音乐分析暂时不可用' }
+      }
+      log(`素材识别失败：${humanError(err.message)}`)
+    }
+  } finally {
+    if (requestId === editingCapabilityRequest) editingCapabilitiesLoading.value = false
+  }
+}
+
+watch(
+  [selectedSourceIds, selectedAutomationMusicIds],
+  () => {
+    if (editingCapabilityTimer) clearTimeout(editingCapabilityTimer)
+    editingCapabilityTimer = setTimeout(
+      () => { refreshEditingCapabilities().catch(() => {}) }, 250
+    )
+  },
+  { deep: true }
+)
 async function refreshSettings() {
   settings.value = await api('/settings')
   settingsForm.value = {
@@ -2360,6 +2536,22 @@ watch(active, (page) => {
   if (page !== 'shoot' || cruiseMap.value) return
   const inherited = robot.value?.map_name || selectedRobotMap.value
   if (inherited) cruiseMap.value = inherited
+})
+
+// Settings access lasts for one visit only. Leaving immediately restores the lock and revokes
+// the backend token; returning therefore always starts on the blurred verification screen.
+watch(active, async (page, previousPage) => {
+  if (previousPage === 'settings' && page !== 'settings') {
+    await lockSettings()
+    return
+  }
+  if (page !== 'settings' || !settingsAdminUnlocked.value || !settingsAdminToken.value) return
+  try {
+    const result = await api('/settings/admin/status', settingsAdminOptions())
+    if (!result.unlocked) handleSettingsAdminError({ status: 403 })
+  } catch {
+    handleSettingsAdminError({ status: 403 })
+  }
 })
 
 // A watch rather than @change on the select: with v-model both fire on 'change', and the
@@ -2725,29 +2917,24 @@ async function createAutomationJobs(forceWithoutPreference = false) {
         output_count: normalizedAutomationOutputCount.value,
         target_duration_seconds: targetDurationSeconds.value,
         mute_original_audio: muteOriginalAudio.value,
-        beat_sync: beatSync.value,
+        // Music structure is always used when it is reliable; ambient or absent music falls
+        // back automatically, so the customer never has to understand a beat-detection switch.
+        beat_sync: true,
         subtitles: subtitlesOn.value && canUseSubtitles.value,
         subtitle_font: subtitleFont.value,
         subtitle_size: subtitleSize.value,
-        ...(batchSeed.value === '' ? {} : { seed: Math.max(0, Number(batchSeed.value) || 0) }),
-        ...policyFields.value
+        ...editingPolicyPayload.value
       })
     })
     active.value = 'queue'
     await Promise.all([refreshJobs(), refreshSettings()])
     jobStatusKind.value = 'success'
-    // The seed is echoed back so a batch worth repeating can be repeated, and one that came
-    // out badly can be deliberately rolled again rather than re-rolled by accident.
-    const usedSeed = created[0]?.request?.batch_seed
-    // Asking for more than the material can make different produces copies, so the count is
-    // capped — silently doing that would look like a bug, so it says which limit applied.
-    // Settings were just refreshed, so a spent day shows as nothing remaining.
     const asked = normalizedAutomationOutputCount.value
     const outOfQuota = settings.value?.automation?.remaining_today === 0
     const capped = created.length < asked
-      ? `（原定 ${asked} 条，${outOfQuota ? '已达今日上限' : '素材只够做出这么多条不同的'}）`
+      ? `（原定 ${asked} 条，${outOfQuota ? '已达今日上限' : '已按可用素材调整'}）`
       : ''
-    jobStatus.value = `已创建 ${created.length} 条自动化剪辑任务${capped}${usedSeed == null ? '' : `，随机种子 ${usedSeed}`}。`
+    jobStatus.value = `已创建 ${created.length} 条自动化剪辑任务${capped}。`
   } catch (err) {
     jobStatusKind.value = 'danger'
     jobStatus.value = `自动化任务创建失败：${humanError(err.message)}`
@@ -3393,7 +3580,9 @@ async function generateSeedanceEffect() {
     seedanceStatusKind.value = result.reused ? 'success' : 'muted'
     seedanceStatus.value = result.reused
       ? `已复用特效：${result.asset.name}`
-      : `特效任务已提交，今日剩余 ${result.quota.remaining} 次。`
+      : result.asset.kind === 'video'
+        ? `特效任务已提交，今日剩余约 ${result.quota.remaining} 次（实际次数与生成时长有关）。`
+        : `特效任务已提交，今日剩余 ${result.quota.count_remaining} 次。`
   } catch (err) {
     seedanceStatusKind.value = 'danger'
     seedanceStatus.value = `特效生成失败：${humanError(err.message)}`
@@ -3510,21 +3699,114 @@ function configuredPlaceholder(value, fallback) {
   return value ? '已配置' : fallback
 }
 
+function settingsAdminOptions(options = {}) {
+  return {
+    ...options,
+    headers: {
+      ...(options.headers || {}),
+      'x-admin-token': settingsAdminToken.value
+    }
+  }
+}
+
+function handleSettingsAdminError(err) {
+  if (err?.status !== 403) return false
+  if (settingsAdminExpiryTimer) clearTimeout(settingsAdminExpiryTimer)
+  settingsAdminExpiryTimer = null
+  settingsAdminUnlocked.value = false
+  settingsAdminToken.value = ''
+  settingsAdminPassword.value = ''
+  settingsAdminStatusKind.value = 'danger'
+  settingsAdminStatus.value = '管理员验证已失效，请重新验证。'
+  return true
+}
+
+async function unlockSettings() {
+  if (!settingsAdminUsername.value || !settingsAdminPassword.value || isUnlockingSettings.value) return
+  isUnlockingSettings.value = true
+  settingsAdminStatus.value = ''
+  try {
+    const result = await api('/settings/admin/unlock', {
+      method: 'POST',
+      body: JSON.stringify({
+        username: settingsAdminUsername.value,
+        password: settingsAdminPassword.value
+      })
+    })
+    // Navigation may happen while the request is in flight. Never let a late successful reply
+    // unlock Settings in the background; revoke that just-issued token instead.
+    if (active.value !== 'settings') {
+      await api('/settings/admin/lock', {
+        method: 'POST',
+        body: '{}',
+        headers: { 'x-admin-token': result.token }
+      })
+      return
+    }
+    settingsAdminToken.value = result.token
+    settingsAdminUnlocked.value = true
+    settingsAdminUsername.value = ''
+    settingsAdminPassword.value = ''
+    settingsAdminStatus.value = ''
+    settingsStatus.value = ''
+    if (settingsAdminExpiryTimer) clearTimeout(settingsAdminExpiryTimer)
+    settingsAdminExpiryTimer = setTimeout(() => {
+      settingsAdminUnlocked.value = false
+      settingsAdminToken.value = ''
+      settingsAdminStatusKind.value = 'danger'
+      settingsAdminStatus.value = '管理员验证已失效，请重新验证。'
+      settingsAdminExpiryTimer = null
+    }, Number(result.expires_in_seconds || 0) * 1000)
+    await refreshSettings()
+  } catch (err) {
+    settingsAdminPassword.value = ''
+    settingsAdminStatusKind.value = 'danger'
+    settingsAdminStatus.value = humanError(err.message)
+  } finally {
+    isUnlockingSettings.value = false
+  }
+}
+
+async function lockSettings() {
+  const token = settingsAdminToken.value
+  if (settingsAdminExpiryTimer) clearTimeout(settingsAdminExpiryTimer)
+  settingsAdminExpiryTimer = null
+  settingsAdminUnlocked.value = false
+  settingsAdminToken.value = ''
+  settingsAdminUsername.value = ''
+  settingsAdminPassword.value = ''
+  settingsAdminStatus.value = ''
+  settingsStatus.value = ''
+  if (!token) return
+  try {
+    await api('/settings/admin/lock', {
+      method: 'POST',
+      body: '{}',
+      headers: { 'x-admin-token': token }
+    })
+  } catch {
+    // Local state is already locked; a stopped backend cannot keep its in-memory session alive.
+  }
+}
+
 async function saveSettings() {
   isSavingSettings.value = true
   settingsStatusKind.value = 'muted'
   settingsStatus.value = '正在保存设置...'
   try {
-    settings.value = await api('/settings', {
+    settings.value = await api('/settings', settingsAdminOptions({
       method: 'PUT',
       body: JSON.stringify(settingsForm.value)
-    })
-    await Promise.all([refreshSettings(), refreshRobot()])
+    }))
+    await Promise.all([refreshSettings(), refreshRobot(), refreshSeedanceAssets()])
     settingsStatusKind.value = 'success'
     settingsStatus.value = '设置已保存。服务和机器人连接会立即生效。'
+    return true
   } catch (err) {
+    handleSettingsAdminError(err)
     settingsStatusKind.value = 'danger'
     settingsStatus.value = `设置保存失败：${humanError(err.message)}`
+    return false
   } finally {
     isSavingSettings.value = false
   }
@@ -3572,7 +3854,7 @@ async function discardFramingTest() {
     framingTest.value = await api('/framing-test/discard', { method: 'POST', body: '{}' })
     framingConfirming.value = false
     framingTestStatusKind.value = 'muted'
-    framingTestStatus.value = '临时测试视频已清除，没有写入媒体库。'
+    framingTestStatus.value = ''
   } catch (err) {
     framingTestStatusKind.value = 'danger'
     framingTestStatus.value = `清除失败：${humanError(err.message)}`
@@ -3726,11 +4008,12 @@ async function testLlm() {
   settingsStatusKind.value = 'muted'
   settingsStatus.value = '正在测试大模型服务...'
   try {
-    await saveSettings()
-    const result = await api('/settings/test/llm', { method: 'POST', body: '{}' })
+    if (!await saveSettings()) return
+    const result = await api('/settings/test/llm', settingsAdminOptions({ method: 'POST', body: '{}' }))
     settingsStatusKind.value = result.ok ? 'success' : 'danger'
     settingsStatus.value = result.ok ? `大模型正常：${humanError(result.message)}` : `大模型失败：${humanError(result.message)}`
   } catch (err) {
+    handleSettingsAdminError(err)
     settingsStatusKind.value = 'danger'
     settingsStatus.value = `大模型失败：${humanError(err.message)}`
   } finally {
@@ -3743,11 +4026,12 @@ async function testTts() {
   settingsStatusKind.value = 'muted'
   settingsStatus.value = '正在测试语音时间戳...'
   try {
-    await saveSettings()
-    const result = await api('/settings/test/tts', { method: 'POST', body: '{}' })
+    if (!await saveSettings()) return
+    const result = await api('/settings/test/tts', settingsAdminOptions({ method: 'POST', body: '{}' }))
     settingsStatusKind.value = result.ok && result.details?.has_words ? 'success' : 'danger'
     settingsStatus.value = result.ok ? `语音合成正常：${result.details?.word_count || 0} 个定时词` : `语音合成失败：${humanError(result.message)}`
   } catch (err) {
+    handleSettingsAdminError(err)
     settingsStatusKind.value = 'danger'
     settingsStatus.value = `语音合成失败：${humanError(err.message)}`
   } finally {
@@ -3760,13 +4044,14 @@ async function testSeedance() {
   settingsStatusKind.value = 'muted'
   settingsStatus.value = '正在测试特效服务连接（不会提交生成任务）...'
   try {
-    await saveSettings()
-    const result = await api('/settings/test/seedance', { method: 'POST', body: '{}' })
+    if (!await saveSettings()) return
+    const result = await api('/settings/test/seedance', settingsAdminOptions({ method: 'POST', body: '{}' }))
     settingsStatusKind.value = result.ok ? 'success' : 'danger'
     settingsStatus.value = result.ok
       ? `特效服务正常：${result.details?.model || 'Seedance'}（未产生生成费用）`
       : `特效服务失败：${humanError(result.message)}`
   } catch (err) {
+    handleSettingsAdminError(err)
     settingsStatusKind.value = 'danger'
     settingsStatus.value = `特效服务失败：${humanError(err.message)}`
   } finally {
@@ -3785,8 +4070,7 @@ async function generateVoiceover() {
       body: JSON.stringify({
         title: voiceoverTitle.value,
         text: voiceoverText.value,
-        use_llm: voiceoverUseLlm.value,
-        include_notes: voiceoverIncludeNotes.value
+        use_llm: voiceoverUseLlm.value
       })
     })
     await Promise.all([refreshMedia(), refreshVault(), refreshTtsAssets()])
@@ -4030,9 +4314,8 @@ function humanError(message) {
     'A name cannot contain / \\ : * ? " < > |': '名称里不能有 / \\ : * ? " < > | 这些字符。',
     'Effect not found': '找不到该特效。',
     'Only imported clips can be removed from the library': '只有导入的素材可以从媒体库移出。',
-    'Voiceover needs text, or notes to draw on': '请填写文案，或勾选「包含拍摄备注」。',
-    'Nothing usable was found in the text or notes': '备注里没有可用于口播的内容，请补充文案。',
-    'Notes need the LLM to draft from them': '「包含拍摄备注」需要同时勾选「大模型辅助」。',
+    'Voiceover needs text': '请填写旁白文案或大模型提示词。',
+    'Nothing usable was found in the text': '文案里没有可用于口播的内容，请补充后再试。',
     'dwell_max_seconds must be >= dwell_min_seconds': '停留最长秒数不能小于最短秒数。',
     'Robot websocket URL is not configured': '未配置机器人 WebSocket 地址',
     'Robot websocket was reconfigured': '机器人 WebSocket 地址已重新配置',
@@ -4071,6 +4354,7 @@ function humanError(message) {
   if (text.startsWith('TOS denied access')) return 'TOS 拒绝访问该桶，密钥可能没有写入权限。'
   if (text.startsWith('TOS upload failed')) return text.replace('TOS upload failed', '对象存储上传失败')
   if (text.startsWith('Seedance daily limit reached')) return text.replace(/Seedance daily limit reached \((\d+)\)/, 'Seedance 今日生成次数已用完（上限 $1）')
+  if (text.startsWith('Seedance daily duration limit reached')) return text.replace(/Seedance daily duration limit reached \((\d+)s remaining, (\d+)s requested\)/, 'Seedance 今日视频时长额度不足（剩余 $1 秒，本次需要 $2 秒）')
   if (text.startsWith('LLM API error')) return text.replace('LLM API error', '大模型 API 错误')
   if (text.startsWith('TTS API error')) return text.replace('TTS API error', '语音合成 API 错误')
   if (text.startsWith('TTS error')) return text.replace('TTS error', '语音合成错误')
@@ -4109,5 +4393,7 @@ onUnmounted(() => {
   window.removeEventListener('pointerup', endFramingDrag)
   if (recordingClock) clearInterval(recordingClock)
   if (seedancePollTimer) clearInterval(seedancePollTimer)
+  if (editingCapabilityTimer) clearTimeout(editingCapabilityTimer)
+  if (settingsAdminExpiryTimer) clearTimeout(settingsAdminExpiryTimer)
 })
 </script>

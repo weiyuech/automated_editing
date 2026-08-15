@@ -1,0 +1,86 @@
+{
+  "capture_session_id": "semantic-real-world-001",
+  "title": "工厂巡游 08-15 下午",
+  "started_at": "2026-08-15T06:02:50.039145+00:00",
+  "ended_at": "2026-08-15T06:04:25.931826+00:00",
+  "notes": [
+    "现场机器噪声比较明显，下午入口处逆光；点位三第一次到达失败后进行了重试。",
+    "点位1：入口接待区，前台为访客办理登记并提供咨询；点位2：产品展示区，陈列核心产品、样品和解决方案",
+    "点位3：智能生产线，机械臂和自动化设备负责装配与检测；点位4：成品仓库，存放已经包装完成、等待发货的货物",
+    "点位2：展厅，主要展示产品方案和样品"
+  ],
+  "markers": [
+    {"id": "m1", "timestamp": 5.2, "label": "cs2#1"},
+    {"id": "m2", "timestamp": 22.1, "label": "cs2#2"},
+    {"id": "m3-failed", "timestamp": 39.8, "label": "cs2#3 失败"},
+    {"id": "m3", "timestamp": 49.3, "label": "cs2#3"},
+    {"id": "m4", "timestamp": 70.4, "label": "cs2#4"}
+  ],
+  "segments": [
+    {
+      "index": 0,
+      "path_name": "cs2",
+      "goal_id": 1,
+      "goal_object": null,
+      "status": "arrived",
+      "transit_start_seconds": 0.0,
+      "arrived_at_seconds": 5.2,
+      "departed_at_seconds": 12.0,
+      "dwell_seconds": 6.8,
+      "scanned": false,
+      "error": null
+    },
+    {
+      "index": 1,
+      "path_name": "cs2",
+      "goal_id": 2,
+      "goal_object": null,
+      "status": "arrived",
+      "transit_start_seconds": 12.0,
+      "arrived_at_seconds": 22.1,
+      "departed_at_seconds": 31.0,
+      "dwell_seconds": 8.9,
+      "scanned": true,
+      "error": null
+    },
+    {
+      "index": 2,
+      "path_name": "cs2",
+      "goal_id": 3,
+      "goal_object": "机械臂",
+      "status": "failed",
+      "transit_start_seconds": 31.0,
+      "arrived_at_seconds": null,
+      "departed_at_seconds": 40.0,
+      "dwell_seconds": null,
+      "scanned": false,
+      "error": "object alignment timeout"
+    },
+    {
+      "index": 3,
+      "path_name": "cs2",
+      "goal_id": 3,
+      "goal_object": "机械臂",
+      "status": "arrived",
+      "transit_start_seconds": 40.0,
+      "arrived_at_seconds": 49.3,
+      "departed_at_seconds": 60.0,
+      "dwell_seconds": 10.7,
+      "scanned": true,
+      "error": null
+    },
+    {
+      "index": 4,
+      "path_name": "cs2",
+      "goal_id": 4,
+      "goal_object": null,
+      "status": "arrived",
+      "transit_start_seconds": 60.0,
+      "arrived_at_seconds": 70.4,
+      "departed_at_seconds": 95.0,
+      "dwell_seconds": 24.6,
+      "scanned": false,
+      "error": null
+    }
+  ]
+}

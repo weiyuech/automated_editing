@@ -16,12 +16,13 @@ from automated_video_editing_backend.api.ws import websocket_endpoint
 from automated_video_editing_backend.core.diagnostics import configure_diagnostics, log_event
 from automated_video_editing_backend.core.events import EventHub
 from automated_video_editing_backend.core.paths import GENERATED_DIRS, ensure_generated_dirs
+from automated_video_editing_backend.services.admin_access import AdminAccessService
 from automated_video_editing_backend.services.analysis import AnalysisService
 from automated_video_editing_backend.services.capture import CaptureService
 from automated_video_editing_backend.services.cruise import CruiseService
 from automated_video_editing_backend.services.cruise_routes import CruiseRouteStore
-from automated_video_editing_backend.services.jobs import JobService
 from automated_video_editing_backend.services.framing_test import FramingTestService
+from automated_video_editing_backend.services.jobs import JobService
 from automated_video_editing_backend.services.llm import LLMService
 from automated_video_editing_backend.services.media import MediaService
 from automated_video_editing_backend.services.media_vault import MediaVaultService
@@ -37,7 +38,7 @@ from automated_video_editing_backend.services.tts import TTSService
 def create_app() -> FastAPI:
     ensure_generated_dirs()
     configure_diagnostics(GENERATED_DIRS["logs"] / "diagnostics.log")
-    log_event("info", "backend.started", version="0.1.1")
+    log_event("info", "backend.started", version="0.1.2")
     events = EventHub()
     settings = SettingsService()
     media = MediaService()
@@ -59,6 +60,7 @@ def create_app() -> FastAPI:
     seedance = SeedanceService(settings, media, renderer)
     jobs = JobService(events, media, analysis, planner, renderer, settings)
     renamer = MediaRenameService(media, jobs, seedance)
+    admin_access = AdminAccessService()
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
@@ -71,7 +73,7 @@ def create_app() -> FastAPI:
             await framing_test.close()
             await robot.disconnect()
 
-    app = FastAPI(title="Automated Video Editing Backend", version="0.1.1", lifespan=lifespan)
+    app = FastAPI(title="Automated Video Editing Backend", version="0.1.2", lifespan=lifespan)
     app.add_middleware(
         CORSMiddleware,
         # electron-vite serves the installed renderer from file://, whose browser origin is
@@ -87,6 +89,7 @@ def create_app() -> FastAPI:
         build_router(
             robot, capture, cruise, cruise_routes, media, jobs, vault, settings, llm, tts,
             seedance, renamer, framing_test,
+            admin_access,
         ),
         prefix="/api",
     )

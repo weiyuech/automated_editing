@@ -228,7 +228,41 @@ class AnalysisResult(BaseModel):
     # Loudness across the music on 0..1, sampled evenly. Lets cut length follow the track
     # instead of a fixed curve. Empty whenever there is no music to read.
     energy: list[float] = Field(default_factory=list)
+    # Rich music data is optional so timelines and cached analyses written by older builds
+    # still load.  New planning keeps it separate from the video measurements conceptually,
+    # but carrying it here preserves the public AnalysisResult contract used by drafts/tests.
+    music_duration_seconds: float = Field(default=0.0, ge=0)
+    tempo_bpm: float | None = Field(default=None, ge=0)
+    onset_times: list[float] = Field(default_factory=list)
+    # The strongest subset of onset_times. Dynamic edits may cut on these accents; using every
+    # detected note onset made the grid far denser than the music a listener perceives as the
+    # beat and let weak events pull cuts away from strong ones.
+    accent_times: list[float] = Field(default_factory=list)
+    onset_strength: list[float] = Field(default_factory=list)
+    section_boundaries: list[float] = Field(default_factory=list)
+    beat_reliability: float = Field(default=0.0, ge=0, le=1)
+    music_evidence: Literal["none", "structured", "ambient", "unreadable"] = "none"
     warnings: list[str] = Field(default_factory=list)
+
+
+class MusicAnalysis(BaseModel):
+    """Reusable full-track analysis before one exact render window is selected."""
+
+    duration_seconds: float = Field(default=0.0, ge=0)
+    tempo_bpm: float | None = Field(default=None, ge=0)
+    beats: list[float] = Field(default_factory=list)
+    onset_times: list[float] = Field(default_factory=list)
+    accent_times: list[float] = Field(default_factory=list)
+    onset_strength: list[float] = Field(default_factory=list)
+    # Evenly sampled across ``duration_seconds`` and kept at a higher resolution than the old
+    # 64 buckets so a 30-second excerpt can be cut out of a long song without time-warping it.
+    energy: list[float] = Field(default_factory=list)
+    section_boundaries: list[float] = Field(default_factory=list)
+    beat_reliability: float = Field(default=0.0, ge=0, le=1)
+    evidence: Literal["structured", "ambient", "unreadable"] = "unreadable"
+
+
+EditorialPreset = Literal["smart", "showcase", "dynamic", "immersive"]
 
 
 # How an edit leans on the footage the robot classified. Parked shots are not automatically
@@ -297,6 +331,12 @@ class EditJobRequest(BaseModel):
     variant_seed: int | None = Field(default=None, ge=0)
     # The batch this came from, carried so a whole day can be re-rolled, not just one output.
     batch_seed: int | None = Field(default=None, ge=0)
+    # The only editorial decision exposed by the automatic UI.  The lower-level fields below
+    # remain serialised for reproducibility and for opening jobs made by older app versions.
+    editorial_preset: EditorialPreset | None = None
+    # Which ranked musical excerpt this output uses. Internal portfolio metadata, not a UI
+    # control; zero is the strongest window and later ranks create real batch variety.
+    music_window_rank: int = Field(default=0, ge=0, le=999)
     # None means "not chosen" rather than "middle setting": the backend rolls one and writes
     # the result back here, so the job record always says which policy it actually used.
     footage_mix: FootageMix | None = None
@@ -330,6 +370,7 @@ class EditBatchRequest(BaseModel):
     # Left blank a fresh one is drawn and recorded on every job in the batch, so a day's
     # output can be reproduced or deliberately re-rolled rather than merely repeated.
     seed: int | None = Field(default=None, ge=0)
+    editorial_preset: EditorialPreset | None = None
     # Whether the outputs of one batch differ in their picture, or only in their sound.
     #   per_output — every output takes its own cuts. Most variety.
     #   shared     — one seeded set of cuts across the batch, so music and narration are the
@@ -372,6 +413,8 @@ class TimelineDraftRequest(BaseModel):
     # A preview is only useful if it shows the cuts the job will actually render, so the
     # draft takes the same seed and the same editing policy.
     variant_seed: int | None = Field(default=None, ge=0)
+    editorial_preset: EditorialPreset | None = None
+    music_window_rank: int = Field(default=0, ge=0, le=999)
     footage_mix: FootageMix | None = None
     emphasis: EditEmphasis | None = None
     pace: EditPace | None = None
@@ -489,6 +532,16 @@ class EditTimeline(BaseModel):
     title: str
     clips: list[TimelineClip]
     music_path: str | None = None
+    # The exact excerpt analysis planned against.  Rendering must trim to the same values or
+    # beat/energy decisions describe music the audience never hears.
+    music_start_seconds: float = Field(default=0.0, ge=0)
+    music_duration_seconds: float | None = Field(default=None, gt=0)
+    music_loop: bool = False
+    music_evidence: Literal["none", "structured", "ambient", "unreadable"] = "none"
+    editorial_preset: EditorialPreset = "smart"
+    # Machine-readable evidence and resolved scores for developer diagnostics. This is never
+    # used to render and remains deliberately open-ended across planner versions.
+    planning_diagnostics: dict[str, Any] = Field(default_factory=dict)
     voiceover_path: str | None = None
     # Where the narration begins in the output. Zero today; it exists so that when 手动微调 moves
     # the voiceover, one field moves the audio and the subtitles together.
@@ -696,7 +749,7 @@ class SeedanceSettingsUpdate(BaseModel):
     tos_object_prefix: str | None = Field(default=None, max_length=512)
     tos_url_expires_seconds: int | None = Field(default=None, ge=60, le=2592000)
     daily_limit: int | None = Field(default=None, ge=1, le=100)
-    default_duration_seconds: int | None = Field(default=None, ge=4, le=15)
+    default_duration_seconds: int | None = Field(default=None, ge=2, le=15)
     resolution: str | None = Field(default=None, max_length=32)
     ratio: str | None = Field(default=None, max_length=32)
 
@@ -748,10 +801,8 @@ class ProviderTestResult(BaseModel):
 
 class TTSGenerateRequest(BaseModel):
     title: str = "voiceover"
-    # May be blank when include_notes is on and the capture notes carry the content.
     text: str = Field(default="", max_length=1500)
     use_llm: bool = False
-    include_notes: bool = False
 
 
 class TTSAsset(BaseModel):
@@ -787,7 +838,7 @@ class SeedanceGenerateRequest(BaseModel):
     source_video_media_id: str | None = None
     timestamp_seconds: float | None = Field(default=None, ge=0)
     source_image_url: str | None = Field(default=None, max_length=4096)
-    duration_seconds: int | None = Field(default=None, ge=4, le=15)
+    duration_seconds: int | None = Field(default=None, ge=2, le=15)
     reuse_existing: bool = True
 
 
@@ -825,6 +876,12 @@ class SeedanceQuota(BaseModel):
     used: int = 0
     limit: int = 10
     remaining: int = 10
+    count_remaining: int = 10
+    used_seconds: int = 0
+    seconds_limit: int = 50
+    remaining_seconds: int = 50
+    default_duration_seconds: int = 5
+    minimum_billable_seconds: int = 5
 
 
 class SeedanceGenerateResult(BaseModel):

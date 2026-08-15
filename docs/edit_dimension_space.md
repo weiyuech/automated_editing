@@ -1,5 +1,13 @@
 # The Edit Dimension Space
 
+> **Current integrity revision (2026-08-14):** this document records the original diversity
+> design. Batch outputs now belong to exactly one source recording and always move forward in
+> that recording. `Start rotation` and `Recording scope` therefore remain accepted legacy API
+> fields but are neutralised to `0` and `all`; they are no longer live diversity dimensions.
+> Multiple recordings contribute additively to batch capacity and are dealt across outputs,
+> never multiplied together inside an output. The current executable contract and scoring
+> formula are in `docs/editorial_scoring_reference.md`.
+
 A formal statement of what an automated edit can vary, how large the resulting space is, and
 how a batch of N outputs is mapped onto it. Written before the code, because "make them
 diverse" is not implementable until the space is fixed and countable.
@@ -30,8 +38,8 @@ implementation detail.
 | 2 | X₁ | Footage mix | `dwell_heavy`, `balanced`, `transit_heavy` | 3 | structural | **live** |
 | 2 | X₂ | Emphasis | `target`, `coverage` | 2 | structural | **live** |
 | 2 | X₃ | Contour | `flat`, `accelerate`, `decelerate`, `arc`, `follow_energy` | 5 | structural | **live** |
-| 2 | X₄ | Start rotation | which point opens the edit | 4 | structural | **live** |
-| 2 | X₅ | Recording scope | `½`, `⅔`, `⅚`, `1` of what the pace carries | 4 | content | **live** |
+| 2 | X₄ | Start rotation | legacy field, fixed at `0` in batches | 1 | structural | **retired for integrity** |
+| 2 | X₅ | Recording scope | legacy field, fixed at `all` for the assigned source | 1 | content | **retired for integrity** |
 | 2 | X₆ | Point scope | `½`, `⅔`, `⅚`, `1` of what the pace carries | r₆(X₀) | structural | **live** |
 | 3 | X₇ | Music track | the music pool | \|M\| | content | **live** |
 | 3 | X₈ | Voiceover track | the voiceover pool | \|V\| | content | **live** |
@@ -313,10 +321,15 @@ shopping list.
 ### Stage 1 — the budget, first because everything is a function of it
 
 ```text
-T = target_duration
-T = max(T, voiceover_length)      narration is never cut mid-sentence
-T = min(T, total_available)       unless the voiceover raised it, in which case picture loops
+P = min(target_duration, total_available)
+T = max(P, voiceover_length)      narration is never cut mid-sentence
+picture loops only when voiceover_length > total_available
 ```
+
+Point scope is resolved from `T`, not from the original target. This prevents a long narration
+from looping a narrow early scope while unused forward footage still exists later in the same
+recording. A shorter narration never shortens the requested picture duration; its tail is simply
+picture-led and has no speech.
 
 ### Stage 2 — pinned versus open
 

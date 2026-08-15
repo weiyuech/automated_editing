@@ -148,3 +148,55 @@ def test_cruise_spans_arriving_late_invalidate_the_cached_analysis(tmp_path):
 
     assert all("kind" not in scene for scene in before)
     assert any(scene.get("kind") == "dwell" for scene in after)
+
+
+def test_long_scenes_receive_local_quality_profiles(monkeypatch, tmp_path):
+    """Candidates using different parts of one continuous take need different evidence;
+    scoring one three-frame sample for the entire take makes portfolio ranking cosmetic."""
+    from automated_video_editing_backend.services import analysis as module
+    from automated_video_editing_backend.services.scoring import ShotScore
+
+    seen = []
+
+    def fake_scores(_path, spans):
+        seen.extend(spans)
+        return [
+            ShotScore(
+                quality=0.3 + index * 0.3,
+                sharpness=0.5,
+                exposure=0.8,
+                motion=0.4,
+                steadiness=0.7,
+                colour=(50.0 + index, 128.0, 128.0),
+                fingerprint=index,
+            )
+            for index, _span in enumerate(spans)
+        ], ""
+
+    monkeypatch.setattr(module, "score_shots", fake_scores)
+    scenes = [{"start": 0.0, "end": 30.0, "boundary_score": 0.9}]
+    AnalysisService()._score_scenes(tmp_path / "video.mp4", scenes, [])
+
+    assert seen == [(0.0, 12.0), (12.0, 24.0), (24.0, 30.0)]
+    assert [item["quality"] for item in scenes[0]["quality_profile"]] == [0.3, 0.6, 0.9]
+    assert 0.3 < scenes[0]["quality"] < 0.9
+
+
+def test_point_merge_preserves_only_real_visual_boundary_metrics():
+    service = AnalysisService()
+    visual = [
+        {"start": 0.0, "end": 20.0, "boundary_score": 1.0, "boundary_metrics": {"content_val": 0}},
+        {"start": 20.0, "end": 40.0, "boundary_score": 0.8, "boundary_metrics": {"content_val": 30}},
+    ]
+    segments = [{
+        "path_name": "path", "goal_id": 1, "status": "arrived",
+        "transit_start_seconds": 0.0, "arrived_at_seconds": 10.0,
+        "departed_at_seconds": 30.0,
+    }]
+
+    merged = service._merge_cruise_segments(visual, segments, [])
+    by_start = {scene["start"]: scene for scene in merged}
+
+    assert by_start[20.0]["boundary_score"] == 0.8
+    assert by_start[20.0]["from_scene_detector"] is True
+    assert "boundary_score" not in by_start[10.0]
