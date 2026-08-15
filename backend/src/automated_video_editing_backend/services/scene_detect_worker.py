@@ -7,6 +7,7 @@ a malformed recording that wedges it should cost one process, not the app.
 from __future__ import annotations
 
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -36,7 +37,7 @@ def open_best(path: Path):
     from scenedetect import open_video
     from scenedetect.backends import AVAILABLE_BACKENDS
 
-    if "pyav" in AVAILABLE_BACKENDS:
+    if os.environ.get("AVE_EXTERNAL_MEDIA_TOOLS") != "1" and "pyav" in AVAILABLE_BACKENDS:
         try:
             return open_video(str(path), backend="pyav")
         except Exception:

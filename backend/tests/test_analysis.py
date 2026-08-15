@@ -48,20 +48,18 @@ def test_the_recording_itself_is_read_when_the_container_can_be(monkeypatch):
 
 
 def test_the_proxy_is_still_there_for_a_machine_without_pyav(monkeypatch):
-    """Without PyAV the reader is back to the one that needed repairing, so the fallback has
-    to survive rather than being deleted along with its usual case."""
+    """Without PyAV both scene detection and scoring use one decoder-compatible proxy."""
     from automated_video_editing_backend.services import analysis as module
 
     monkeypatch.setattr(module, "_has_pyav", lambda: False)
     service = AnalysisService()
     source = Path("/tmp/source.mp4")
     proxy = Path("/tmp/proxy.mp4")
-    monkeypatch.setattr(service, "_timestamps_need_repair", lambda path: True)
     monkeypatch.setattr(service, "_create_analysis_proxy", lambda path: proxy)
 
     warnings = []
     assert service._scene_input(source, warnings) == proxy
-    assert warnings == ["Using timestamp-repaired analysis proxy: proxy.mp4"]
+    assert warnings == ["Using decoder-compatible analysis proxy: proxy.mp4"]
 
 
 def test_timestamp_value_rejects_missing_and_nan():

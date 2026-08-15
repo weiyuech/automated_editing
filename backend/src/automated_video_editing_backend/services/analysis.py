@@ -29,6 +29,8 @@ QUALITY_PROFILE_SECONDS = 12.0
 @lru_cache(maxsize=1)
 def _has_pyav() -> bool:
     """Whether frames can be read from the container directly. Asked once."""
+    if os.environ.get("AVE_EXTERNAL_MEDIA_TOOLS") == "1":
+        return False
     try:
         import av  # noqa: F401
     except Exception:
@@ -338,7 +340,10 @@ class AnalysisService:
             notes.append("PySceneDetect returned no scenes; using OpenCV fallback")
             scenes = self._detect_scenes_with_opencv(scene_input, notes)
         scenes = self._merge_capture_markers(video_path, scenes, notes)
-        self._score_scenes(video_path, scenes, notes)
+        # The proxy has the same clock as the source.  In the external-tools edition it is also
+        # the decoder compatibility layer for quality sampling, so score the exact input that
+        # scene detection could read instead of reopening the troublesome camera container.
+        self._score_scenes(scene_input, scenes, notes)
         if key:
             self._scene_cache[key] = (scenes, notes)
         warnings.extend(notes)
@@ -635,18 +640,18 @@ class AnalysisService:
         from the container and has no such trouble, so where PyAV is present the recording is
         read directly and the transcode is skipped entirely.
 
-        It remains the fallback, because a machine without PyAV is back to the decoder that
-        needed it.
+        It remains the fallback, because a build without PyAV is back to the decoder that
+        needed it.  That build always uses the cached proxy: checking timestamps alone is not
+        enough, because OpenCV can report a plausible clock and still fail its first frame read.
         """
         if _has_pyav():
             return video_path
         try:
-            if self._timestamps_need_repair(video_path):
-                proxy = self._create_analysis_proxy(video_path)
-                warnings.append(f"Using timestamp-repaired analysis proxy: {proxy.name}")
-                return proxy
+            proxy = self._create_analysis_proxy(video_path)
+            warnings.append(f"Using decoder-compatible analysis proxy: {proxy.name}")
+            return proxy
         except Exception as exc:
-            warnings.append(f"Timestamp preflight failed: {exc}")
+            warnings.append(f"Analysis proxy could not be created: {exc}")
         return video_path
 
     def _timestamps_need_repair(self, video_path: Path) -> bool:

@@ -1,0 +1,52 @@
+{
+  "appId": "com.weiyuech.automatedediting",
+  "productName": "自动视频剪辑",
+  "extraMetadata": {
+    "version": "0.1.3"
+  },
+  "asar": true,
+  "directories": {
+    "output": "../release/external-media-tools",
+    "buildResources": "build"
+  },
+  "files": [
+    "out/**/*",
+    "package.json"
+  ],
+  "extraResources": [
+    {
+      "from": "build-external/backend-dist",
+      "to": "backend"
+    },
+    {
+      "from": "build/icon.png",
+      "to": "icon.png"
+    },
+    {
+      "from": "build/external-media-tools.json",
+      "to": "external-media-tools.json"
+    },
+    {
+      "from": "../THIRD_PARTY_NOTICES_EXTERNAL.md",
+      "to": "THIRD_PARTY_NOTICES.md"
+    }
+  ],
+  "win": {
+    "target": [
+      {
+        "target": "nsis",
+        "arch": ["x64"]
+      }
+    ],
+    "icon": "build/icon.png",
+    "artifactName": "Automated-Video-Editing-${version}-Windows-${arch}-External-Media-Tools-Setup.${ext}"
+  },
+  "nsis": {
+    "oneClick": false,
+    "allowToChangeInstallationDirectory": true,
+    "deleteAppDataOnUninstall": false,
+    "createDesktopShortcut": true,
+    "createStartMenuShortcut": true,
+    "shortcutName": "自动视频剪辑"
+  }
+}

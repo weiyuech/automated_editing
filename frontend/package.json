@@ -8,7 +8,8 @@
     "dev": "electron-vite dev",
     "build": "electron-vite build",
     "preview": "electron-vite preview",
-    "dist:win": "electron-vite build && electron-builder --win nsis --x64 --publish never"
+    "dist:win": "electron-vite build && electron-builder --win nsis --x64 --publish never",
+    "dist:win:external": "electron-vite build && electron-builder --config electron-builder.external.json --win nsis --x64 --publish never"
   },
   "dependencies": {
     "@vitejs/plugin-vue": "^5.0.4",

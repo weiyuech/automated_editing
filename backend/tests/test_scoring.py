@@ -4,7 +4,6 @@ import pytest
 
 from automated_video_editing_backend.services import scoring
 
-
 SIZE = "size=320x240:rate=25:duration=6"
 
 
@@ -107,6 +106,33 @@ def test_the_same_frame_hashes_alike_and_a_different_one_does_not(tmp_path):
 
     assert scoring.fingerprint_distance(first.fingerprint, again.fingerprint) == 0
     assert scoring.fingerprint_distance(first.fingerprint, other.fingerprint) > 8
+
+
+def test_opencv_proxy_sampler_keeps_quality_measurements_without_pyav(tmp_path, monkeypatch):
+    """The external-tools package omits PyAV, but must not turn every shot neutral."""
+    import cv2
+    import numpy as np
+
+    moving = tmp_path / "proxy.avi"
+    writer = cv2.VideoWriter(
+        str(moving), cv2.VideoWriter_fourcc(*"MJPG"), 25, (320, 240),
+    )
+    for index in range(150):
+        frame = np.zeros((240, 320, 3), dtype=np.uint8)
+        cv2.rectangle(frame, (index % 260, 60), (index % 260 + 60, 180), (220, 120, 40), -1)
+        writer.write(frame)
+    writer.release()
+    groups = scoring._sample_frames_opencv(cv2, moving, [(0.0, 6.0)])
+    measured = scoring._measure(cv2, groups[0])
+
+    assert measured is not None
+    assert measured["sharp"] > 0
+    assert measured["motion"] > 0
+
+    monkeypatch.setenv("AVE_EXTERNAL_MEDIA_TOOLS", "1")
+    scores, problem = scoring.score_shots(moving, [(0.0, 6.0)])
+    assert problem == ""
+    assert scores[0].fingerprint != 0
 
 
 def test_colour_distance_grows_with_the_jolt_between_two_shots():

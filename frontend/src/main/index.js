@@ -2,8 +2,8 @@ import { app, BrowserWindow, ipcMain, dialog, shell } from 'electron'
 import { execFile, spawn } from 'node:child_process'
 import { randomBytes } from 'node:crypto'
 import { createServer } from 'node:net'
-import { existsSync, mkdirSync, appendFileSync, copyFileSync, readFileSync } from 'node:fs'
-import { extname, join, relative, resolve, sep } from 'node:path'
+import { existsSync, mkdirSync, appendFileSync, copyFileSync, readFileSync, writeFileSync } from 'node:fs'
+import { delimiter, dirname, extname, join, relative, resolve, sep } from 'node:path'
 
 const SOURCE_ROOT = resolve(__dirname, '../../../')
 const DEFAULT_BACKEND_PORT = 4817
@@ -23,6 +23,124 @@ function ensureRuntimeDirs() {
   const root = appRoot()
   for (const name of ['data', '.cache', 'logs', 'exports', 'previews']) {
     mkdirSync(join(root, name), { recursive: true })
+  }
+}
+
+function isExternalMediaToolsBuild() {
+  if (process.env.AVE_EXTERNAL_MEDIA_TOOLS === '1') return true
+  return app.isPackaged && existsSync(join(process.resourcesPath, 'external-media-tools.json'))
+}
+
+function externalToolConfigPath() {
+  return join(appRoot(), 'data', 'external-media-tools.local.json')
+}
+
+function readExternalToolDirectory() {
+  try {
+    const parsed = JSON.parse(readFileSync(externalToolConfigPath(), 'utf8'))
+    return typeof parsed?.directory === 'string' ? parsed.directory : ''
+  } catch {
+    return ''
+  }
+}
+
+function executableDirectoryCandidates(selected = '') {
+  const directories = [
+    selected,
+    selected ? join(selected, 'bin') : '',
+    process.env.FFMPEG_BIN ? dirname(process.env.FFMPEG_BIN) : '',
+    process.env.FFPROBE_BIN ? dirname(process.env.FFPROBE_BIN) : '',
+    readExternalToolDirectory(),
+    ...String(process.env.PATH || '').split(delimiter)
+  ]
+  return [...new Set(directories.filter(Boolean).map((entry) => resolve(entry)))]
+}
+
+function runTool(path, args) {
+  return new Promise((resolveRun) => {
+    execFile(path, args, { windowsHide: true, timeout: 15000 }, (error, stdout, stderr) => {
+      resolveRun({ error, output: `${stdout || ''}\n${stderr || ''}` })
+    })
+  })
+}
+
+async function inspectExternalTools(selected = '') {
+  let firstIncompatible = null
+  for (const directory of executableDirectoryCandidates(selected)) {
+    const ffmpeg = join(directory, process.platform === 'win32' ? 'ffmpeg.exe' : 'ffmpeg')
+    const ffprobe = join(directory, process.platform === 'win32' ? 'ffprobe.exe' : 'ffprobe')
+    if (!existsSync(ffmpeg) || !existsSync(ffprobe)) continue
+
+    const [version, filters, encoders, probe] = await Promise.all([
+      runTool(ffmpeg, ['-hide_banner', '-version']),
+      runTool(ffmpeg, ['-hide_banner', '-filters']),
+      runTool(ffmpeg, ['-hide_banner', '-encoders']),
+      runTool(ffprobe, ['-hide_banner', '-version'])
+    ])
+    if (version.error || filters.error || encoders.error || probe.error) continue
+    const hasSubtitleFilter = /\b(?:ass|subtitles)\b/i.test(filters.output)
+    const hasX264 = /\blibx264\b/i.test(encoders.output)
+    if (!hasSubtitleFilter || !hasX264) {
+      firstIncompatible ||= {
+        ok: false,
+        directory,
+        reason: [
+          !hasSubtitleFilter ? '缺少字幕所需的 libass（ass/subtitles 滤镜）' : '',
+          !hasX264 ? '缺少导出所需的 libx264 编码器' : ''
+        ].filter(Boolean).join('；')
+      }
+      continue
+    }
+    return { ok: true, directory, ffmpeg, ffprobe }
+  }
+  return firstIncompatible || {
+    ok: false,
+    reason: '没有找到同一文件夹内的 ffmpeg.exe 和 ffprobe.exe'
+  }
+}
+
+async function resolveExternalMediaTools() {
+  if (!isExternalMediaToolsBuild()) return {}
+
+  let last = await inspectExternalTools()
+  if (last.ok) return { FFMPEG_BIN: last.ffmpeg, FFPROBE_BIN: last.ffprobe }
+
+  while (true) {
+    const choice = await dialog.showMessageBox({
+      type: 'warning',
+      title: '首次启动准备',
+      message: '此安装包不内置 FFmpeg 媒体工具。',
+      detail: `请先自行准备 64 位 FFmpeg 与 FFprobe，再选择它们所在的文件夹。\n\n需要：libass 字幕滤镜、libx264 编码器。\n当前检测：${last.reason}\n\n软件不会替您下载或接受第三方许可。`,
+      buttons: ['选择工具文件夹', '重新检测', '打开 FFmpeg 官网', '退出应用'],
+      defaultId: 0,
+      cancelId: 3,
+      noLink: true
+    })
+    if (choice.response === 3) throw new Error('尚未准备 FFmpeg/FFprobe，已取消启动。')
+    if (choice.response === 2) {
+      await shell.openExternal('https://ffmpeg.org/download.html')
+      continue
+    }
+    if (choice.response === 1) {
+      last = await inspectExternalTools()
+      if (last.ok) return { FFMPEG_BIN: last.ffmpeg, FFPROBE_BIN: last.ffprobe }
+      continue
+    }
+
+    const selected = await dialog.showOpenDialog({
+      title: '选择包含 ffmpeg.exe 与 ffprobe.exe 的文件夹',
+      properties: ['openDirectory']
+    })
+    if (selected.canceled || !selected.filePaths[0]) continue
+    last = await inspectExternalTools(selected.filePaths[0])
+    if (!last.ok) continue
+    mkdirSync(join(appRoot(), 'data'), { recursive: true })
+    writeFileSync(
+      externalToolConfigPath(),
+      `${JSON.stringify({ directory: last.directory }, null, 2)}\n`,
+      { encoding: 'utf8', mode: 0o600 }
+    )
+    return { FFMPEG_BIN: last.ffmpeg, FFPROBE_BIN: last.ffprobe }
   }
 }
 
@@ -146,6 +264,7 @@ async function startBackend() {
   migrateLegacySettings()
   ensureRuntimeDirs()
   if (backendProcess) return
+  const externalMediaTools = await resolveExternalMediaTools()
   backendPort = await findBackendPort()
   const root = appRoot()
   const logPath = join(root, 'logs', 'backend.log')
@@ -157,6 +276,7 @@ async function startBackend() {
     APP_BACKEND_PORT: String(backendPort),
     APP_BRIDGE_TOKEN: BRIDGE_TOKEN,
     NUMBA_CACHE_DIR: join(root, '.cache', 'numba'),
+    ...externalMediaTools,
     ...(app.isPackaged
       ? {}
       : { PYTHONPATH: join(SOURCE_ROOT, 'backend', 'src') + (process.env.PYTHONPATH ? `:${process.env.PYTHONPATH}` : '') })

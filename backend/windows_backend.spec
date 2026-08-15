@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 
 from PyInstaller.utils.hooks import collect_all, copy_metadata
@@ -7,6 +8,7 @@ BACKEND_ROOT = Path(SPECPATH).resolve()
 if BACKEND_ROOT.is_file():
     BACKEND_ROOT = BACKEND_ROOT.parent
 PROJECT_ROOT = BACKEND_ROOT.parent
+EXTERNAL_MEDIA_TOOLS = os.environ.get("AVE_EXTERNAL_MEDIA_TOOLS") == "1"
 
 datas = []
 binaries = []
@@ -22,8 +24,7 @@ hiddenimports = [
 # These libraries discover codecs, compiled extensions or analysis backends dynamically. The
 # explicit collection makes the Windows artifact independent of whichever modules PyInstaller
 # happened to observe while importing main.py on the CI runner.
-for package in (
-    "av",
+packages = [
     "cv2",
     "scenedetect",
     "librosa",
@@ -33,7 +34,11 @@ for package in (
     "sklearn",
     "onnxruntime",
     "tokenizers",
-):
+]
+if not EXTERNAL_MEDIA_TOOLS:
+    packages.insert(0, "av")
+
+for package in packages:
     package_datas, package_binaries, package_hidden = collect_all(package)
     datas += package_datas
     binaries += package_binaries
@@ -55,16 +60,17 @@ datas += [
         "automated_video_editing_backend/assets",
     ),
 ]
-binaries += [
-    (
-        str(BACKEND_ROOT / "vendor" / "ffmpeg" / "win64" / "ffmpeg.exe"),
-        "vendor/ffmpeg/win64",
-    ),
-    (
-        str(BACKEND_ROOT / "vendor" / "ffmpeg" / "win64" / "ffprobe.exe"),
-        "vendor/ffmpeg/win64",
-    ),
-]
+if not EXTERNAL_MEDIA_TOOLS:
+    binaries += [
+        (
+            str(BACKEND_ROOT / "vendor" / "ffmpeg" / "win64" / "ffmpeg.exe"),
+            "vendor/ffmpeg/win64",
+        ),
+        (
+            str(BACKEND_ROOT / "vendor" / "ffmpeg" / "win64" / "ffprobe.exe"),
+            "vendor/ffmpeg/win64",
+        ),
+    ]
 
 a = Analysis(
     [str(BACKEND_ROOT / "src" / "automated_video_editing_backend" / "main.py")],
@@ -75,7 +81,7 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=["pytest", "matplotlib", "tkinter"],
+    excludes=["pytest", "matplotlib", "tkinter"] + (["av"] if EXTERNAL_MEDIA_TOOLS else []),
     noarchive=False,
     optimize=0,
 )

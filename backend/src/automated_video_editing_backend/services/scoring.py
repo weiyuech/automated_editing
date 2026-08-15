@@ -13,6 +13,7 @@ the numbers.
 from __future__ import annotations
 
 import math
+import os
 from pathlib import Path
 from typing import Any, NamedTuple
 
@@ -83,7 +84,7 @@ class ShotScore(NamedTuple):
     fingerprint: int        # 64-bit perceptual hash — for "have we shown this already"
 
     @staticmethod
-    def neutral() -> "ShotScore":
+    def neutral() -> ShotScore:
         """What an unmeasurable shot is worth: neither preferred nor penalised."""
         return ShotScore(1.0, 1.0, 1.0, 1.0, 1.0, (0.0, 0.0, 0.0), 0)
 
@@ -95,21 +96,30 @@ def score_shots(video_path: Path, spans: list[tuple[float, float]]) -> tuple[lis
     decoration: the previous decoder failed on every file in this project and said so only by
     returning nothing, which is how it went unnoticed. A scorer that cannot see must say so.
 
-    Decoding is PyAV's, not OpenCV's. OpenCV opens these files and then refuses to hand over a
-    single frame — `grab()` fails on the first call — so anything built on its decoder measures
-    nothing at all. OpenCV's *image* operations are fine and are still used; it is only the
-    reading of frames that moves.
+    The fully bundled edition decodes the original container with PyAV.  The external-tools
+    edition deliberately does not ship PyAV's prebuilt FFmpeg libraries; AnalysisService gives
+    this scorer a timestamp-repaired proxy and OpenCV walks that proxy sequentially instead.
+    Both paths collect the same neighbouring-frame samples and feed the same measurements.
     """
     if not spans:
         return [], ""
     try:
-        import av
         import cv2
     except Exception as exc:
         return [ShotScore.neutral()] * len(spans), f"镜头质量分析不可用：{exc}"
 
     try:
-        frames = _sample_frames(av, cv2, video_path, spans)
+        av = None
+        if os.environ.get("AVE_EXTERNAL_MEDIA_TOOLS") != "1":
+            try:
+                import av
+            except Exception:
+                pass
+        frames = (
+            _sample_frames(av, cv2, video_path, spans)
+            if av is not None
+            else _sample_frames_opencv(cv2, video_path, spans)
+        )
     except Exception as exc:
         return [ShotScore.neutral()] * len(spans), f"镜头质量分析失败：{exc}"
 
@@ -166,6 +176,58 @@ def _sample_frames(av, cv2, video_path: Path, spans: list[tuple[float, float]]) 
                 collected[index].append([picture])
                 awaiting.append(index)
                 cursor += 1
+    return collected
+
+
+def _sample_frames_opencv(
+    cv2, video_path: Path, spans: list[tuple[float, float]]
+) -> list[list[Any]]:
+    """The same forward-only sampler for a decoder-compatible constant-rate proxy.
+
+    Seeking is intentionally avoided here too.  The proxy was made with an explicit frame rate
+    and regenerated timestamps, so frame index divided by FPS is the stable clock that the
+    original robot recording could not provide through OpenCV.
+    """
+    wanted: list[tuple[float, int]] = []
+    for index, (start, end) in enumerate(spans):
+        for sample in range(SAMPLES_PER_SHOT):
+            wanted.append((start + (end - start) * (sample + 1) / (SAMPLES_PER_SHOT + 1), index))
+    wanted.sort()
+
+    collected: list[list[list[Any]]] = [[] for _ in spans]
+    awaiting: list[int] = []
+    cursor = 0
+    frame_index = 0
+    capture = cv2.VideoCapture(str(video_path))
+    if not capture.isOpened():
+        raise RuntimeError(f"OpenCV could not open {video_path.name}")
+    try:
+        fps = float(capture.get(cv2.CAP_PROP_FPS) or 0.0)
+        if not math.isfinite(fps) or fps <= 0:
+            raise RuntimeError(f"OpenCV could not read the frame rate of {video_path.name}")
+        while cursor < len(wanted) or awaiting:
+            ok, frame = capture.read()
+            if not ok:
+                break
+            moment = frame_index / fps
+            frame_index += 1
+            picture = None
+
+            if awaiting:
+                picture = _shrink(cv2, frame)
+                for index in awaiting:
+                    collected[index][-1].append(picture)
+                awaiting = []
+
+            while cursor < len(wanted) and wanted[cursor][0] <= moment:
+                if picture is None:
+                    picture = _shrink(cv2, frame)
+                index = wanted[cursor][1]
+                collected[index].append([picture])
+                awaiting.append(index)
+                cursor += 1
+    finally:
+        capture.release()
     return collected
 
 
