@@ -51,7 +51,7 @@ jobs:
       - name: Install backend build dependencies
         run: python -m pip install --upgrade pip pyinstaller && python -m pip install -e "backend[beat,assets,dev]"
 
-      - name: Fetch pinned fonts and Windows FFmpeg
+      - name: Fetch pinned fonts, semantic model, and Windows FFmpeg
         run: python scripts/prepare_assets.py --platform win64
 
       - name: Verify bundled media assets
@@ -65,11 +65,13 @@ jobs:
               Path("backend/src/automated_video_editing_backend/assets/fonts/NotoSansSC.ttf"),
               Path("backend/src/automated_video_editing_backend/assets/fonts/NotoSerifSC.ttf"),
               Path("backend/src/automated_video_editing_backend/assets/fonts/SmileySans.ttf"),
+              Path("backend/src/automated_video_editing_backend/assets/semantic/bge-small-zh-v1.5/model_int8.onnx"),
+              Path("backend/src/automated_video_editing_backend/assets/semantic/bge-small-zh-v1.5/tokenizer.json"),
           ]
           missing = [str(path) for path in required if not path.is_file()]
           if missing:
               raise SystemExit("Missing release assets: " + ", ".join(missing))
-          print("Fonts and FFmpeg are ready.")
+          print("Fonts, semantic model, and FFmpeg are ready.")
           PY
 
       - name: Add bundled FFmpeg tools to PATH
@@ -94,12 +96,14 @@ jobs:
               "NotoSansSC.ttf",
               "NotoSerifSC.ttf",
               "SmileySans.ttf",
+              "model_int8.onnx",
+              "tokenizer.json",
           }
           found = {path.name for path in bundle.rglob("*") if path.is_file()}
           missing = sorted(required_names - found)
           if missing:
               raise SystemExit("Frozen backend is incomplete: " + ", ".join(missing))
-          print("Frozen backend contains the executable, FFmpeg, and all fonts.")
+          print("Frozen backend contains the executable, FFmpeg, fonts, and semantic model.")
           PY
 
       - name: Install frontend dependencies
