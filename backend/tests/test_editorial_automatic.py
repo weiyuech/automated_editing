@@ -170,7 +170,9 @@ async def test_one_hundred_deliveries_plan_four_hundred_candidates(monkeypatch, 
         editorial_preset="smart",
     ))
 
-    manifest = json.loads((tmp_path / "logs" / "batch-plan-100.json").read_text())
+    manifest = json.loads(
+        (tmp_path / "logs" / "batch-plan-100.json").read_text(encoding="utf-8")
+    )
     assert len(created) == 100
     assert manifest["selected_count"] == 100
     assert manifest["candidate_count"] == 400
@@ -224,7 +226,9 @@ async def test_automatic_portfolio_is_balanced_per_source_and_stays_chronologica
         assert components["source_integrity"] == 1.0
         assert components["chronological_integrity"] == 1.0
 
-    manifest = json.loads((tmp_path / "logs" / "batch-plan-91.json").read_text())
+    manifest = json.loads(
+        (tmp_path / "logs" / "batch-plan-91.json").read_text(encoding="utf-8")
+    )
     assert manifest["source_allocation"] == "one_recording_per_output"
     assert set(manifest["source_output_counts"].values()) == {2}
     assert manifest["candidate_count"] == 40
