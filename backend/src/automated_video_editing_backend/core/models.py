@@ -353,6 +353,14 @@ class EditJobRequest(BaseModel):
     subtitles: bool = False
     subtitle_font: str = "noto_sans_sc"
     subtitle_size: Literal["small", "medium", "large"] = "medium"
+    # A generated effect bumper attached to this one output, resolved by the batch from the
+    # effect pools. The effect keeps its own audio; narration/music sit after an intro and
+    # before an outro. Duration is on top of target_duration_seconds, not counted into it.
+    intro_effect_media_id: str | None = None
+    outro_effect_media_id: str | None = None
+    # Off (default): narration/music sit around the effect, which keeps its own audio. On: the
+    # narration/music cover it and the effect is treated like an ordinary input clip.
+    effect_cover_audio: bool = False
 
 
 class EditBatchRequest(BaseModel):
@@ -397,6 +405,16 @@ class EditBatchRequest(BaseModel):
     subtitles: bool = False
     subtitle_font: str = "noto_sans_sc"
     subtitle_size: Literal["small", "medium", "large"] = "medium"
+    # 特效池: intro clips are attached at the start, outro clips at the end (a video may get
+    # both). ``effect_scope`` decides which outputs are decorated — "all" gives every output a
+    # bumper (reusing the pool), "auto" is scarce: the best-scored outputs in 智能剪辑, a random
+    # subset in 专业剪辑. One effect per output per pool, no repeats within a scarce deal.
+    intro_effect_media_ids: list[str] = Field(default_factory=list, max_length=100)
+    outro_effect_media_ids: list[str] = Field(default_factory=list, max_length=100)
+    effect_scope: Literal["auto", "all"] = "auto"
+    # Off (default): narration/music sit around the effect, which keeps its own audio. On: the
+    # narration/music cover it and the effect is treated like an ordinary input clip.
+    effect_cover_audio: bool = False
 
 
 class TimelineDraftRequest(BaseModel):
@@ -546,6 +564,9 @@ class EditTimeline(BaseModel):
     # Where the narration begins in the output. Zero today; it exists so that when 手动微调 moves
     # the voiceover, one field moves the audio and the subtitles together.
     voiceover_start_seconds: float = Field(default=0.0, ge=0)
+    # How far to push the music bed back, so an intro effect plays before the music starts.
+    # Zero on every ordinary timeline; set only when a 片头特效 is attached.
+    music_delay_seconds: float = Field(default=0.0, ge=0)
     subtitles: SubtitleTrack | None = None
     # The export frame. Held here rather than hardcoded in the renderer because a vertical mode
     # is coming, and subtitle geometry is all expressed as fractions of these two numbers.
@@ -655,6 +676,9 @@ class TTSSettingsSummary(BaseModel):
     volume_ratio: float = 1.0
     pitch_ratio: float = 1.0
     with_timestamp: bool = True
+    # A daily cap on voiceover generations, mirroring the Seedance daily limit. Counts every
+    # 旁白 produced, whether or not the LLM assist drafted the text.
+    daily_limit: int = 100
 
 
 class SeedanceSettingsSummary(BaseModel):
@@ -730,6 +754,7 @@ class TTSSettingsUpdate(BaseModel):
     speed_ratio: float | None = Field(default=None, ge=0.2, le=3.0)
     volume_ratio: float | None = Field(default=None, ge=0.1, le=5.0)
     pitch_ratio: float | None = Field(default=None, ge=0.2, le=3.0)
+    daily_limit: int | None = Field(default=None, ge=1, le=1000)
 
 
 class SeedanceSettingsUpdate(BaseModel):
@@ -803,6 +828,9 @@ class TTSGenerateRequest(BaseModel):
     title: str = "voiceover"
     text: str = Field(default="", max_length=1500)
     use_llm: bool = False
+    # Desired spoken length in seconds. Only meaningful with use_llm: the LLM is what shapes
+    # the script to length. The backend turns it into a target 字数; blank keeps the old prompt.
+    target_seconds: float | None = Field(default=None, ge=1, le=600)
 
 
 class TTSAsset(BaseModel):
@@ -816,11 +844,21 @@ class TTSAsset(BaseModel):
     created_at: datetime = Field(default_factory=utc_now)
 
 
+class TTSQuota(BaseModel):
+    """Today's voiceover allowance, the TTS analogue of SeedanceQuota."""
+
+    date: str
+    used: int = 0
+    limit: int = 100
+    remaining: int = 100
+
+
 class TTSGenerateResult(BaseModel):
     media_item: MediaItem
     asset: TTSAsset
     words: list[dict[str, Any]] = Field(default_factory=list)
     final_text: str
+    quota: TTSQuota
 
 
 class SeedanceFrameRequest(BaseModel):

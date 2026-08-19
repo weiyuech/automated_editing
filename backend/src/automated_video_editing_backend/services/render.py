@@ -188,6 +188,9 @@ class RenderService:
             duration = timeline.music_duration_seconds or sum(
                 max(0.0, clip.duration) for clip in timeline.clips
             )
+            # Only a 片头特效 pushes the music back; without one the filter graph is left exactly
+            # as it was, so ordinary timelines render byte-for-byte unchanged.
+            music_label = "[bgmbase]" if timeline.music_delay_seconds > 0 else "[bgm]"
             if (
                 timeline.music_duration_seconds is None
                 and timeline.music_start_seconds == 0
@@ -196,7 +199,7 @@ class RenderService:
                 # A hand-built/old timeline did not select an excerpt. Preserve its exact
                 # full-track rendering contract; planner-v2 timelines always fill the fields
                 # above and take the bounded branch below.
-                filter_parts.append(f"[{music_input_index}:a:0]volume={bed}[bgm]")
+                filter_parts.append(f"[{music_input_index}:a:0]volume={bed}{music_label}")
             else:
                 fade = min(0.8, max(0.12, duration * 0.025))
                 fade_out = max(0.0, duration - fade)
@@ -206,7 +209,13 @@ class RenderService:
                     "asetpts=PTS-STARTPTS,"
                     f"afade=t=in:st=0:d={fade:.3f},"
                     f"afade=t=out:st={fade_out:.3f}:d={fade:.3f},"
-                    f"volume={bed}[bgm]"
+                    f"volume={bed}{music_label}"
+                )
+            if timeline.music_delay_seconds > 0:
+                # The music starts after the intro effect — the same relationship
+                # voiceover_start_seconds gives the narration.
+                filter_parts.append(
+                    f"[bgmbase]adelay={int(round(timeline.music_delay_seconds * 1000))}:all=1[bgm]"
                 )
             sources.append("[bgm]")
         if timeline.voiceover_path:

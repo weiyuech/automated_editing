@@ -118,6 +118,7 @@ async def test_tts_generation_creates_audio_asset(monkeypatch, tmp_path):
     })
     media = MediaService(path=Path(tempfile.mkdtemp()) / "media-library.json")
     service = TTSService(settings, media)
+    service.usage_path = tmp_path / "usage.json"  # keep the daily counter out of real data/tts
 
     async def fake_request(text):
         return b"fake-mp3", {"duration_ms": 320, "words": [{"word": "你", "start_time": 0, "end_time": 120}], "phonemes": []}
@@ -138,6 +139,98 @@ async def test_tts_generation_creates_audio_asset(monkeypatch, tmp_path):
         Path(result.asset.audio_path).unlink(missing_ok=True)
         if result.asset.metadata_path:
             Path(result.asset.metadata_path).unlink(missing_ok=True)
+
+
+def test_resource_id_is_derived_from_cluster(tmp_path):
+    """A cloned voice needs X-Api-Resource-Id to return the per-word timestamps subtitles are
+    built from. Standard voices need none; the volcano_icl clusters map to the clone models."""
+    settings = SettingsService(path=tmp_path / "settings.json")
+    media = MediaService(path=Path(tempfile.mkdtemp()) / "media-library.json")
+    service = TTSService(settings, media)
+
+    assert service._resource_id({"cluster": "volcano_tts"}) == ""
+    assert service._resource_id({"cluster": "volcano_icl"}) == "volc.megatts.default"
+    assert service._resource_id({"cluster": "volcano_icl_concurr"}) == "volc.megatts.concurr"
+    assert service._resource_id({"cluster": "volcano_icl", "resource_id": "volc.custom"}) == "volc.custom"
+
+
+@pytest.mark.asyncio
+async def test_cloned_voice_request_sends_resource_id_header(monkeypatch, tmp_path):
+    """volcano_icl must carry X-Api-Resource-Id (or the cloned voice returns no timestamps);
+    a standard volcano_tts request must not send it."""
+    captured: dict[str, dict] = {}
+
+    class FakeResponse:
+        status_code = 200
+        text = ""
+
+        def json(self):
+            return {"code": 3000, "data": "", "addition": {"duration": "100"}}
+
+    class FakeClient:
+        def __init__(self, *a, **k):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def post(self, url, headers=None, json=None):
+            captured["headers"] = headers
+            return FakeResponse()
+
+    monkeypatch.setattr("automated_video_editing_backend.services.tts.httpx.AsyncClient", FakeClient)
+    media = MediaService(path=Path(tempfile.mkdtemp()) / "media-library.json")
+
+    icl = SettingsService(path=tmp_path / "icl.json")
+    icl.replace_for_development({"tts": {"enabled": True, "app_id": "a", "access_token": "t",
+                                         "voice_type": "S_nFIhsvHX1", "cluster": "volcano_icl"}})
+    await TTSService(icl, media)._request_sync_tts("你好")
+    assert captured["headers"]["X-Api-Resource-Id"] == "volc.megatts.default"
+
+    std = SettingsService(path=tmp_path / "std.json")
+    std.replace_for_development({"tts": {"enabled": True, "app_id": "a", "access_token": "t",
+                                         "voice_type": "BV001_streaming", "cluster": "volcano_tts"}})
+    await TTSService(std, media)._request_sync_tts("你好")
+    assert "X-Api-Resource-Id" not in captured["headers"]
+
+
+@pytest.mark.asyncio
+async def test_voiceover_daily_limit_counts_and_blocks(monkeypatch, tmp_path):
+    """Every successful 旁白 spends one of the day's allowance (regardless of LLM assist,
+    which happens upstream in the route), and generation is blocked once it is used up."""
+    settings = SettingsService(path=tmp_path / "settings.json")
+    settings.replace_for_development({"tts": {
+        "enabled": True, "app_id": "a", "access_token": "t",
+        "voice_type": "BV001_streaming", "cluster": "volcano_tts", "daily_limit": 2,
+    }})
+    media = MediaService(path=Path(tempfile.mkdtemp()) / "media-library.json")
+    service = TTSService(settings, media)
+    service.usage_path = tmp_path / "usage.json"
+
+    async def fake_request(text):
+        return b"fake-mp3", {"duration_ms": 100, "words": [], "phonemes": []}
+
+    monkeypatch.setattr(service, "_request_sync_tts", fake_request)
+
+    assert service.quota().remaining == 2
+    made = []
+    try:
+        first = await service.synthesize(TTSGenerateRequest(title="a", text="一"), "一")
+        assert (first.quota.used, first.quota.remaining) == (1, 1)
+        made.append(first)
+        second = await service.synthesize(TTSGenerateRequest(title="b", text="二"), "二")
+        assert (second.quota.used, second.quota.remaining) == (2, 0)
+        made.append(second)
+        with pytest.raises(ValueError):
+            await service.synthesize(TTSGenerateRequest(title="c", text="三"), "三")
+    finally:
+        for result in made:
+            Path(result.asset.audio_path).unlink(missing_ok=True)
+            if result.asset.metadata_path:
+                Path(result.asset.metadata_path).unlink(missing_ok=True)
 
 
 def test_seedance_summary_surfaces_both_models(tmp_path):

@@ -40,6 +40,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
         "volume_ratio": 1.0,
         "pitch_ratio": 1.0,
         "with_timestamp": True,
+        "daily_limit": 100,
     },
     "seedance": {
         "enabled": False,
@@ -111,6 +112,7 @@ class SettingsService:
                 volume_ratio=float(tts.get("volume_ratio") or 1.0),
                 pitch_ratio=float(tts.get("pitch_ratio") or 1.0),
                 with_timestamp=True,
+                daily_limit=int(tts.get("daily_limit") or 100),
             ),
             seedance=SeedanceSettingsSummary(
                 enabled=bool(seedance.get("enabled")),

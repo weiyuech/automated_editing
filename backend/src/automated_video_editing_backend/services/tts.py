@@ -4,7 +4,7 @@ import base64
 import json
 import re
 import uuid
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -15,7 +15,9 @@ from automated_video_editing_backend.core.models import (
     TTSAsset,
     TTSGenerateRequest,
     TTSGenerateResult,
+    TTSQuota,
 )
+from automated_video_editing_backend.core.store import read_json, write_json
 from automated_video_editing_backend.services.naming import stamped_name
 from automated_video_editing_backend.core.paths import ensure_inside_root, generated_path
 from automated_video_editing_backend.services.media import MediaService
@@ -30,6 +32,7 @@ class TTSService:
         self.media = media
         self.tts_dir = generated_path("data", "tts")
         self.tts_dir.mkdir(parents=True, exist_ok=True)
+        self.usage_path = self.tts_dir / "usage.json"
 
     async def test(self) -> ProviderTestResult:
         cfg = self.settings.tts_config()
@@ -55,6 +58,9 @@ class TTSService:
         clean_text = self._clean_text(final_text)
         if not clean_text:
             raise ValueError("TTS text is empty after cleaning")
+        quota = self.quota()
+        if quota.remaining <= 0:
+            raise ValueError(f"今日旁白生成已达上限（{quota.limit}），可在设置中调整每日上限")
         audio, timing = await self._request_sync_tts(clean_text)
         cfg = self.settings.tts_config()
         ext = ".wav" if cfg.get("encoding") == "wav" else ".mp3"
@@ -85,12 +91,17 @@ class TTSService:
                 "duration_ms": metadata["duration_ms"],
             },
         )
+        # A voiceover was produced: spend one of today's allowance, whether or not the LLM
+        # assist drafted the text. Only a successful synthesis counts, so a provider error
+        # never burns the operator's quota.
+        self._increment_usage(quota.date)
         asset = self._asset_from_files(audio_path, metadata_path, media_item.id)
         return TTSGenerateResult(
             media_item=media_item,
             asset=asset,
             words=metadata["words"],
             final_text=clean_text,
+            quota=self.quota(),
         )
 
     def list_assets(self) -> list[TTSAsset]:
@@ -106,6 +117,36 @@ class TTSService:
             )
             assets.append(self._asset_from_files(path, metadata_path if metadata_path.exists() else None, media_item.id))
         return assets
+
+    def quota(self) -> TTSQuota:
+        """Today's voiceover allowance. The TTS analogue of SeedanceService.quota()."""
+        cfg = self.settings.tts_config()
+        limit = int(cfg.get("daily_limit") or 100)
+        today = date.today().isoformat()
+        used = int(self._read_usage().get(today, 0))
+        return TTSQuota(date=today, used=used, limit=limit, remaining=max(0, limit - used))
+
+    def _read_usage(self) -> dict[str, int]:
+        data, _problem = read_json(self.usage_path)
+        if not isinstance(data, dict):
+            return {}
+        usage: dict[str, int] = {}
+        for key, value in data.items():
+            try:
+                usage[str(key)] = max(0, int(value))
+            except (TypeError, ValueError):
+                continue
+        return usage
+
+    def _increment_usage(self, day: str) -> None:
+        """Spend one voiceover from the day's allowance.
+
+        store.write_json writes whole and moves into place: a torn write would read back as
+        nothing spent today, handing the whole day's budget back by accident.
+        """
+        usage = self._read_usage()
+        usage[day] = int(usage.get(day, 0)) + 1
+        write_json(self.usage_path, usage)
 
     async def _request_sync_tts(self, text: str) -> tuple[bytes, dict[str, Any]]:
         cfg = self.settings.tts_config()
@@ -128,10 +169,14 @@ class TTSService:
                 "with_timestamp": 1,
             },
         }
+        headers = {"Content-Type": "application/json", "x-api-key": cfg["access_token"]}
+        resource_id = self._resource_id(cfg)
+        if resource_id:
+            headers["X-Api-Resource-Id"] = resource_id
         async with httpx.AsyncClient(timeout=30) as client:
             response = await client.post(
                 VOLCENGINE_SYNC_TTS_URL,
-                headers={"Content-Type": "application/json", "x-api-key": cfg["access_token"]},
+                headers=headers,
                 json=payload,
             )
         if response.status_code >= 400:
@@ -201,3 +246,23 @@ class TTSService:
 
     def _configured(self, cfg: dict[str, Any]) -> bool:
         return bool(cfg.get("app_id") and cfg.get("access_token") and cfg.get("voice_type"))
+
+    def _resource_id(self, cfg: dict[str, Any]) -> str:
+        """The X-Api-Resource-Id a 声音复刻 (cloned) voice needs to behave fully.
+
+        A standard voice needs no resource id, so the header is omitted and that path is left
+        exactly as it was. A cloned voice on the ``volcano_icl`` cluster synthesises audio
+        without it — but only *returns the per-word timestamps* (the ``addition.frontend``
+        block) when the request names this resource, and without those timestamps subtitles
+        cannot be built. ``volcano_icl`` maps to the standard clone model, ``volcano_icl_concurr``
+        to the concurrent one. The voice's owning account must have the resource granted; a
+        different account answers 3001 "resource not granted". An explicit ``resource_id`` in
+        settings overrides the mapping for voices these rules do not anticipate.
+        """
+        explicit = str(cfg.get("resource_id") or "").strip()
+        if explicit:
+            return explicit
+        cluster = str(cfg.get("cluster") or "").strip().lower()
+        if cluster.startswith("volcano_icl"):
+            return "volc.megatts.concurr" if cluster.endswith("concurr") else "volc.megatts.default"
+        return ""

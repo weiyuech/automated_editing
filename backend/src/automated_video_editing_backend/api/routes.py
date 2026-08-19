@@ -577,6 +577,10 @@ def build_router(
     async def tts_assets(_: Secured = None):
         return tts.list_assets()
 
+    @router.get("/tts/quota")
+    async def tts_quota(_: Secured = None):
+        return tts.quota()
+
     @router.post("/tts/generate")
     async def tts_generate(request: TTSGenerateRequest, _: Secured = None):
         try:
@@ -586,7 +590,7 @@ def build_router(
                 raise ValueError("Voiceover needs text")
 
             if request.use_llm:
-                final_text = await llm.draft_voiceover(request.text)
+                final_text = await llm.draft_voiceover(request.text, request.target_seconds)
             else:
                 final_text = request.text
 

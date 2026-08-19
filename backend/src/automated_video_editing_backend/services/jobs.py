@@ -16,6 +16,7 @@ from automated_video_editing_backend.core.models import (
     EditJobRequest,
     JobRecord,
     JobStatus,
+    TimelineClip,
     TimelineDraftRequest,
     utc_now,
 )
@@ -201,6 +202,9 @@ class JobService:
         music_ids = self._deal_pool(request.music_media_ids, count, rng)
         voiceover_ids = self._deal_voiceovers(source_ids, request.voiceover_media_ids, rng)
         self._avoid_repeat_pairs(music_ids, voiceover_ids, rng)
+        # 专业剪辑 has no quality score, so a scarce ("auto") effect deal is a random subset.
+        intro_effect_ids = self._deal_effects(request.intro_effect_media_ids, count, request.effect_scope, rng)
+        outro_effect_ids = self._deal_effects(request.outro_effect_media_ids, count, request.effect_scope, rng)
         variant_seeds = self._deal_variant_seeds(request.cut_variation, count, rng)
         signatures = self._deal_source_signatures(request, source_ids, rng)
         jobs: list[JobRecord] = []
@@ -228,6 +232,9 @@ class JobService:
                 subtitles=request.subtitles,
                 subtitle_font=request.subtitle_font,
                 subtitle_size=request.subtitle_size,
+                intro_effect_media_id=intro_effect_ids[index],
+                outro_effect_media_id=outro_effect_ids[index],
+                effect_cover_audio=request.effect_cover_audio,
                 **signatures[index],
             )
             jobs.append(await self.create(job_request))
@@ -361,8 +368,21 @@ class JobService:
                         "reason": "同一输出位中质量或与已选结果的差异度较低",
                     })
 
+        # Effects are scarce, so "auto" decorates the best-scored outputs first; "all" gives
+        # every output one, reusing the pool.
+        effect_ranking = sorted(range(len(selected)), key=lambda i: selected[i].score, reverse=True)
+        intro_effect_ids = self._deal_effects(
+            request.intro_effect_media_ids, len(selected), request.effect_scope, rng, ranking=effect_ranking,
+        )
+        outro_effect_ids = self._deal_effects(
+            request.outro_effect_media_ids, len(selected), request.effect_scope, rng, ranking=effect_ranking,
+        )
+
         jobs: list[JobRecord] = []
         for index, candidate in enumerate(selected):
+            candidate.request.intro_effect_media_id = intro_effect_ids[index]
+            candidate.request.outro_effect_media_id = outro_effect_ids[index]
+            candidate.request.effect_cover_audio = request.effect_cover_audio
             candidate.request.output_name = self._next_output_name(request.title)
             candidate.request.title = f"{request.title} {index + 1:03d}"
             candidate.timeline.title = candidate.request.title
@@ -707,6 +727,9 @@ class JobService:
                 # see an auto-planned job at all while this was a local variable.
                 job.timeline = timeline
 
+            # Both paths converge here with a finished timeline; attach any 片头/片尾 effects
+            # the batch assigned to this output before it renders.
+            self._decorate_timeline(timeline, job.request)
             job.warnings = list(getattr(timeline, "warnings", []) or [])
             job.progress = 0.7
             job.message = "Rendering export"
@@ -861,6 +884,72 @@ class JobService:
                 timeline.warnings.append(
                     f"特效「{Path(clip.source_path).name}」没有可用声音，已按静音特效处理"
                 )
+
+    def _decorate_timeline(self, timeline, request) -> None:
+        """Attach the resolved 片头/片尾 effect bumpers to a finished timeline.
+
+        Effects sit on top of the planned picture: an intro is prepended and (cover off) the
+        bed pushed past it; an outro is appended. With cover off the effect keeps its own audio
+        and the narration/music sit around it; with cover on it is an ordinary clip the bed
+        plays over. Runs once, after either batch path, so nothing upstream needs to know
+        effects exist.
+        """
+        if not isinstance(getattr(timeline, "planning_diagnostics", None), dict):
+            return
+        if timeline.planning_diagnostics.get("effects_applied"):
+            return
+        intro_id = getattr(request, "intro_effect_media_id", None)
+        outro_id = getattr(request, "outro_effect_media_id", None)
+        intro = self.media.get(intro_id) if intro_id else None
+        outro = self.media.get(outro_id) if outro_id else None
+        # Automatic edits only accept video effects; an image effect (allowed in 手动微调) has no
+        # motion to open or close on, so it is dropped with a note rather than frozen on screen.
+        if intro is not None and getattr(intro, "kind", None) != "video":
+            timeline.warnings.append(f"片头特效「{Path(intro.path).name}」不是视频，自动剪辑已跳过")
+            intro = None
+        if outro is not None and getattr(outro, "kind", None) != "video":
+            timeline.warnings.append(f"片尾特效「{Path(outro.path).name}」不是视频，自动剪辑已跳过")
+            outro = None
+        if intro is None and outro is None:
+            return
+        cover = bool(getattr(request, "effect_cover_audio", False))
+        # Cover off + original audio muted is the only case the effect needs its own audio
+        # layer; when the original bed is kept, the effect's sound rides it in sequence and a
+        # second copy would double it, and when covered the effect is just an ordinary clip.
+        keep_own_audio = (not cover) and not getattr(timeline, "include_original_audio", False)
+        if intro is not None:
+            self._attach_effect(timeline, intro, "intro", cover, keep_own_audio)
+        if outro is not None:
+            self._attach_effect(timeline, outro, "outro", cover, keep_own_audio)
+        self._resolve_clip_audio(timeline)
+        timeline.planning_diagnostics["effects_applied"] = True
+
+    def _attach_effect(self, timeline, item, where: str, cover: bool, keep_own_audio: bool) -> None:
+        duration = self.renderer.probe_duration(item.path) or 0.0
+        if duration <= 0:
+            label = "片头特效" if where == "intro" else "片尾特效"
+            timeline.warnings.append(f"{label}「{Path(item.path).name}」时长无法读取，已跳过")
+            return
+        clip = TimelineClip(
+            media_id=item.id, source_path=item.path, start=0.0, duration=duration,
+            kind="video", include_audio=keep_own_audio, timeline_start=0.0,
+        )
+        if where == "intro":
+            for existing in timeline.clips:
+                existing.timeline_start += duration
+            timeline.clips.insert(0, clip)
+            if not cover:
+                # Push the narration (and its subtitles) and the music past the intro.
+                if timeline.voiceover_path:
+                    timeline.voiceover_start_seconds += duration
+                if timeline.music_path:
+                    timeline.music_delay_seconds += duration
+        else:
+            clip.timeline_start = max(
+                (existing.timeline_start + existing.duration for existing in timeline.clips),
+                default=0.0,
+            )
+            timeline.clips.append(clip)
 
     def is_path_in_use(self, path: str) -> bool:
         """Whether a queued or running render reads from or writes to this file.
@@ -1117,6 +1206,39 @@ class JobService:
             rng.shuffle(shuffled)
             dealt.extend(shuffled[:output_count - len(dealt)])
         return dealt
+
+    def _deal_effects(
+        self,
+        effect_ids: list[str],
+        output_count: int,
+        scope: str,
+        rng: random.Random,
+        ranking: list[int] | None = None,
+    ) -> list[str | None]:
+        """Which output gets which effect from one pool (片头 or 片尾).
+
+        ``scope == "all"`` gives every output a bumper, reusing the pool like _deal_pool.
+        ``scope == "auto"`` is scarce: only as many outputs as there are distinct effects are
+        decorated, one distinct effect each. ``ranking`` (best output index first, from the
+        scored 智能剪辑 portfolio) picks those outputs; without it — 专业剪辑 has no scores — the
+        subset is chosen at random from the batch seed.
+        """
+        deck = list(dict.fromkeys(effect_ids))
+        result: list[str | None] = [None] * output_count
+        if not deck or output_count <= 0:
+            return result
+        if scope == "all":
+            return self._deal_pool(deck, output_count, rng)
+        take = min(len(deck), output_count)
+        if ranking is not None:
+            chosen = list(ranking)[:take]
+        else:
+            chosen = rng.sample(range(output_count), take)
+        effects = list(deck)
+        rng.shuffle(effects)
+        for offset, out_index in enumerate(chosen):
+            result[out_index] = effects[offset]
+        return result
 
     def _deal_voiceovers(
         self,

@@ -624,6 +624,50 @@
                   </label>
                 </div>
               </div>
+              <div class="effect-pool">
+                <div class="effect-pool-head">特效池</div>
+                <div class="effect-zones">
+                  <div class="effect-zone intro">
+                    <div class="effect-zone-head"><span>片头特效</span><button @click="selectedIntroEffectIds = []">清空</button></div>
+                    <div v-if="effectItems.length === 0" class="empty compact-empty">暂无特效素材。</div>
+                    <div v-else class="pool-list">
+                      <label v-for="item in effectItems" :key="'in-' + item.id" class="pool-row">
+                        <input
+                          type="checkbox"
+                          :checked="selectedIntroEffectIds.includes(item.id)"
+                          :disabled="!selectedIntroEffectIds.includes(item.id) && selectedIntroEffectIds.length >= MAX_AUTOMATION_ITEMS"
+                          @change="toggleIntroEffect(item.id, $event.target.checked)"
+                        />
+                        <span>{{ shortPath(item.path) }}</span>
+                      </label>
+                    </div>
+                  </div>
+                  <div class="effect-zone outro">
+                    <div class="effect-zone-head"><span>片尾特效</span><button @click="selectedOutroEffectIds = []">清空</button></div>
+                    <div v-if="effectItems.length === 0" class="empty compact-empty">暂无特效素材。</div>
+                    <div v-else class="pool-list">
+                      <label v-for="item in effectItems" :key="'out-' + item.id" class="pool-row">
+                        <input
+                          type="checkbox"
+                          :checked="selectedOutroEffectIds.includes(item.id)"
+                          :disabled="!selectedOutroEffectIds.includes(item.id) && selectedOutroEffectIds.length >= MAX_AUTOMATION_ITEMS"
+                          @change="toggleOutroEffect(item.id, $event.target.checked)"
+                        />
+                        <span>{{ shortPath(item.path) }}</span>
+                      </label>
+                    </div>
+                  </div>
+                </div>
+                <div class="effect-controls">
+                  <div class="effect-scope"><span>应用范围</span>
+                    <div class="segmented effect-scope-seg">
+                      <button type="button" :class="{ active: effectScope === 'auto' }" @click="effectScope = 'auto'">由系统挑选</button>
+                      <button type="button" :class="{ active: effectScope === 'all' }" @click="effectScope = 'all'">应用到全部</button>
+                    </div>
+                  </div>
+                  <label class="effect-cover"><input v-model="effectCoverAudio" type="checkbox" /><span>旁白/音乐盖住特效</span></label>
+                </div>
+              </div>
             </div>
             <div class="editing-mode-switch" role="tablist" aria-label="剪辑方式">
               <button
@@ -784,9 +828,14 @@
               <textarea v-model="voiceoverText" class="field text voice-text" placeholder="脚本文本或大模型提示词"></textarea>
               <div class="voice-options">
                 <label class="check-row"><input v-model="voiceoverUseLlm" type="checkbox" /> 大模型辅助</label>
+                <label class="check-row"><span>预计时长（秒）</span>
+                  <input v-model.number="voiceoverSeconds" class="field compact-field" type="number" min="1" max="600" step="1" placeholder="可留空" :disabled="!voiceoverUseLlm" />
+                </label>
               </div>
+              <p v-if="voiceoverSeconds > 0 && !voiceoverUseLlm" class="form-hint">预计时长需配合「大模型辅助」使用。</p>
               <div class="voice-actions">
                 <button class="primary" :disabled="!canGenerateVoiceover || isGeneratingVoiceover" @click="generateVoiceover">{{ isGeneratingVoiceover ? '生成中...' : '生成旁白' }}</button>
+                <span class="quota-hint">{{ ttsQuotaText }}</span>
               </div>
               <p v-if="voiceoverStatus" class="inline-status" :class="voiceoverStatusKind">{{ voiceoverStatus }}</p>
             </div>
@@ -1120,6 +1169,10 @@
                 <input v-model.number="settingsForm.tts.speed_ratio" class="field" type="number" min="0.2" max="3" step="0.05" />
               </label>
             </div>
+            <label class="field-row"><span>每日旁白上限（次）</span>
+              <input v-model.number="settingsForm.tts.daily_limit" class="field" type="number" min="1" max="1000" step="1" />
+              <small class="secret-state">每天最多生成的旁白条数（含大模型辅助），达到后需到次日或调高上限</small>
+            </label>
             </div>
             <div class="button-row">
               <button class="primary" :disabled="isSavingSettings" @click="saveSettings">保存设置</button>
@@ -1359,6 +1412,7 @@ const settings = ref(null)
 const ttsAssets = ref([])
 const seedanceAssets = ref([])
 const seedanceQuota = ref(null)
+const ttsQuota = ref(null)
 const vaultView = ref('calendar')
 const todayDate = startOfDay(new Date())
 const calendarStartDate = startOfMonth(todayDate)
@@ -1431,6 +1485,10 @@ const sourceFilter = ref('')
 const vaultFilter = ref('')
 const selectedAutomationMusicIds = ref([])
 const selectedAutomationVoiceoverIds = ref([])
+const selectedIntroEffectIds = ref([])
+const selectedOutroEffectIds = ref([])
+const effectScope = ref('auto')
+const effectCoverAudio = ref(false)
 const isCreatingJob = ref(false)
 const jobStatus = ref('')
 const jobStatusKind = ref('muted')
@@ -1719,7 +1777,7 @@ function capabilityTone(evidence) {
 }
 const settingsForm = ref({
   llm: { enabled: false, provider: 'doubao', api_key: '', model: '', timeout_ms: 20000 },
-  tts: { enabled: false, provider: 'volcengine_sync', app_id: '', access_token: '', voice_type: 'BV001_streaming', cluster: 'volcano_tts', encoding: 'mp3', speed_ratio: 1.0 },
+  tts: { enabled: false, provider: 'volcengine_sync', app_id: '', access_token: '', voice_type: 'BV001_streaming', cluster: 'volcano_tts', encoding: 'mp3', speed_ratio: 1.0, daily_limit: 100 },
   seedance: {
     enabled: false,
     provider: 'volcengine_ark',
@@ -1842,10 +1900,15 @@ const savedOutputCrop = computed(() => ({
 const voiceoverTitle = ref('')
 const voiceoverText = ref('')
 const voiceoverUseLlm = ref(false)
+const voiceoverSeconds = ref(null)
 const canGenerateVoiceover = computed(() => Boolean(voiceoverText.value.trim()))
 const isGeneratingVoiceover = ref(false)
 const voiceoverStatus = ref('')
 const voiceoverStatusKind = ref('muted')
+const ttsQuotaText = computed(() => {
+  if (!ttsQuota.value) return '今日旁白额度：--'
+  return `今日剩余 ${ttsQuota.value.remaining} / ${ttsQuota.value.limit} 次`
+})
 const seedanceTitle = ref('')
 const seedancePrompt = ref('')
 const seedanceSourceMode = ref('image')
@@ -2244,6 +2307,9 @@ async function refreshMedia() {
   const validVoiceoverIds = new Set(voiceoverItems.value.map((item) => item.id))
   selectedAutomationMusicIds.value = selectedAutomationMusicIds.value.filter((id) => validMusicIds.has(id))
   selectedAutomationVoiceoverIds.value = selectedAutomationVoiceoverIds.value.filter((id) => validVoiceoverIds.has(id))
+  const validEffectIds = new Set(effectItems.value.map((item) => item.id))
+  selectedIntroEffectIds.value = selectedIntroEffectIds.value.filter((id) => validEffectIds.has(id))
+  selectedOutroEffectIds.value = selectedOutroEffectIds.value.filter((id) => validEffectIds.has(id))
   if (selectedSeedanceImageId.value && !imageItems.value.some((item) => item.id === selectedSeedanceImageId.value)) selectedSeedanceImageId.value = ''
   if (selectedSeedanceVideoId.value && !sourceVideoItems.value.some((item) => item.id === selectedSeedanceVideoId.value)) selectedSeedanceVideoId.value = ''
 }
@@ -2305,7 +2371,8 @@ async function refreshSettings() {
       voice_type: settings.value.tts.voice_type || 'BV001_streaming',
       cluster: settings.value.tts.cluster || 'volcano_tts',
       encoding: settings.value.tts.encoding || 'mp3',
-      speed_ratio: settings.value.tts.speed_ratio || 1.0
+      speed_ratio: settings.value.tts.speed_ratio || 1.0,
+      daily_limit: settings.value.tts.daily_limit || 100
     },
     seedance: {
       enabled: settings.value.seedance?.enabled || false,
@@ -2346,7 +2413,11 @@ async function refreshSettings() {
     loadFramingSelectionFromSettings()
   }
 }
-async function refreshTtsAssets() { ttsAssets.value = await api('/tts/assets') }
+async function refreshTtsAssets() {
+  const [assets, quota] = await Promise.all([api('/tts/assets'), api('/tts/quota')])
+  ttsAssets.value = assets
+  ttsQuota.value = quota
+}
 async function refreshSeedanceAssets() {
   const [assets, quota] = await Promise.all([
     api('/seedance/assets'),
@@ -2914,6 +2985,10 @@ async function createAutomationJobs(forceWithoutPreference = false) {
         media_ids: videoIds,
         music_media_ids: selectedAutomationMusicIds.value.slice(0, MAX_AUTOMATION_ITEMS),
         voiceover_media_ids: selectedAutomationVoiceoverIds.value.slice(0, MAX_AUTOMATION_ITEMS),
+        intro_effect_media_ids: selectedIntroEffectIds.value.slice(0, MAX_AUTOMATION_ITEMS),
+        outro_effect_media_ids: selectedOutroEffectIds.value.slice(0, MAX_AUTOMATION_ITEMS),
+        effect_scope: effectScope.value,
+        effect_cover_audio: effectCoverAudio.value,
         output_count: normalizedAutomationOutputCount.value,
         target_duration_seconds: targetDurationSeconds.value,
         mute_original_audio: muteOriginalAudio.value,
@@ -2966,6 +3041,12 @@ function toggleAutomationMusic(id, checked) {
 
 function toggleAutomationVoiceover(id, checked) {
   toggleLimitedSelection(selectedAutomationVoiceoverIds, id, checked, MAX_AUTOMATION_ITEMS)
+}
+function toggleIntroEffect(id, checked) {
+  toggleLimitedSelection(selectedIntroEffectIds, id, checked, MAX_AUTOMATION_ITEMS)
+}
+function toggleOutroEffect(id, checked) {
+  toggleLimitedSelection(selectedOutroEffectIds, id, checked, MAX_AUTOMATION_ITEMS)
 }
 
 function toggleLimitedSelection(targetRef, id, checked, limit) {
@@ -4070,7 +4151,9 @@ async function generateVoiceover() {
       body: JSON.stringify({
         title: voiceoverTitle.value,
         text: voiceoverText.value,
-        use_llm: voiceoverUseLlm.value
+        use_llm: voiceoverUseLlm.value,
+        // Length targeting only applies through the LLM, so send it only then.
+        target_seconds: voiceoverUseLlm.value && voiceoverSeconds.value > 0 ? voiceoverSeconds.value : null
       })
     })
     await Promise.all([refreshMedia(), refreshVault(), refreshTtsAssets()])

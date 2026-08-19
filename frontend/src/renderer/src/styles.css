@@ -136,7 +136,7 @@ p { margin: 6px 0 0; color: var(--text-muted); }
 .role-pill.music { color: #f5b84b; border-color: #7a5b21; background: #261d0b; }
 .role-pill.tts_voice { color: #fb923c; border-color: #9a3412; background: #32150a; }
 .role-pill.image { color: #86efac; border-color: #166534; background: #052e1b; }
-.role-pill.seedance_effect { color: #c4b5fd; border-color: #5b4b91; background: #1a1433; }
+.role-pill.seedance_effect { color: #b8bdc9; border-color: #4b515e; background: #1b1e26; }
 .role-pill.export { color: #93c5fd; border-color: #315f91; background: #0b1d33; }
 .role-pill.preview { color: #c4b5fd; border-color: #5b4b91; background: #1a1433; }
 .role-pill.cache { color: #fca5a5; border-color: #7f2b35; background: #2b1015; }
@@ -172,6 +172,32 @@ p { margin: 6px 0 0; color: var(--text-muted); }
 .pool-list { display: flex; flex-direction: column; max-height: 170px; overflow: auto; }
 .pool-row { display: grid; grid-template-columns: 22px minmax(0, 1fr); gap: 8px; align-items: center; padding: 8px 12px; border-top: 1px solid var(--border); color: var(--text-soft); }
 .pool-row span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* 特效池 — one card, two purple zones (片头 / 片尾) plus a controls footer. */
+.effect-pool { border: 1px solid var(--border-strong); border-radius: 10px; overflow: hidden; background: linear-gradient(160deg, rgba(247, 243, 255, .66), rgba(236, 233, 255, .5)); box-shadow: 0 12px 32px rgba(82, 70, 170, .1); }
+.effect-pool-head { padding: 10px 14px; font-size: 12px; font-weight: 800; letter-spacing: .08em; text-transform: uppercase; color: var(--purple-strong); background: rgba(224, 214, 255, .52); border-bottom: 1px solid var(--border); }
+.effect-zones { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 10px; padding: 12px; }
+.effect-zone { border: 1px solid var(--border); border-radius: 8px; overflow: hidden; min-width: 0; display: flex; flex-direction: column; background: rgba(250, 248, 255, .9); }
+.effect-zone.intro { box-shadow: inset 3px 0 0 var(--lilac); }
+.effect-zone.outro { box-shadow: inset 3px 0 0 var(--periwinkle); }
+/* Colour lives in the header; the list body stays near-white like the other pools. */
+.effect-zone-head { display: flex; align-items: center; gap: 8px; padding: 9px 11px; font-size: 12px; font-weight: 800; }
+.effect-zone.intro .effect-zone-head { background: rgba(181, 139, 255, .34); color: #4b2f9c; }
+.effect-zone.outro .effect-zone-head { background: rgba(102, 130, 255, .30); color: #2e3f9e; }
+.effect-zone-head span { margin-right: auto; }
+.effect-zone-head button { padding: 4px 9px; font-size: 12px; background: rgba(255, 255, 255, .7); }
+/* Scroll both ways: down for many effects, right for long names (no ellipsis). */
+.effect-zone .pool-list { max-height: 150px; overflow: auto; align-items: flex-start; }
+.effect-zone .pool-row { grid-template-columns: 22px auto; min-width: 100%; border-top: 1px solid rgba(120, 92, 255, .12); padding: 7px 11px; }
+.effect-zone .pool-row span { overflow: visible; text-overflow: clip; }
+.effect-zone .empty { padding: 12px; }
+.effect-controls { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 16px; padding: 12px 14px; border-top: 1px solid var(--border); background: rgba(255, 255, 255, .38); }
+.effect-scope { flex: 1 1 280px; display: grid; grid-template-columns: 64px minmax(0, 1fr); gap: 10px; align-items: center; }
+.effect-scope > span { color: var(--text-muted); font-size: 12px; font-weight: 800; }
+.effect-scope-seg { margin-bottom: 0; gap: 6px; }
+.effect-scope-seg button { flex: 1; padding: 8px 10px; font-size: 12px; font-weight: 700; }
+.effect-cover { flex: 0 0 auto; display: inline-flex; align-items: center; gap: 8px; color: var(--text-soft); font-size: 13px; white-space: nowrap; cursor: pointer; }
+.effect-cover input { accent-color: var(--purple); }
 
 .duration-control { display: grid; grid-template-columns: 84px minmax(0, 1fr); gap: 10px; align-items: center; }
 .duration-control > span { color: var(--text-muted); font-size: 12px; font-weight: 800; }
@@ -322,7 +348,7 @@ p { margin: 6px 0 0; color: var(--text-muted); }
 .role-pill.music { color: var(--amber); border-color: rgba(168, 103, 18, .22); background: rgba(255, 244, 221, .54); }
 .role-pill.tts_voice { color: #c2410c; border-color: rgba(234, 88, 12, .3); background: rgba(255, 228, 213, .68); }
 .role-pill.image { color: #166534; border-color: rgba(22, 101, 52, .3); background: rgba(220, 252, 231, .72); }
-.role-pill.seedance_effect { color: #5234bd; border-color: rgba(82, 52, 189, .24); background: rgba(235, 230, 255, .66); }
+.role-pill.seedance_effect { color: #5b6070; border-color: rgba(100, 106, 122, .28); background: rgba(236, 237, 241, .74); }
 .role-pill.export { color: #6b56b5; border-color: rgba(107, 86, 181, .22); background: rgba(241, 236, 255, .58); }
 .role-pill.preview { color: #7a5ccc; border-color: rgba(122, 92, 204, .22); background: rgba(242, 236, 255, .54); }
 .role-pill.cache { color: var(--rose); border-color: rgba(196, 73, 109, .24); background: rgba(255, 235, 241, .54); }
