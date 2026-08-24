@@ -1,0 +1,265 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>机器人控制测试台</title>
+<style>
+:root{
+  --bg:#f8f7ff; --bg-deep:#eef0ff; --surface:rgba(255,255,255,.66);
+  --border:rgba(89,94,214,.18); --border-strong:rgba(91,78,223,.34);
+  --text:#211a43; --text-soft:#514977; --text-muted:#756b9d;
+  --purple:#785cff; --purple-strong:#5539d9; --periwinkle:#6682ff; --lilac:#b58bff;
+  --lavender:#f7f3ff; --teal:#2f9e7d; --rose:#c44973; --amber:#9a690e;
+}
+*{ box-sizing:border-box; }
+body{ margin:0; background:linear-gradient(180deg,var(--bg),var(--bg-deep)); color:var(--text);
+  font-family:-apple-system,system-ui,"PingFang SC","Microsoft YaHei",sans-serif; padding:20px; line-height:1.5; }
+h1{ font-size:20px; margin:0; color:var(--purple-strong); }
+.sub{ color:var(--text-muted); font-size:13px; margin:2px 0 16px; }
+.layout{ display:grid; grid-template-columns:minmax(0,1fr) minmax(0,1fr); gap:14px; align-items:start; }
+@media(max-width:860px){ .layout{ grid-template-columns:1fr; } }
+.panel{ background:linear-gradient(145deg,rgba(255,255,255,.7),rgba(244,242,255,.55)); border:1px solid var(--border);
+  border-radius:10px; padding:14px; backdrop-filter:blur(10px); box-shadow:0 12px 30px rgba(82,70,170,.08); margin-bottom:14px; }
+.panel h2{ font-size:12px; letter-spacing:.08em; text-transform:uppercase; color:var(--text-muted); margin:0 0 12px; font-weight:800; }
+label{ font-size:12px; color:var(--text-muted); font-weight:700; }
+input,select,textarea,button{ font-family:inherit; font-size:14px; }
+input,select,textarea{ width:100%; border:1px solid var(--border); background:rgba(255,255,255,.7); color:var(--text);
+  border-radius:7px; padding:9px 10px; }
+input:focus,select:focus,textarea:focus{ outline:none; border-color:var(--border-strong); }
+button{ border:1px solid var(--border); background:rgba(255,255,255,.6); color:var(--text); border-radius:7px;
+  padding:9px 14px; cursor:pointer; font-weight:700; }
+button:hover{ border-color:var(--border-strong); background:rgba(245,242,255,.9); }
+button.primary{ background:linear-gradient(135deg,var(--periwinkle),var(--purple) 54%,var(--lilac)); border-color:var(--border-strong);
+  color:#fffaff; }
+button:disabled{ opacity:.5; cursor:not-allowed; }
+.row{ display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+.field{ display:flex; flex-direction:column; gap:4px; }
+.triple{ display:grid; grid-template-columns:56px 1fr 1fr 1fr; gap:8px; align-items:center; margin-bottom:8px; }
+.triple > span{ color:var(--text-soft); font-weight:800; font-size:13px; }
+.axis-head{ display:grid; grid-template-columns:56px 1fr 1fr 1fr; gap:8px; margin-bottom:4px; }
+.axis-head span{ font-size:11px; color:var(--text-muted); text-align:center; }
+.axis-head span:first-child{ text-align:left; }
+.hint{ font-size:11px; color:var(--text-muted); margin:4px 0 0; }
+.dot{ width:9px; height:9px; border-radius:50%; background:#c3c3d6; display:inline-block; }
+.dot.on{ background:var(--teal); box-shadow:0 0 8px rgba(47,158,125,.6); }
+.dot.err{ background:var(--rose); }
+.dot.wait{ background:var(--amber); }
+.status-strip{ display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:8px; }
+.status-strip div{ border:1px solid var(--border); border-radius:8px; background:rgba(255,255,255,.5); padding:8px 10px; }
+.status-strip span{ display:block; font-size:11px; color:var(--text-muted); }
+.status-strip strong{ font-size:15px; font-variant-numeric:tabular-nums; }
+pre.preview{ background:rgba(30,22,60,.05); border:1px solid var(--border); border-radius:7px; padding:8px 10px; margin:8px 0 0;
+  font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:12px; white-space:pre-wrap; word-break:break-all; color:var(--text-soft); }
+.log{ height:420px; overflow:auto; background:rgba(30,22,60,.04); border:1px solid var(--border); border-radius:8px; padding:8px;
+  font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:12px; }
+.log .line{ padding:4px 6px; border-bottom:1px solid rgba(89,94,214,.08); white-space:pre-wrap; word-break:break-all; }
+.log .t{ color:var(--text-muted); }
+.log .send{ color:var(--purple-strong); }
+.log .recv{ color:var(--teal); }
+.log .sys{ color:var(--amber); }
+.log .err{ color:var(--rose); }
+.tag{ font-weight:800; margin-right:6px; }
+.spacer{ flex:1; }
+.mb8{ margin-bottom:8px; }
+</style>
+</head>
+<body>
+  <h1>机器人控制测试台</h1>
+
+  <!-- 连接 -->
+  <div class="panel">
+    <h2>连接</h2>
+    <div class="row">
+      <span class="dot" id="dot"></span>
+      <strong id="connText" style="min-width:78px">未连接</strong>
+      <input id="url" placeholder="ws://机器人IP:端口/…" style="flex:1; min-width:220px">
+      <button class="primary" id="btnConn">连接</button>
+      <button id="btnDisc" disabled>断开</button>
+    </div>
+    <p class="hint" id="connErr"></p>
+  </div>
+
+  <div class="layout">
+    <!-- 左列：指令 -->
+    <div>
+      <!-- 云台控制 -->
+      <div class="panel">
+        <h2>云台控制 · gimbal_control</h2>
+        <div class="field mb8" style="max-width:180px">
+          <label>mode（模式）</label>
+          <input id="g_mode" type="number" step="1" value="0">
+        </div>
+        <p class="hint">start=起始角，end=目标角，speed=每秒多少度。文档未定义 mode 各值含义——可试 0/1/2 观察是否会“锁定/随动”。</p>
+
+        <div class="axis-head"><span></span><span>start</span><span>speed</span><span>end</span></div>
+        <div class="triple"><span>偏航</span>
+          <input id="g_yaw_start" type="number" step="0.1" value="0">
+          <input id="g_yaw_speed" type="number" step="0.1" value="5">
+          <input id="g_yaw_end" type="number" step="0.1" value="0"></div>
+        <div class="triple"><span>俯仰</span>
+          <input id="g_pitch_start" type="number" step="0.1" value="0">
+          <input id="g_pitch_speed" type="number" step="0.1" value="0">
+          <input id="g_pitch_end" type="number" step="0.1" value="0"></div>
+        <div class="triple"><span>变焦</span>
+          <input id="g_zoom_start" type="number" step="0.1" value="1">
+          <input id="g_zoom_speed" type="number" step="0.1" value="0">
+          <input id="g_zoom_end" type="number" step="0.1" value="1"></div>
+
+        <div class="row mb8">
+          <button id="p_center">归中 (0°)</button>
+          <button id="p_goto">去到 end（从当前角）</button>
+          <button id="p_sweep">扫视 ±45°</button>
+        </div>
+        <pre class="preview" id="g_preview"></pre>
+        <div class="row" style="margin-top:10px">
+          <button class="primary" id="g_send">发送云台指令</button>
+        </div>
+      </div>
+
+    </div>
+
+    <!-- 右列：状态 + 日志 -->
+    <div>
+      <div class="panel">
+        <h2>当前状态（来自心跳）</h2>
+        <div class="status-strip">
+          <div><span>偏航</span><strong id="st_yaw">–</strong></div>
+          <div><span>俯仰</span><strong id="st_pitch">–</strong></div>
+          <div><span>电量</span><strong id="st_batt">–</strong></div>
+          <div><span>录制</span><strong id="st_rec">–</strong></div>
+        </div>
+        <p class="hint" id="st_extra"></p>
+      </div>
+
+      <div class="panel">
+        <h2>实时日志 <span class="hint" style="text-transform:none">（<span class="send">→ 发送</span> / <span class="recv">← 接收</span>）</span></h2>
+        <div class="row mb8">
+          <label class="row" style="gap:6px"><input type="checkbox" id="hbFilter" style="width:auto"> 隐藏纯心跳</label>
+          <span class="spacer"></span>
+          <button id="log_pause">暂停</button>
+          <button id="log_clear">清空</button>
+        </div>
+        <div class="log" id="log"></div>
+      </div>
+    </div>
+  </div>
+
+<script>
+(function(){
+  "use strict";
+  var ws = null, paused = false, lastYaw = null, lastPitch = null;
+  var $ = function(id){ return document.getElementById(id); };
+
+  // ---- connection ----
+  var savedUrl = localStorage.getItem("robot_ws_url");
+  if (savedUrl) $("url").value = savedUrl;
+
+  function setDot(cls, text){ $("dot").className = "dot" + (cls ? " " + cls : ""); $("connText").textContent = text; }
+
+  function connect(){
+    var url = $("url").value.trim();
+    $("connErr").textContent = "";
+    if(!url){ $("connErr").textContent = "请先填写机器人 ws:// 地址。"; return; }
+    localStorage.setItem("robot_ws_url", url);
+    try { ws = new WebSocket(url); }
+    catch(e){ $("connErr").textContent = "地址无效：" + e.message; return; }
+    setDot("wait", "连接中…"); $("btnConn").disabled = true;
+    ws.onopen = function(){ setDot("on", "已连接"); $("btnDisc").disabled = false; logLine("sys", "sys", "WebSocket 已连接 " + url); };
+    ws.onmessage = function(ev){ onMessage(ev.data); };
+    ws.onerror = function(){ $("connErr").textContent = "连接出错（检查地址、机器人是否在线、是否同一网络）。"; };
+    ws.onclose = function(ev){
+      setDot(ev.wasClean ? "" : "err", "未连接"); $("btnConn").disabled = false; $("btnDisc").disabled = true; ws = null;
+      logLine("sys", "err", "连接已关闭 (code " + ev.code + ")");
+    };
+  }
+  function disconnect(){ if(ws){ ws.close(); } }
+
+  function sendObj(obj){
+    if(!ws || ws.readyState !== 1){ $("connErr").textContent = "尚未连接，无法发送。"; logLine("sys","err","未连接，发送被忽略"); return; }
+    var text = JSON.stringify(obj);
+    ws.send(text);
+    logLine("→", "send", pretty(obj));
+  }
+
+  // ---- gimbal ----
+  function num(id){ var v = parseFloat($(id).value); return isFinite(v) ? v : 0; }
+  function buildGimbal(){
+    return { gimbal_control: {
+      mode: Math.round(num("g_mode")),
+      yaw_start: num("g_yaw_start"), yaw_speed: num("g_yaw_speed"), yaw_end: num("g_yaw_end"),
+      pitch_start: num("g_pitch_start"), pitch_speed: num("g_pitch_speed"), pitch_end: num("g_pitch_end"),
+      zoom_start: num("g_zoom_start"), zoom_speed: num("g_zoom_speed"), zoom_end: num("g_zoom_end")
+    }};
+  }
+  function refreshGimbalPreview(){ $("g_preview").textContent = pretty(buildGimbal()); }
+
+  // presets mirror robot.py: set_camera_angle (start=current yaw, speed 5) / sweep_camera
+  function presetCenter(){ $("g_yaw_start").value = (lastYaw==null?0:lastYaw); $("g_yaw_speed").value = 5; $("g_yaw_end").value = 0; refreshGimbalPreview(); }
+  function presetGoto(){ $("g_yaw_start").value = (lastYaw==null?0:lastYaw); if(!parseFloat($("g_yaw_speed").value)) $("g_yaw_speed").value = 5; refreshGimbalPreview(); }
+  function presetSweep(){ $("g_yaw_start").value = -45; $("g_yaw_speed").value = 5; $("g_yaw_end").value = 45; refreshGimbalPreview(); }
+
+  // ---- incoming (parsing aligned with robot.py _apply_protocol_state) ----
+  function onMessage(raw){
+    var text = (typeof raw === "string") ? raw : "[binary]";
+    var obj = null; try { obj = JSON.parse(text); } catch(e){}
+    var isHeartbeat = obj && (obj.gimbal || obj.system || obj.map || obj.navigation || obj.naviagtion || obj.task);
+    if(!(paused || ($("hbFilter").checked && isHeartbeat && !hasReply(obj)))){
+      logLine("←", "recv", obj ? pretty(obj) : text);
+    }
+    if(!obj) return;
+    var g = obj.gimbal;
+    if(g && typeof g === "object"){
+      if("yaw" in g){ lastYaw = toNum(g.yaw); $("st_yaw").textContent = fmt(lastYaw) + "°"; }
+      if("pitch" in g){ lastPitch = toNum(g.pitch); $("st_pitch").textContent = fmt(lastPitch) + "°"; }
+      if("record_status" in g){ $("st_rec").textContent = (g.record_status === "recording") ? "录制中" : "未录制"; }
+    }
+    var sys = obj.system;
+    if(sys && typeof sys === "object"){
+      if("battery" in sys){ $("st_batt").textContent = sys.battery + "%"; }
+      if("status" in sys){ $("st_extra").textContent = "system.status: " + sys.status; }
+    }
+    var nav = obj.navigation || obj.naviagtion; // firmware typo, handled like the app
+    var task = obj.task;
+    var bits = [];
+    if(nav && nav.goal_status) bits.push("nav:" + nav.goal_status);
+    if(task && task.goal_status) bits.push("task:" + task.goal_status);
+    if(bits.length) $("st_extra").textContent = ($("st_extra").textContent || "") + "  " + bits.join("  ");
+  }
+  function hasReply(obj){ for(var k in obj){ if(k.indexOf("robot_")===0) return true; } return false; }
+
+  // ---- log ----
+  function logLine(tag, cls, body){
+    if(paused && cls !== "sys" && cls !== "err") return;
+    var el = document.createElement("div");
+    el.className = "line";
+    var t = new Date().toLocaleTimeString();
+    el.innerHTML = '<span class="t">'+t+'</span> <span class="tag '+cls+'">'+esc(tag)+'</span>';
+    var pre = document.createElement("span"); pre.className = cls; pre.textContent = body; el.appendChild(pre);
+    var log = $("log"); log.appendChild(el);
+    while(log.childNodes.length > 400) log.removeChild(log.firstChild);
+    log.scrollTop = log.scrollHeight;
+  }
+
+  // ---- helpers ----
+  function pretty(o){ try { return JSON.stringify(o, null, 2); } catch(e){ return String(o); } }
+  function esc(s){ return String(s).replace(/[&<>]/g, function(c){ return {'&':'&amp;','<':'&lt;','>':'&gt;'}[c]; }); }
+  function toNum(v){ var n = parseFloat(v); return isFinite(n) ? n : null; }
+  function fmt(n){ return (n==null) ? "–" : (Math.round(n*10)/10); }
+
+  // ---- wiring ----
+  $("btnConn").onclick = connect;
+  $("btnDisc").onclick = disconnect;
+  $("g_send").onclick = function(){ sendObj(buildGimbal()); };
+  $("p_center").onclick = presetCenter;
+  $("p_goto").onclick = presetGoto;
+  $("p_sweep").onclick = presetSweep;
+  $("log_clear").onclick = function(){ $("log").innerHTML = ""; };
+  $("log_pause").onclick = function(){ paused = !paused; $("log_pause").textContent = paused ? "继续" : "暂停"; };
+  ["g_mode","g_yaw_start","g_yaw_speed","g_yaw_end","g_pitch_start","g_pitch_speed","g_pitch_end","g_zoom_start","g_zoom_speed","g_zoom_end"]
+    .forEach(function(id){ $(id).addEventListener("input", refreshGimbalPreview); });
+  refreshGimbalPreview();
+})();
+</script>
+</body>
+</html>

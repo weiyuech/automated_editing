@@ -10,6 +10,7 @@ from automated_video_editing_backend.core.diagnostics import log_event
 from automated_video_editing_backend.core.events import EventHub
 from automated_video_editing_backend.core.models import (
     CameraAngle,
+    GimbalMoveRequest,
     MoveCommand,
     RobotGoalCommand,
     RobotMode,
@@ -64,6 +65,9 @@ class RobotAdapter(ABC):
 
     @abstractmethod
     async def set_camera_angle(self, angle: CameraAngle) -> RobotState: ...
+
+    @abstractmethod
+    async def set_gimbal(self, command: GimbalMoveRequest) -> RobotState: ...
 
     @abstractmethod
     async def start_recording(self) -> RobotState: ...
@@ -219,15 +223,16 @@ class HardwareRobotAdapter(RobotAdapter):
         heartbeat_yaw() to tell when the move actually finished.
         """
         start = self._heartbeat_yaw if self._heartbeat_yaw is not None else (self.state.yaw or 0.0)
+        pitch = self.state.pitch or 0
         payload = {
             "gimbal_control": {
-                "mode": 0,
-                "yaw_start": start,
-                "yaw_speed": yaw_speed,
-                "yaw_end": target_yaw,
-                "pitch_start": self.state.pitch or 0,
+                "mode": 1,
+                "yaw_start": _gimbal_num(start),
+                "yaw_speed": _gimbal_num(yaw_speed),
+                "yaw_end": _gimbal_num(target_yaw),
+                "pitch_start": _gimbal_num(pitch),
                 "pitch_speed": 0,
-                "pitch_end": self.state.pitch or 0,
+                "pitch_end": _gimbal_num(pitch),
                 "zoom_start": 1,
                 "zoom_speed": 0,
                 "zoom_end": 1,
@@ -286,13 +291,13 @@ class HardwareRobotAdapter(RobotAdapter):
         pitch = self.state.pitch if self.state.pitch is not None else 0
         payload = {
             "gimbal_control": {
-                "mode": 0,
-                "yaw_start": yaw_start,
+                "mode": 1,
+                "yaw_start": _gimbal_num(yaw_start),
                 "yaw_speed": 5,
-                "yaw_end": angle.angle,
-                "pitch_start": pitch,
+                "yaw_end": _gimbal_num(angle.angle),
+                "pitch_start": _gimbal_num(pitch),
                 "pitch_speed": 0,
-                "pitch_end": pitch,
+                "pitch_end": _gimbal_num(pitch),
                 "zoom_start": 1,
                 "zoom_speed": 0,
                 "zoom_end": 1,
@@ -301,6 +306,30 @@ class HardwareRobotAdapter(RobotAdapter):
         await self._send(payload)
         self.state.camera_angle = angle.angle
         self.state.yaw = angle.angle
+        self.state.last_command = "gimbal_control"
+        self._touch()
+        await self._publish_state()
+        return self.state
+
+    async def set_gimbal(self, command: GimbalMoveRequest) -> RobotState:
+        payload = {
+            "gimbal_control": {
+                "mode": 1,
+                "yaw_start": _gimbal_num(command.yaw_start),
+                "yaw_speed": _gimbal_num(command.yaw_speed),
+                "yaw_end": _gimbal_num(command.yaw_end),
+                "pitch_start": _gimbal_num(command.pitch_start),
+                "pitch_speed": _gimbal_num(command.pitch_speed),
+                "pitch_end": _gimbal_num(command.pitch_end),
+                "zoom_start": _gimbal_num(command.zoom_start),
+                "zoom_speed": 0,
+                "zoom_end": _gimbal_num(command.zoom_end),
+            }
+        }
+        await self._send(payload)
+        self.state.camera_angle = command.yaw_end
+        self.state.yaw = command.yaw_end
+        self.state.pitch = command.pitch_end
         self.state.last_command = "gimbal_control"
         self._touch()
         await self._publish_state()
@@ -659,6 +688,15 @@ class RobotService:
         await self.events.publish("ROBOT_STATE", state.model_dump(mode="json"))
         return state
 
+    async def set_gimbal(self, command: GimbalMoveRequest) -> RobotState:
+        state = await self.adapter.set_gimbal(command)
+        log_event(
+            "info", "gimbal.moved",
+            yaw_end=command.yaw_end, pitch_end=command.pitch_end, zoom_end=command.zoom_end,
+        )
+        await self.events.publish("ROBOT_STATE", state.model_dump(mode="json"))
+        return state
+
     async def _clear_media_state(self) -> None:
         state = await self.adapter.status()
         state.media_url = None
@@ -848,6 +886,18 @@ def _maybe_float(value: Any) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _gimbal_num(value: Any) -> int | float:
+    """Serialise a gimbal number the way the working browser console (任意门) does: a whole
+    number as an int (``30``, not ``30.0``) and only a real fraction as a float (``3.5``).
+
+    The robot firmware treats yaw/pitch/speed as integers and silently ignores a whole value
+    written as a float — which is why the app's gimbal commands did nothing while the browser
+    tool, whose JSON.stringify emits ``30``, worked. Aligning the wire format is the fix.
+    """
+    number = float(value)
+    return int(number) if number.is_integer() else number
 
 
 def _maybe_str(value: Any) -> str | None:

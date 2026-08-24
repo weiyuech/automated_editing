@@ -10,6 +10,7 @@ from pydantic import BaseModel, Field
 
 from automated_video_editing_backend.core.models import (
     CameraAngle,
+    GimbalMoveRequest,
     CruiseRequest,
     CruiseRouteSaveRequest,
     EditBatchRequest,
@@ -216,6 +217,13 @@ def build_router(
     async def robot_camera_angle(angle: CameraAngle, _: Secured = None):
         try:
             return await robot.set_camera_angle(angle)
+        except ConnectionError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+    @router.post("/robot/gimbal")
+    async def robot_gimbal(command: GimbalMoveRequest, _: Secured = None):
+        try:
+            return await robot.set_gimbal(command)
         except ConnectionError as exc:
             raise HTTPException(status_code=503, detail=str(exc)) from exc
 

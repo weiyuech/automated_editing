@@ -64,6 +64,24 @@ class CameraAngle(BaseModel):
     angle: float = Field(ge=-90, le=90)
 
 
+class GimbalMoveRequest(BaseModel):
+    """Full 镜头控制 move: yaw/pitch pan from start to end at a speed; zoom from start to end.
+
+    start and end are independent points, each inside the axis' UI range (any direction — 80→-30
+    is fine); the UI ranges sit inside the hardware limits (yaw ±135, pitch -90..25) so an
+    overshoot at the end cannot cross them. Zoom has no speed. The service fixes mode to 1.
+    Direction convention: negative yaw = right, negative pitch = up.
+    """
+    yaw_start: float = Field(ge=-90, le=90)
+    yaw_end: float = Field(ge=-90, le=90)
+    yaw_speed: float = Field(default=5, ge=2, le=5)
+    pitch_start: float = Field(default=0, ge=-60, le=15)
+    pitch_end: float = Field(default=0, ge=-60, le=15)
+    pitch_speed: float = Field(default=5, ge=2, le=5)
+    zoom_start: float = Field(default=1, ge=1, le=3.5)
+    zoom_end: float = Field(default=1, ge=1, le=3.5)
+
+
 class RobotGoalCommand(BaseModel):
     path_name: str = Field(min_length=1, max_length=200)
     goal_id: int = Field(ge=0)
@@ -133,6 +151,10 @@ class CruiseRequest(BaseModel):
     dwell_max_seconds: float = Field(default=10.0, ge=0.0, le=120.0)
     arrival_timeout_seconds: float = Field(default=180.0, ge=5.0, le=1800.0)
     gimbal_scan: GimbalScanConfig = Field(default_factory=GimbalScanConfig)
+    # Off by default (the existing cruise is untouched). On: the backend drives a slow, organic
+    # gimbal move throughout transit and dwell so footage is never dead-static — it picks a style
+    # per run (wander/ping-pong/short-holds) and samples zoom occasionally at each stop.
+    auto_camerawork: bool = False
 
     @model_validator(mode="after")
     def validate_dwell_range(self) -> CruiseRequest:

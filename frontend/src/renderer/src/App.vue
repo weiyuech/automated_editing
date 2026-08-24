@@ -162,6 +162,32 @@
             </div>
           </div>
         </Panel>
+
+        <Panel title="镜头控制" class="wide">
+          <div class="form-stack">
+            <p class="form-hint">从起始角扫到目标角。偏航：负=右、正=左；俯仰：负=上、正=下。</p>
+            <div class="gimbal-axis">
+              <span class="axis-name">偏航</span>
+              <label><small>起始 (−90~90)</small><input v-model.number="gimbalForm.yaw_start" class="field" type="number" min="-90" max="90" step="1" /></label>
+              <label><small>目标 (−90~90)</small><input v-model.number="gimbalForm.yaw_end" class="field" type="number" min="-90" max="90" step="1" /></label>
+              <label><small>速度 (2~5)</small><input v-model.number="gimbalForm.yaw_speed" class="field" type="number" min="2" max="5" step="1" /></label>
+            </div>
+            <div class="gimbal-axis">
+              <span class="axis-name">俯仰</span>
+              <label><small>起始 (−60~15)</small><input v-model.number="gimbalForm.pitch_start" class="field" type="number" min="-60" max="15" step="1" /></label>
+              <label><small>目标 (−60~15)</small><input v-model.number="gimbalForm.pitch_end" class="field" type="number" min="-60" max="15" step="1" /></label>
+              <label><small>速度 (2~5)</small><input v-model.number="gimbalForm.pitch_speed" class="field" type="number" min="2" max="5" step="1" /></label>
+            </div>
+            <div class="gimbal-axis">
+              <span class="axis-name">变焦</span>
+              <label><small>起始 (1~3.5)</small><input v-model.number="gimbalForm.zoom_start" class="field" type="number" min="1" max="3.5" step="0.1" /></label>
+              <label><small>目标 (1~3.5)</small><input v-model.number="gimbalForm.zoom_end" class="field" type="number" min="1" max="3.5" step="0.1" /></label>
+            </div>
+            <div class="button-row">
+              <button class="primary" :disabled="isRobotBusy || framingTestBusy" @click="sendGimbal">发送镜头控制</button>
+            </div>
+          </div>
+        </Panel>
       </section>
 
       <section v-else-if="active === 'shoot'" class="grid two">
@@ -250,6 +276,7 @@
             <p class="form-hint">每到达一个点位随机停留 {{ cruiseDwellMin }}–{{ cruiseDwellMax }} 秒，避免刚到就转身、拍不到可用画面。</p>
             <input v-model.number="cruiseArrivalTimeout" class="field" type="number" min="5" max="1800" step="5" placeholder="单点到达超时秒数" />
 
+            <label class="toggle-row"><input v-model="cruiseAutoCamerawork" type="checkbox" />自动运镜（巡游全程缓慢移动云台，避免画面太静；默认关闭）</label>
             <label class="toggle-row"><input v-model="cruiseScanEnabled" type="checkbox" />停留时云台缓慢扫视（可选，默认关闭）</label>
             <template v-if="cruiseScanEnabled">
               <div class="settings-pair">
@@ -1391,6 +1418,7 @@ const cruiseNewGoalObject = ref('')
 const cruiseDwellMin = ref(5)
 const cruiseDwellMax = ref(10)
 const cruiseArrivalTimeout = ref(180)
+const cruiseAutoCamerawork = ref(false)
 const cruiseScanEnabled = ref(false)
 const cruiseScanDirection = ref('right')
 const cruiseScanOffset = ref(15)
@@ -1425,6 +1453,11 @@ const captureNote = ref('')
 const captureStatus = ref('')
 const captureStatusKind = ref('muted')
 const cameraAngle = ref(0)
+const gimbalForm = ref({
+  yaw_start: 0, yaw_end: 0, yaw_speed: 5,
+  pitch_start: 0, pitch_end: 0, pitch_speed: 5,
+  zoom_start: 1, zoom_end: 1
+})
 const framingTest = ref({ running: false, ready: false, preview_id: '' })
 const framingTestBusy = ref(false)
 const framingTestStatus = ref('')
@@ -2677,7 +2710,8 @@ function buildCruiseRequest() {
       direction: cruiseScanDirection.value,
       yaw_offset_deg: Number(cruiseScanOffset.value),
       yaw_speed_deg_s: Number(cruiseScanSpeed.value)
-    }
+    },
+    auto_camerawork: cruiseAutoCamerawork.value
   }
 }
 
@@ -2905,6 +2939,7 @@ async function refreshRobotPaths(showStatus = true, allowBusy = false) {
 
 function pingBackend() { sendWs('PING') }
 function setCameraAngle() { sendWs('ROBOT_CAMERA_ANGLE', { angle: cameraAngle.value }) }
+function sendGimbal() { sendWs('ROBOT_GIMBAL', { ...gimbalForm.value }) }
 function captureStart() {
   captureStatusKind.value = 'muted'
   captureStatus.value = '正在开始录制…'

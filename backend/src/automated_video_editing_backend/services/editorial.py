@@ -103,6 +103,15 @@ def resolve_family_policy(
     request.start_rotation = rng.choice(policy["start_rotation"]) if has_points else 0
 
 
+# A window whose measured visual motion is at or below this is treated as dead/frozen. It sits
+# just above the shot scorer's MOTION_DEAD floor, so slow but real movement is never mistaken
+# for static — the heartbeat telemetry (below) is what rescues the rare slow-pan-over-blank case.
+STATIC_MOTION_DEAD = 0.1
+# The most of a candidate's score staticness may remove. Applied as a multiplier so the weighted
+# taste terms are left exactly as they were; relative selection then favours a live candidate.
+STATIC_PENALTY = 0.5
+
+
 def score_timeline(
     timeline: EditTimeline,
     analyses,
@@ -197,8 +206,17 @@ def score_timeline(
         "temporal_flow": round(temporal_flow, 4),
         "analysis_coverage": round(evidence_coverage, 4),
     }
+    # A frozen shot passes every weighted taste term (a locked-off frame is sharp, well exposed
+    # and maximally "steady"), so staticness is applied as a layered multiplier, not a weight:
+    # lively footage keeps ~1.0 and nothing else in the sum is touched, while a static-heavy
+    # candidate is pulled down so a live one wins the slot. Built from the per-window motion the
+    # analysis already computes; footage with no motion evidence is left unchanged.
+    static_fraction = _timeline_static_fraction(timeline, scenes)
+    liveliness = round(1.0 - STATIC_PENALTY * static_fraction, 6)
+    components["static_fraction"] = round(static_fraction, 4)
+    components["liveliness"] = liveliness
     # Duration is a universal correctness term rather than a preset-specific taste weight.
-    return round(0.9 * score + 0.1 * duration, 6), components
+    return round((0.9 * score + 0.1 * duration) * liveliness, 6), components
 
 
 def _clip_evidence(clip, scenes: list[dict]) -> dict:
@@ -223,6 +241,59 @@ def _clip_evidence(clip, scenes: list[dict]) -> dict:
         scene.get("from_scene_detector") or "boundary_score" in scene
     ) and abs(clip.start - float(scene.get("start", 0.0))) <= 0.08
     return evidence
+
+
+def _clip_static_fraction(clip, scenes: list[dict]) -> float | None:
+    """Share of one clip's span whose measured visual motion is dead.
+
+    Reads the per-window ``quality_profile`` across the clip's whole span (not just its start),
+    so a frozen patch inside an otherwise-live clip is counted rather than hidden behind its
+    liveliest window — which is what ``_clip_evidence``'s ``max()`` does. Falls back to the
+    clip's scene-level motion when no sub-window profile exists, and returns ``None`` when there
+    is no motion evidence at all.
+    """
+    clip_start = clip.start
+    clip_end = clip.start + max(0.0, clip.duration)
+    covered = 0.0
+    dead = 0.0
+    for scene in scenes:
+        for window in scene.get("quality_profile") or []:
+            overlap = max(
+                0.0,
+                min(clip_end, float(window.get("end", 0.0)))
+                - max(clip_start, float(window.get("start", 0.0))),
+            )
+            if overlap <= 0.0:
+                continue
+            covered += overlap
+            if float(window.get("motion", 1.0)) <= STATIC_MOTION_DEAD:
+                dead += overlap
+    if covered > 0.0:
+        return dead / covered
+    evidence = _clip_evidence(clip, scenes)
+    if "motion" in evidence:
+        return 1.0 if float(evidence["motion"]) <= STATIC_MOTION_DEAD else 0.0
+    return None
+
+
+def _timeline_static_fraction(timeline: EditTimeline, scenes: dict) -> float:
+    """Duration-weighted share of the timeline that is visually dead.
+
+    Only clips that carry motion evidence contribute, so imported footage with no analysis
+    neither penalises nor dilutes — those timelines score exactly as before.
+    """
+    total = 0.0
+    dead = 0.0
+    for clip in timeline.clips:
+        duration = max(0.0, clip.duration)
+        if duration <= 0.0:
+            continue
+        fraction = _clip_static_fraction(clip, scenes.get(clip.media_id, []))
+        if fraction is None:
+            continue
+        total += duration
+        dead += duration * fraction
+    return dead / total if total > 0.0 else 0.0
 
 
 def _timeline_integrity(timeline: EditTimeline) -> tuple[float, float, float]:

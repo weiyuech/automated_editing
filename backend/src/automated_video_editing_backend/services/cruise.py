@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import random
 import time
 from contextlib import suppress
+from pathlib import Path
 from typing import Any
 
 from automated_video_editing_backend.core.events import EventHub
@@ -14,12 +16,31 @@ from automated_video_editing_backend.core.models import (
     CruiseRouteValidation,
     CruiseRun,
     CruiseSegment,
+    GimbalMoveRequest,
     GimbalScanConfig,
     RobotGoalCommand,
     utc_now,
 )
 from automated_video_editing_backend.services.capture import CaptureService
 from automated_video_editing_backend.services.robot import RobotService
+
+# Backend-only 自动运镜. The UI is a single on/off toggle; when on, each camerawork run picks a
+# style by these weights (never exposed): a wandering A→B→C path, a two-point ping-pong, or a
+# walk with brief holds. All legs are slow (2–5°/s) and go to fresh targets, so the gimbal never
+# hits its own auto-loop reset. Ranges are the safe UI bands, inside the hardware limits.
+_CAMERAWORK_MODES: tuple[tuple[str, float], ...] = (("wander", 50.0), ("pingpong", 30.0), ("holds", 20.0))
+_CW_SPEED = (2.0, 5.0)
+_CW_YAW = (-90.0, 90.0)
+_CW_PITCH = (-60.0, 15.0)
+_CW_ZOOM = (1.0, 3.5)
+_CW_ZOOM_PROB = 0.4       # chance a dwell leg also samples a new zoom
+_CW_HOLD_PROB = 0.25      # chance a "holds"-mode leg is a brief pause instead of a move
+_CW_HOLD_SECONDS = 1.5
+_CW_LEG_MARGIN = 0.6      # settle headroom added to a leg's travel time
+
+
+def _clamp(value: float, low: float, high: float) -> float:
+    return max(low, min(high, value))
 
 
 class CruiseService:
@@ -38,6 +59,14 @@ class CruiseService:
         self._task: asyncio.Task[None] | None = None
         self._cancel = asyncio.Event()
         self._origin_monotonic = 0.0
+        # Our last commanded pitch/zoom. Zoom has no heartbeat feedback, so we track what we sent
+        # to use as the next leg's start; pitch is tracked for the same reason (start continuity).
+        self._cw_pitch = 0.0
+        self._cw_zoom = 1.0
+        # (video_time, yaw, pitch) samples recorded during an auto-camerawork run, written beside
+        # the video so the grader can tell a slow pan over a plain surface from a true freeze.
+        self._telemetry: list[tuple[float, float, float]] = []
+        self._telemetry_task: asyncio.Task[None] | None = None
 
     def current(self) -> CruiseRun | None:
         return self._run
@@ -203,6 +232,10 @@ class CruiseService:
             # start of the recorded file rather than with wall-clock time.
             self._origin_monotonic = time.monotonic()
 
+            if request.auto_camerawork and request.record:
+                self._telemetry = []
+                self._telemetry_task = asyncio.create_task(self._sample_telemetry())
+
             canceled = False
             for segment in run.segments:
                 if self._cancel.is_set():
@@ -248,7 +281,19 @@ class CruiseService:
             await self._fail_segment(run, segment, "Robot rejected the goal (goal_check false)")
             return
 
-        arrival = await self._await_arrival(request.arrival_timeout_seconds)
+        if request.auto_camerawork:
+            # Oscillate the gimbal while the robot drives to the point, so transit footage moves.
+            camerawork = asyncio.create_task(self._run_camerawork(
+                deadline=time.monotonic() + request.arrival_timeout_seconds, allow_zoom=False,
+            ))
+            try:
+                arrival = await self._await_arrival(request.arrival_timeout_seconds)
+            finally:
+                camerawork.cancel()
+                with suppress(asyncio.CancelledError):
+                    await camerawork
+        else:
+            arrival = await self._await_arrival(request.arrival_timeout_seconds)
         if arrival == "canceled":
             segment.status = "skipped"
             segment.departed_at_seconds = self._elapsed()
@@ -304,7 +349,11 @@ class CruiseService:
             dwell = max(dwell, scan.budget_seconds)
 
         deadline = time.monotonic() + dwell
-        if scan.enabled:
+        if request.auto_camerawork:
+            # Slow drift + occasional zoom for the whole dwell, so a parked shot is never frozen.
+            await self._run_camerawork(deadline=deadline, allow_zoom=True)
+            segment.scanned = True
+        elif scan.enabled:
             segment.scanned = await self._scan(scan)
         remaining = deadline - time.monotonic()
         if remaining > 0:
@@ -347,6 +396,98 @@ class CruiseService:
             await asyncio.sleep(0.2)
         return False
 
+    def _pick_camerawork_mode(self) -> str:
+        roll = random.uniform(0.0, sum(weight for _name, weight in _CAMERAWORK_MODES))
+        cumulative = 0.0
+        for name, weight in _CAMERAWORK_MODES:
+            cumulative += weight
+            if roll <= cumulative:
+                return name
+        return _CAMERAWORK_MODES[0][0]
+
+    def _camerawork_pose(self) -> tuple[float, float]:
+        return (round(random.uniform(*_CW_YAW), 1), round(random.uniform(*_CW_PITCH), 1))
+
+    async def _camerawork_leg(
+        self, target: tuple[float, float], speed: float, zoom: float | None, deadline: float,
+    ) -> None:
+        """One slow move to a fresh (yaw, pitch) target at 2–5°/s, optionally re-zooming.
+
+        A failed gimbal command must never break the cruise, so anything short of a lost
+        connection is swallowed. The wait is time-based (travel ÷ speed): we move to a new target
+        each time, so there is no auto-loop to out-run, and zoom has no arrival feedback anyway.
+        """
+        heartbeat_yaw = self.robot.heartbeat_yaw()
+        start_yaw = _clamp(heartbeat_yaw if heartbeat_yaw is not None else 0.0, *_CW_YAW)
+        start_pitch = _clamp(self._cw_pitch, *_CW_PITCH)
+        target_yaw, target_pitch = target
+        zoom_end = zoom if zoom is not None else self._cw_zoom
+        command = GimbalMoveRequest(
+            yaw_start=start_yaw, yaw_end=target_yaw, yaw_speed=speed,
+            pitch_start=start_pitch, pitch_end=target_pitch, pitch_speed=speed,
+            zoom_start=self._cw_zoom, zoom_end=zoom_end,
+        )
+        try:
+            await self.robot.set_gimbal(command)
+        except ConnectionError:
+            raise
+        except Exception:
+            return
+        self._cw_pitch = target_pitch
+        self._cw_zoom = zoom_end
+        travel = max(abs(target_yaw - start_yaw), abs(target_pitch - start_pitch))
+        budget = (travel / speed + _CW_LEG_MARGIN) if speed > 0 else _CW_LEG_MARGIN
+        await self._sleep_or_cancel(max(0.3, min(budget, deadline - time.monotonic())))
+
+    async def _run_camerawork(self, deadline: float, allow_zoom: bool) -> None:
+        """Slow, organic camerawork until `deadline` or cancel — never the auto-loop reset."""
+        mode = self._pick_camerawork_mode()
+        endpoint_a, endpoint_b = self._camerawork_pose(), self._camerawork_pose()
+        toggle = False
+        while time.monotonic() < deadline and not self._cancel.is_set():
+            if mode == "pingpong":
+                target = endpoint_a if toggle else endpoint_b
+                toggle = not toggle
+            elif mode == "holds" and random.random() < _CW_HOLD_PROB:
+                await self._sleep_or_cancel(min(_CW_HOLD_SECONDS, max(0.0, deadline - time.monotonic())))
+                continue
+            else:
+                target = self._camerawork_pose()
+            speed = random.uniform(*_CW_SPEED)
+            zoom = (
+                round(random.uniform(*_CW_ZOOM), 2)
+                if allow_zoom and random.random() < _CW_ZOOM_PROB
+                else None
+            )
+            await self._camerawork_leg(target, speed, zoom, deadline)
+
+    async def _sample_telemetry(self) -> None:
+        """Record (video_time, yaw, pitch) a few times a second while the recording runs."""
+        while not self._cancel.is_set():
+            try:
+                state = await self.robot.status()
+                if state.yaw is not None and state.pitch is not None:
+                    self._telemetry.append((
+                        round(self._elapsed(), 3),
+                        round(float(state.yaw), 3),
+                        round(float(state.pitch), 3),
+                    ))
+            except Exception:
+                pass
+            await asyncio.sleep(0.3)
+
+    def _write_gimbal_sidecar(self, media_local_path: str | None) -> None:
+        """Persist the run's gimbal track beside the video so analysis can rescue slow pans."""
+        if not media_local_path or not self._telemetry:
+            return
+        try:
+            Path(str(media_local_path) + ".gimbal.json").write_text(
+                json.dumps({"samples": [list(sample) for sample in self._telemetry]}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+        except OSError:
+            pass
+
     async def _fail_segment(self, run: CruiseRun, segment: CruiseSegment, error: str) -> None:
         """Failure policy: keep recording, mark the moment, move to the next point.
 
@@ -366,6 +507,11 @@ class CruiseService:
         await self._publish_segment("CRUISE_POINT_FAILED", run, segment)
 
     async def _finish(self, request: CruiseRequest, run: CruiseRun) -> None:
+        if self._telemetry_task is not None:
+            self._telemetry_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await self._telemetry_task
+            self._telemetry_task = None
         for segment in run.segments:
             if segment.status in {"pending", "navigating"}:
                 segment.status = "skipped"
@@ -383,6 +529,7 @@ class CruiseService:
                 state = await self.robot.status()
             run.media_url = state.media_url
             run.media_local_path = state.media_local_path
+            self._write_gimbal_sidecar(run.media_local_path)
 
         session = self.capture.active_session()
         with suppress(Exception):

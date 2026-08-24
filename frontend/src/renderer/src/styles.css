@@ -202,6 +202,13 @@ p { margin: 6px 0 0; color: var(--text-muted); }
 .duration-control { display: grid; grid-template-columns: 84px minmax(0, 1fr); gap: 10px; align-items: center; }
 .duration-control > span { color: var(--text-muted); font-size: 12px; font-weight: 800; }
 .duration-control > .field { grid-column: 2; }
+
+/* 镜头控制 — one row per axis: name + start / end / speed inputs. */
+.gimbal-axis { display: grid; grid-template-columns: 52px repeat(3, minmax(0, 1fr)); gap: 10px; align-items: end; margin-bottom: 8px; }
+.gimbal-axis .axis-name { color: var(--text-soft); font-weight: 800; font-size: 13px; padding-bottom: 10px; }
+.gimbal-axis label { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+.gimbal-axis label small { color: var(--text-muted); font-size: 11px; }
+.gimbal-axis .axis-nospeed { color: var(--text-muted); font-size: 12px; padding-bottom: 11px; }
 .compact-field { padding: 8px 9px; }
 .timeline-head,
 

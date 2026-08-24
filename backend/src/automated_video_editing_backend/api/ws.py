@@ -9,7 +9,7 @@ from starlette.websockets import WebSocketDisconnect
 
 from automated_video_editing_backend.core.diagnostics import log_event
 from automated_video_editing_backend.core.events import EventHub
-from automated_video_editing_backend.core.models import CameraAngle, CruiseRequest, MoveCommand
+from automated_video_editing_backend.core.models import CameraAngle, CruiseRequest, GimbalMoveRequest, MoveCommand
 from automated_video_editing_backend.core.security import require_ws_token
 from automated_video_editing_backend.services.capture import CaptureService
 from automated_video_editing_backend.services.cruise import CruiseService
@@ -20,6 +20,7 @@ ALLOWED_COMMANDS = {
     "ROBOT_STOP",
     "ROBOT_MOVE",
     "ROBOT_CAMERA_ANGLE",
+    "ROBOT_GIMBAL",
     "ROBOT_START_RECORDING",
     "ROBOT_STOP_RECORDING",
     "ROBOT_CAPTURE_PHOTO",
@@ -88,6 +89,9 @@ async def _handle_command(
         await websocket.send_json({"type": "ROBOT_STATE", "data": state.model_dump(mode="json")})
     elif msg_type == "ROBOT_CAMERA_ANGLE":
         state = await robot.set_camera_angle(CameraAngle(**data))
+        await websocket.send_json({"type": "ROBOT_STATE", "data": state.model_dump(mode="json")})
+    elif msg_type == "ROBOT_GIMBAL":
+        state = await robot.set_gimbal(GimbalMoveRequest(**data))
         await websocket.send_json({"type": "ROBOT_STATE", "data": state.model_dump(mode="json")})
     elif msg_type == "ROBOT_START_RECORDING":
         state = await robot.start_recording()

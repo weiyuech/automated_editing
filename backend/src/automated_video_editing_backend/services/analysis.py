@@ -55,6 +55,7 @@ class AnalysisService:
     async def analyze_video(self, media: MediaItem, music: MediaItem | None = None) -> AnalysisResult:
         warnings: list[str] = []
         scenes = self.detect_scenes(Path(media.path), warnings)
+        _lift_static_windows_with_gimbal(Path(media.path), scenes)
         music_result = self.analyze_music(Path(music.path), warnings) if music else None
         return AnalysisResult(
             media_id=media.id,
@@ -877,3 +878,68 @@ class AnalysisService:
 
     def _fallback_scene(self) -> list[dict[str, Any]]:
         return [{"start": 0.0, "end": 6.0, "score": 1.0}]
+
+
+# Telemetry rescue: a slow pan over a plain surface changes few pixels, so the visual motion
+# reads dead even though the gimbal was moving. When a cruise recorded a gimbal track beside the
+# video (see CruiseService), lift those windows out of the static band so the scorer keeps them.
+GIMBAL_SIDECAR_SUFFIX = ".gimbal.json"
+_GIMBAL_STATIC_MOTION = 0.12   # visual motion at/below this is a static candidate to rescue
+_GIMBAL_MOVING_DEG_S = 1.0     # measured gimbal travel above this counts as real camerawork
+_GIMBAL_LIFTED_MOTION = 0.35   # motion value a rescued window is raised to (clears the dead band)
+
+
+def _read_gimbal_track(video_path: Path) -> list[tuple[float, float, float]]:
+    """The recorded (video_time, yaw, pitch) samples beside a cruise video, or [] if none."""
+    sidecar = Path(str(video_path) + GIMBAL_SIDECAR_SUFFIX)
+    if not sidecar.exists():
+        return []
+    try:
+        data = json.loads(sidecar.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    track: list[tuple[float, float, float]] = []
+    for item in (data.get("samples") if isinstance(data, dict) else None) or []:
+        try:
+            track.append((float(item[0]), float(item[1]), float(item[2])))
+        except (TypeError, ValueError, IndexError):
+            continue
+    track.sort(key=lambda row: row[0])
+    return track
+
+
+def _gimbal_rate(track: list[tuple[float, float, float]], start: float, end: float) -> float:
+    """Average yaw+pitch travel (deg/s) over [start, end] from the recorded gimbal track."""
+    window = [row for row in track if start - 1e-6 <= row[0] <= end + 1e-6]
+    if len(window) < 2:
+        return 0.0
+    travel = sum(abs(b[1] - a[1]) + abs(b[2] - a[2]) for a, b in zip(window, window[1:]))
+    span = max(1e-3, window[-1][0] - window[0][0])
+    return travel / span
+
+
+def _lift_static_windows_with_gimbal(video_path: Path, scenes: list[dict[str, Any]]) -> None:
+    """Rescue visually-static windows the gimbal was actually panning through.
+
+    No sidecar (imported footage, or a cruise that recorded none) -> nothing happens, so ordinary
+    analysis is unchanged. Only windows whose *visual* motion is dead but whose *gimbal* travel is
+    real are lifted; scene-level motion is then recomputed so the scorer sees the rescue.
+    """
+    track = _read_gimbal_track(video_path)
+    if not track:
+        return
+    for scene in scenes:
+        profile = scene.get("quality_profile") or []
+        changed = False
+        for window in profile:
+            if float(window.get("motion", 1.0)) > _GIMBAL_STATIC_MOTION:
+                continue
+            rate = _gimbal_rate(track, float(window.get("start", 0.0)), float(window.get("end", 0.0)))
+            if rate >= _GIMBAL_MOVING_DEG_S:
+                window["motion"] = max(float(window.get("motion", 0.0)), _GIMBAL_LIFTED_MOTION)
+                changed = True
+        if changed and profile:
+            total = sum(max(0.0, w["end"] - w["start"]) for w in profile) or 1.0
+            scene["motion"] = round(
+                sum(float(w["motion"]) * max(0.0, w["end"] - w["start"]) for w in profile) / total, 4
+            )
