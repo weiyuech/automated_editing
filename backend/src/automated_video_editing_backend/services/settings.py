@@ -7,9 +7,12 @@ from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
+from pydantic import ValidationError
+
 from automated_video_editing_backend.core.models import (
     LLMSettingsSummary,
     AutomationSettingsSummary,
+    CameraworkConfig,
     RobotSettingsSummary,
     SeedanceSettingsSummary,
     SecretStatus,
@@ -75,6 +78,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
         "framing_mode": "center",
         "framing_crop_x": 0.5,
         "framing_crop_y": 0.5,
+        "camerawork": CameraworkConfig().model_dump(mode="json"),
     },
 }
 
@@ -156,6 +160,16 @@ class SettingsService:
     def automation_config(self) -> dict[str, Any]:
         return deepcopy(self._settings["automation"])
 
+    def camerawork_config(self) -> CameraworkConfig:
+        """Return one validated snapshot for a cruise to keep for its whole run."""
+        raw = self.automation_config().get("camerawork")
+        try:
+            return CameraworkConfig.model_validate(raw if isinstance(raw, dict) else {})
+        except ValidationError:
+            # An operator must be able to open 镜头设置 and replace a bad hand-edited profile;
+            # surfacing it as unconfigured is safer than making the whole settings API fail.
+            return CameraworkConfig()
+
     def output_quota(self) -> AutomationSettingsSummary:
         """How many more videos may be produced today.
 
@@ -183,6 +197,7 @@ class SettingsService:
             ),
             framing_crop_x=max(0.0, min(1.0, float(config.get("framing_crop_x", 0.5)))),
             framing_crop_y=max(0.0, min(1.0, float(config.get("framing_crop_y", 0.5)))),
+            camerawork=self.camerawork_config(),
         )
 
     def record_outputs(self, count: int) -> None:

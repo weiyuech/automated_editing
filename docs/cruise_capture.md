@@ -65,7 +65,7 @@ Footage shot while the robot was travelling, or while a point was failing, is st
 material, so the failure is recorded as a labelled marker (`path1#3 失败`) for a human to
 judge rather than as an instruction to cut.
 
-A point that times out (`arrival_timeout_seconds`, default 180s) is treated the same as a
+A point that times out (`arrival_timeout_seconds`, default 60s) is treated the same as a
 failure. A dropped robot connection aborts the run rather than failing every remaining
 point one at a time.
 
@@ -90,6 +90,22 @@ moving, which would add shake.
 
 Navigation and gimbal are independent commands, so enabling the scan does not change how a
 cruise drives, and manual camera control stays usable throughout a run.
+
+## Automatic camerawork profile
+
+`auto_camerawork` remains off by default. Enabling it on a cruise uses the single profile saved
+under **镜头设置**; a cruise is refused when the operator has never saved that profile.
+
+- Anchor and yaw/pitch/zoom limits are absolute poses inside the existing manual-control limits.
+- Before recording and whenever intentional camerawork ends, the complete pose returns to the
+  anchor. The old random temporary-hold style no longer exists.
+- While the base travels, yaw and pitch use either adaptive wander (relative weight 50) or
+  ping-pong (relative weight 30). From a left-side pose, wander chooses a broad rightward sweep
+  or a small further-left move; the right-side case is mirrored. Every leg re-reads current yaw.
+- Zoom remains fixed during transit. It is commanded only after arrival, then returns to the
+  anchor zoom together with yaw and pitch.
+- The separately configured parked scan is ignored when automatic camerawork is enabled, so two
+  planners never issue competing gimbal commands.
 
 ## Saved routes
 
@@ -156,8 +172,10 @@ The **拍摄** section holds:
 - **巡游清单** — map and path come from dropdowns fed by the robot; `goal_id` is typed,
   because nothing can enumerate it. Each row has 试跑 (single point, no recording) for
   discovering whether an id is real. Rows reorder and delete.
-- **巡游设置** — recording, dwell range, arrival timeout, and the off-by-default gimbal
-  scan. The scan's worst-case duration is shown so the dwell floor is not a surprise.
+- **巡游设置** — recording, dwell range, the off-by-default gimbal scan, and an
+  automatic-camerawork switch that links back to its profile under 镜头设置. The internal
+  per-point arrival timeout is fixed at 60 seconds and is not exposed in the UI. The scan's
+  worst-case duration is shown so the dwell floor is not a surprise.
 - **已保存清单** — save, load, validate, delete, or start a saved 清单 directly. Validation
   issues render per row. Named 清单 rather than 路线 because 路线 collides with 路径 in
   Chinese, and 清单 is the term robot-live-system already uses.

@@ -49,7 +49,7 @@ def create_app() -> FastAPI:
     )
     framing_test = FramingTestService(robot)
     capture = CaptureService(events)
-    cruise = CruiseService(events, robot, capture)
+    cruise = CruiseService(events, robot, capture, settings.camerawork_config)
     cruise_routes = CruiseRouteStore()
     vault = MediaVaultService(media)
     llm = LLMService(settings)

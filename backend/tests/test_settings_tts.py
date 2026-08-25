@@ -5,6 +5,7 @@ from pydantic import ValidationError
 
 from automated_video_editing_backend.core.models import (
     AutomationSettingsUpdate,
+    CameraworkConfig,
     SeedanceSettingsUpdate,
     SettingsUpdateRequest,
     TTSGenerateRequest,
@@ -83,6 +84,44 @@ def test_output_framing_starts_unset_and_persists_one_preference(tmp_path):
     assert cleared.output_aspect_ratio is None
     with pytest.raises(ValidationError):
         AutomationSettingsUpdate(output_aspect_ratio="1:1")
+
+
+def test_camerawork_profile_is_unconfigured_until_saved_and_persists_absolute_limits(tmp_path):
+    path = tmp_path / "settings.json"
+    service = SettingsService(path=path)
+    assert service.summary().automation.camerawork.configured is False
+
+    profile = CameraworkConfig(
+        configured=True,
+        anchor_yaw=5,
+        anchor_pitch=1,
+        anchor_zoom=1.2,
+        yaw_min=-20,
+        yaw_max=35,
+        pitch_min=-6,
+        pitch_max=8,
+        zoom_min=1,
+        zoom_max=1.8,
+        speed_min=2,
+        speed_max=4,
+    )
+    service.update(SettingsUpdateRequest(
+        automation=AutomationSettingsUpdate(camerawork=profile)
+    ))
+
+    saved = SettingsService(path=path).camerawork_config()
+    assert saved == profile
+
+
+@pytest.mark.parametrize("patch", [
+    {"yaw_min": 10, "yaw_max": 10},
+    {"pitch_min": -5, "pitch_max": 5, "anchor_pitch": 10},
+    {"zoom_min": 1.5, "zoom_max": 1.2},
+    {"speed_min": 5, "speed_max": 2},
+])
+def test_camerawork_rejects_invalid_ranges_and_anchors(patch):
+    with pytest.raises(ValidationError):
+        CameraworkConfig(configured=True, **patch)
 
 
 def test_seedance_model_is_preserved_when_settings_form_leaves_it_blank(tmp_path):

@@ -49,7 +49,7 @@ class RobotAdapter(ABC):
     async def set_goal(self, command: RobotGoalCommand) -> dict[str, Any]: ...
 
     @abstractmethod
-    async def wait_for_arrival(self, timeout_s: float = 180.0) -> str: ...
+    async def wait_for_arrival(self, timeout_s: float = 60.0) -> str: ...
 
     @abstractmethod
     async def sweep_camera(self, target_yaw: float, yaw_speed: float) -> RobotState: ...
@@ -197,7 +197,7 @@ class HardwareRobotAdapter(RobotAdapter):
         await self._publish_state()
         return response if isinstance(response, dict) else {"raw": response}
 
-    async def wait_for_arrival(self, timeout_s: float = 180.0) -> str:
+    async def wait_for_arrival(self, timeout_s: float = 60.0) -> str:
         """Block until the robot settles on the goal armed by set_goal().
 
         Returns 'done' or 'failed'. Raises TimeoutError if the robot never settles, and
@@ -661,7 +661,7 @@ class RobotService:
         await self.events.publish("ROBOT_COMMAND", {"type": "set_goal", "result": result})
         return result
 
-    async def wait_for_arrival(self, timeout_s: float = 180.0) -> str:
+    async def wait_for_arrival(self, timeout_s: float = 60.0) -> str:
         return await self.adapter.wait_for_arrival(timeout_s)
 
     async def sweep_camera(self, target_yaw: float, yaw_speed: float) -> RobotState:

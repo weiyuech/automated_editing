@@ -209,6 +209,9 @@ p { margin: 6px 0 0; color: var(--text-muted); }
 .gimbal-axis label { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
 .gimbal-axis label small { color: var(--text-muted); font-size: 11px; }
 .gimbal-axis .axis-nospeed { color: var(--text-muted); font-size: 12px; padding-bottom: 11px; }
+.camera-settings-section { border-top: 1px solid var(--border); margin-top: 8px; padding-top: 18px; scroll-margin-top: 24px; }
+.camera-settings-section > div:first-child { margin-bottom: 12px; }
+.camera-settings-section > div:first-child strong { color: var(--text); font-size: 15px; }
 .compact-field { padding: 8px 9px; }
 .timeline-head,
 

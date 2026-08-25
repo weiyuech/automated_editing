@@ -10,6 +10,8 @@ from pydantic import BaseModel, Field
 
 from automated_video_editing_backend.core.models import (
     CameraAngle,
+    CameraworkConfig,
+    CameraworkPreferenceSaveRequest,
     GimbalMoveRequest,
     CruiseRequest,
     CruiseRouteSaveRequest,
@@ -302,6 +304,20 @@ def build_router(
                 "framing_crop_x": 0.5,
                 "framing_crop_y": 0.5,
             }
+        }))
+
+    @router.post("/camerawork-preference")
+    async def camerawork_preference_save(
+        request: CameraworkPreferenceSaveRequest, _: Secured = None
+    ):
+        """Persist the ordinary operator's cruise camerawork profile.
+
+        Like framing preference, this belongs on 镜头设置 and must not require access to the
+        administrator-only provider settings page.
+        """
+        profile = CameraworkConfig(configured=True, **request.model_dump())
+        return settings.update(SettingsUpdateRequest.model_validate({
+            "automation": {"camerawork": profile.model_dump(mode="json")}
         }))
 
     @router.get("/capture/sessions")

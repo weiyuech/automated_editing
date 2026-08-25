@@ -82,6 +82,53 @@ class GimbalMoveRequest(BaseModel):
     zoom_end: float = Field(default=1, ge=1, le=3.5)
 
 
+class CameraworkProfile(BaseModel):
+    """Operator-owned automatic camerawork limits, all expressed as absolute poses.
+
+    These limits deliberately match the narrower ranges already accepted by the manual
+    镜头控制 form. The anchor is a real resting pose, not the origin of relative offsets.
+    """
+
+    anchor_yaw: int = Field(default=0, ge=-90, le=90)
+    anchor_pitch: int = Field(default=0, ge=-60, le=15)
+    anchor_zoom: float = Field(default=1.0, ge=1.0, le=3.5)
+    yaw_min: int = Field(default=-60, ge=-90, le=90)
+    yaw_max: int = Field(default=60, ge=-90, le=90)
+    pitch_min: int = Field(default=-15, ge=-60, le=15)
+    pitch_max: int = Field(default=15, ge=-60, le=15)
+    zoom_min: float = Field(default=1.0, ge=1.0, le=3.5)
+    zoom_max: float = Field(default=1.5, ge=1.0, le=3.5)
+    # The robot firmware expects whole-number yaw/pitch speeds on the wire.
+    speed_min: int = Field(default=2, ge=2, le=5)
+    speed_max: int = Field(default=5, ge=2, le=5)
+
+    @model_validator(mode="after")
+    def validate_ranges_and_anchor(self) -> CameraworkProfile:
+        ranges = (
+            ("yaw", self.yaw_min, self.yaw_max, self.anchor_yaw),
+            ("pitch", self.pitch_min, self.pitch_max, self.anchor_pitch),
+            ("zoom", self.zoom_min, self.zoom_max, self.anchor_zoom),
+        )
+        for name, low, high, anchor in ranges:
+            if high <= low:
+                raise ValueError(f"{name}_max must be greater than {name}_min")
+            if not low <= anchor <= high:
+                raise ValueError(f"anchor_{name} must be inside the configured {name} range")
+        if self.speed_max < self.speed_min:
+            raise ValueError("speed_max must be greater than or equal to speed_min")
+        return self
+
+
+class CameraworkConfig(CameraworkProfile):
+    """Persisted profile. False means the operator has not explicitly saved it yet."""
+
+    configured: bool = False
+
+
+class CameraworkPreferenceSaveRequest(CameraworkProfile):
+    pass
+
+
 class RobotGoalCommand(BaseModel):
     path_name: str = Field(min_length=1, max_length=200)
     goal_id: int = Field(ge=0)
@@ -149,11 +196,11 @@ class CruiseRequest(BaseModel):
     record: bool = True
     dwell_min_seconds: float = Field(default=5.0, ge=0.0, le=120.0)
     dwell_max_seconds: float = Field(default=10.0, ge=0.0, le=120.0)
-    arrival_timeout_seconds: float = Field(default=180.0, ge=5.0, le=1800.0)
+    arrival_timeout_seconds: float = Field(default=60.0, ge=5.0, le=1800.0)
     gimbal_scan: GimbalScanConfig = Field(default_factory=GimbalScanConfig)
-    # Off by default (the existing cruise is untouched). On: the backend drives a slow, organic
-    # gimbal move throughout transit and dwell so footage is never dead-static — it picks a style
-    # per run (wander/ping-pong/short-holds) and samples zoom occasionally at each stop.
+    # Off by default. When enabled, the currently saved 镜头设置 profile is resolved when the
+    # run starts: yaw/pitch move during transit, zoom is only commanded after arrival, and the
+    # camera settles back on the profile's anchor before departing again.
     auto_camerawork: bool = False
 
     @model_validator(mode="after")
@@ -746,6 +793,7 @@ class AutomationSettingsSummary(BaseModel):
     framing_mode: Literal["center", "custom"] = "center"
     framing_crop_x: float = Field(default=0.5, ge=0, le=1)
     framing_crop_y: float = Field(default=0.5, ge=0, le=1)
+    camerawork: CameraworkConfig = Field(default_factory=CameraworkConfig)
 
 
 class SettingsSummary(BaseModel):
@@ -822,6 +870,7 @@ class AutomationSettingsUpdate(BaseModel):
     framing_mode: Literal["center", "custom"] | None = None
     framing_crop_x: float | None = Field(default=None, ge=0, le=1)
     framing_crop_y: float | None = Field(default=None, ge=0, le=1)
+    camerawork: CameraworkConfig | None = None
 
 
 class FramingPreferenceSaveRequest(BaseModel):

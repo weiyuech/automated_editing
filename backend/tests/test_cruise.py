@@ -9,6 +9,7 @@ import pytest
 
 from automated_video_editing_backend.core.events import EventHub
 from automated_video_editing_backend.core.models import (
+    CameraworkConfig,
     CruisePoint,
     CruiseRequest,
     GimbalScanConfig,
@@ -97,6 +98,7 @@ class FakeAdapter:
         self.goals = []
         self.sweeps = []
         self.recording_calls = []
+        self.arrival_timeouts = []
 
     async def status(self):
         return self.state
@@ -110,7 +112,8 @@ class FakeAdapter:
         self._pending = command
         return {"goal_check": "true", "goal_id": command.goal_id}
 
-    async def wait_for_arrival(self, timeout_s=180.0):
+    async def wait_for_arrival(self, timeout_s=60.0):
+        self.arrival_timeouts.append(timeout_s)
         await asyncio.sleep(0)
         return "failed" if self._pending.goal_id in self.fail_ids else "done"
 
@@ -138,12 +141,12 @@ class FakeAdapter:
         return self.state
 
 
-def build_cruise(fail_ids=()):
+def build_cruise(fail_ids=(), camerawork_provider=None):
     events = EventHub()
     adapter = FakeAdapter(fail_ids=fail_ids)
     robot = RobotService(events, adapter=adapter)
     capture = CaptureService(events, path=Path(tempfile.mkdtemp()) / "sessions.json")
-    return CruiseService(events, robot, capture), adapter, capture
+    return CruiseService(events, robot, capture, camerawork_provider), adapter, capture
 
 
 def cruise_request(**overrides):
@@ -154,6 +157,33 @@ def cruise_request(**overrides):
     }
     request.update(overrides)
     return CruiseRequest(**request)
+
+
+def test_cruise_arrival_timeout_defaults_to_sixty_seconds():
+    assert cruise_request().arrival_timeout_seconds == 60.0
+
+
+@pytest.mark.asyncio
+async def test_legacy_saved_timeout_is_overridden_by_fixed_sixty_seconds():
+    cruise, adapter, _ = build_cruise()
+
+    await cruise.start(cruise_request(arrival_timeout_seconds=180.0))
+    await cruise._task
+
+    assert adapter.arrival_timeouts == [60.0, 60.0]
+
+
+@pytest.mark.asyncio
+async def test_auto_camerawork_requires_an_explicitly_saved_camera_profile():
+    cruise, adapter, _ = build_cruise(
+        camerawork_provider=lambda: CameraworkConfig(configured=False)
+    )
+
+    with pytest.raises(ValueError, match="镜头设置"):
+        await cruise.start(cruise_request(auto_camerawork=True))
+
+    assert adapter.goals == []
+    assert adapter.recording_calls == []
 
 
 @pytest.mark.asyncio

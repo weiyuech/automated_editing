@@ -186,6 +186,49 @@
             <div class="button-row">
               <button class="primary" :disabled="isRobotBusy || framingTestBusy" @click="sendGimbal">发送镜头控制</button>
             </div>
+
+            <div id="automatic-camerawork-settings" class="camera-settings-section">
+              <div>
+                <strong>自动运镜（巡游）</strong>
+                <p class="form-hint">设置绝对角度范围与静止锚点。巡游移动时调整水平和俯仰；机器人停稳后才会变焦，运镜结束后回到锚点。</p>
+              </div>
+              <div class="gimbal-axis">
+                <span class="axis-name">锚点</span>
+                <label><small>水平 (−90~90)</small><input v-model.number="cameraworkForm.anchor_yaw" class="field" type="number" min="-90" max="90" step="1" @input="markCameraworkDirty" /></label>
+                <label><small>俯仰 (−60~15)</small><input v-model.number="cameraworkForm.anchor_pitch" class="field" type="number" min="-60" max="15" step="1" @input="markCameraworkDirty" /></label>
+                <label><small>变焦 (1~3.5)</small><input v-model.number="cameraworkForm.anchor_zoom" class="field" type="number" min="1" max="3.5" step="0.1" @input="markCameraworkDirty" /></label>
+              </div>
+              <div class="gimbal-axis">
+                <span class="axis-name">水平</span>
+                <label><small>右边界 (−90~90)</small><input v-model.number="cameraworkForm.yaw_min" class="field" type="number" min="-90" max="90" step="1" @input="markCameraworkDirty" /></label>
+                <label><small>左边界 (−90~90)</small><input v-model.number="cameraworkForm.yaw_max" class="field" type="number" min="-90" max="90" step="1" @input="markCameraworkDirty" /></label>
+                <span class="axis-nospeed">负＝右，正＝左</span>
+              </div>
+              <div class="gimbal-axis">
+                <span class="axis-name">俯仰</span>
+                <label><small>上边界 (−60~15)</small><input v-model.number="cameraworkForm.pitch_min" class="field" type="number" min="-60" max="15" step="1" @input="markCameraworkDirty" /></label>
+                <label><small>下边界 (−60~15)</small><input v-model.number="cameraworkForm.pitch_max" class="field" type="number" min="-60" max="15" step="1" @input="markCameraworkDirty" /></label>
+                <span class="axis-nospeed">负＝上，正＝下</span>
+              </div>
+              <div class="gimbal-axis">
+                <span class="axis-name">变焦</span>
+                <label><small>最小 (1~3.5)</small><input v-model.number="cameraworkForm.zoom_min" class="field" type="number" min="1" max="3.5" step="0.1" @input="markCameraworkDirty" /></label>
+                <label><small>最大 (1~3.5)</small><input v-model.number="cameraworkForm.zoom_max" class="field" type="number" min="1" max="3.5" step="0.1" @input="markCameraworkDirty" /></label>
+                <span class="axis-nospeed">仅停稳后变焦</span>
+              </div>
+              <div class="gimbal-axis">
+                <span class="axis-name">速度</span>
+                <label><small>最慢 (2~5°/秒)</small><input v-model.number="cameraworkForm.speed_min" class="field" type="number" min="2" max="5" step="1" @input="markCameraworkDirty" /></label>
+                <label><small>最快 (2~5°/秒)</small><input v-model.number="cameraworkForm.speed_max" class="field" type="number" min="2" max="5" step="1" @input="markCameraworkDirty" /></label>
+                <span class="axis-nospeed">大幅运镜不会提高速度</span>
+              </div>
+              <div class="button-row">
+                <button :disabled="robot.yaw == null || robot.pitch == null" @click="useCurrentCameraworkAnchor">使用当前水平/俯仰</button>
+                <button class="primary" :disabled="cameraworkSaving || Boolean(cameraworkWarning)" @click="saveCameraworkPreference">保存自动运镜设置</button>
+              </div>
+              <p v-if="cameraworkWarning" class="inline-status danger">{{ cameraworkWarning }}</p>
+              <p v-if="cameraworkStatus" class="inline-status" :class="cameraworkStatusKind">{{ cameraworkStatus }}</p>
+            </div>
           </div>
         </Panel>
       </section>
@@ -274,11 +317,15 @@
               <input v-model.number="cruiseDwellMax" class="field" type="number" min="0" max="120" step="0.5" placeholder="停留最长秒数" />
             </div>
             <p class="form-hint">每到达一个点位随机停留 {{ cruiseDwellMin }}–{{ cruiseDwellMax }} 秒，避免刚到就转身、拍不到可用画面。</p>
-            <input v-model.number="cruiseArrivalTimeout" class="field" type="number" min="5" max="1800" step="5" placeholder="单点到达超时秒数" />
 
-            <label class="toggle-row"><input v-model="cruiseAutoCamerawork" type="checkbox" />自动运镜（巡游全程缓慢移动云台，避免画面太静；默认关闭）</label>
-            <label class="toggle-row"><input v-model="cruiseScanEnabled" type="checkbox" />停留时云台缓慢扫视（可选，默认关闭）</label>
-            <template v-if="cruiseScanEnabled">
+            <label class="toggle-row"><input v-model="cruiseAutoCamerawork" type="checkbox" />自动运镜（使用「镜头设置」中的配置；默认关闭）</label>
+            <template v-if="cruiseAutoCamerawork">
+              <p class="form-hint">巡游移动时缓慢调整水平和俯仰；到达点位并停稳后执行变焦，运镜结束后回到锚点。请先在「镜头设置」中完成配置。</p>
+              <div class="button-row"><button @click="goToCameraworkSettings">前往镜头设置</button></div>
+              <p v-if="!cameraworkConfigured" class="inline-status danger">尚未配置自动运镜，请先前往「镜头设置」。</p>
+            </template>
+            <label class="toggle-row"><input v-model="cruiseScanEnabled" type="checkbox" :disabled="cruiseAutoCamerawork" />停留时云台缓慢扫视（可选，默认关闭）</label>
+            <template v-if="cruiseScanEnabled && !cruiseAutoCamerawork">
               <div class="settings-pair">
                 <select v-model="cruiseScanDirection" class="field">
                   <option value="right">向右扫视</option>
@@ -1392,6 +1439,7 @@ const nav = [
 
 const MAX_SOURCE_VIDEOS = 20
 const MAX_AUTOMATION_ITEMS = 100
+const CRUISE_ARRIVAL_TIMEOUT_SECONDS = 60
 
 const active = ref('dashboard')
 const current = computed(() => nav.find((item) => item.key === active.value) || nav[0])
@@ -1417,7 +1465,6 @@ const cruiseNewGoalId = ref(1)
 const cruiseNewGoalObject = ref('')
 const cruiseDwellMin = ref(5)
 const cruiseDwellMax = ref(10)
-const cruiseArrivalTimeout = ref(180)
 const cruiseAutoCamerawork = ref(false)
 const cruiseScanEnabled = ref(false)
 const cruiseScanDirection = ref('right')
@@ -1458,6 +1505,18 @@ const gimbalForm = ref({
   pitch_start: 0, pitch_end: 0, pitch_speed: 5,
   zoom_start: 1, zoom_end: 1
 })
+const cameraworkForm = ref({
+  anchor_yaw: 0, anchor_pitch: 0, anchor_zoom: 1,
+  yaw_min: -60, yaw_max: 60,
+  pitch_min: -15, pitch_max: 15,
+  zoom_min: 1, zoom_max: 1.5,
+  speed_min: 2, speed_max: 5
+})
+const cameraworkLoaded = ref(false)
+const cameraworkDirty = ref(false)
+const cameraworkSaving = ref(false)
+const cameraworkStatus = ref('')
+const cameraworkStatusKind = ref('muted')
 const framingTest = ref({ running: false, ready: false, preview_id: '' })
 const framingTestBusy = ref(false)
 const framingTestStatus = ref('')
@@ -2445,6 +2504,9 @@ async function refreshSettings() {
   if (!framingSelectionLoaded.value || !framingDraftDirty.value) {
     loadFramingSelectionFromSettings()
   }
+  if (!cameraworkLoaded.value || !cameraworkDirty.value) {
+    loadCameraworkFromSettings()
+  }
 }
 async function refreshTtsAssets() {
   const [assets, quota] = await Promise.all([api('/tts/assets'), api('/tts/quota')])
@@ -2532,16 +2594,35 @@ const recordingSourceLabel = computed(() => {
 const cruiseDwellWarning = computed(() =>
   Number(cruiseDwellMax.value) < Number(cruiseDwellMin.value) ? '停留最长秒数不能小于最短秒数。' : ''
 )
+const cameraworkConfigured = computed(() => Boolean(settings.value?.automation?.camerawork?.configured))
+const cameraworkWarning = computed(() => {
+  const form = cameraworkForm.value
+  if (Object.values(form).some((value) => !Number.isFinite(Number(value)))) return '所有自动运镜参数都必须是数字。'
+  if (![form.anchor_yaw, form.anchor_pitch, form.yaw_min, form.yaw_max, form.pitch_min, form.pitch_max].every(Number.isInteger)) return '水平和俯仰角度必须是整数。'
+  if (form.yaw_min < -90 || form.yaw_max > 90 || form.yaw_max <= form.yaw_min) return '水平范围必须在 −90°~90° 内，且左边界大于右边界。'
+  if (form.pitch_min < -60 || form.pitch_max > 15 || form.pitch_max <= form.pitch_min) return '俯仰范围必须在 −60°~15° 内，且下边界大于上边界。'
+  if (form.zoom_min < 1 || form.zoom_max > 3.5 || form.zoom_max <= form.zoom_min) return '变焦范围必须在 1~3.5 内，且最大值大于最小值。'
+  if (!Number.isInteger(form.speed_min) || !Number.isInteger(form.speed_max) || form.speed_min < 2 || form.speed_max > 5 || form.speed_max < form.speed_min) return '速度必须是 2~5°/秒内的整数，且最快速度不小于最慢速度。'
+  if (form.anchor_yaw < form.yaw_min || form.anchor_yaw > form.yaw_max) return '水平锚点必须位于水平范围内。'
+  if (form.anchor_pitch < form.pitch_min || form.anchor_pitch > form.pitch_max) return '俯仰锚点必须位于俯仰范围内。'
+  if (form.anchor_zoom < form.zoom_min || form.anchor_zoom > form.zoom_max) return '变焦锚点必须位于变焦范围内。'
+  return ''
+})
 // A cruise always records, so it needs sole ownership of the recording. activeSession is
 // also set during a cruise, hence the cruiseRunning exclusion: this means a *manual* one.
 const manualCaptureActive = computed(() => Boolean(activeSession.value) && !cruiseRunning.value)
 const canStartCruise = computed(() =>
   cruisePoints.value.length > 0 && !cruiseRunning.value && !isCruiseBusy.value
   && !cruiseDwellWarning.value && !manualCaptureActive.value
+  && (!cruiseAutoCamerawork.value || cameraworkConfigured.value)
 )
 const cruiseScanBudget = computed(() => {
   const speed = Math.max(1, Number(cruiseScanSpeed.value) || 1)
   return (2 * (Number(cruiseScanOffset.value || 0) / speed + 0.8)).toFixed(1)
+})
+
+watch(cruiseAutoCamerawork, (enabled) => {
+  if (enabled) cruiseScanEnabled.value = false
 })
 
 function cruiseSegmentLabel(status) { return CRUISE_SEGMENT_LABELS[status] || status }
@@ -2608,7 +2689,7 @@ async function testCruisePoint(point) {
         record: false,
         dwell_min_seconds: 0,
         dwell_max_seconds: 0,
-        arrival_timeout_seconds: Number(cruiseArrivalTimeout.value),
+        arrival_timeout_seconds: CRUISE_ARRIVAL_TIMEOUT_SECONDS,
         gimbal_scan: { enabled: false }
       })
     })
@@ -2704,9 +2785,9 @@ function buildCruiseRequest() {
     record: true,
     dwell_min_seconds: Number(cruiseDwellMin.value),
     dwell_max_seconds: Number(cruiseDwellMax.value),
-    arrival_timeout_seconds: Number(cruiseArrivalTimeout.value),
+    arrival_timeout_seconds: CRUISE_ARRIVAL_TIMEOUT_SECONDS,
     gimbal_scan: {
-      enabled: cruiseScanEnabled.value,
+      enabled: cruiseScanEnabled.value && !cruiseAutoCamerawork.value,
       direction: cruiseScanDirection.value,
       yaw_offset_deg: Number(cruiseScanOffset.value),
       yaw_speed_deg_s: Number(cruiseScanSpeed.value)
@@ -2720,9 +2801,9 @@ function applyCruiseRequest(request) {
   cruisePoints.value = (request.points || []).map((point) => ({ ...point }))
   cruiseDwellMin.value = request.dwell_min_seconds
   cruiseDwellMax.value = request.dwell_max_seconds
-  cruiseArrivalTimeout.value = request.arrival_timeout_seconds
+  cruiseAutoCamerawork.value = Boolean(request.auto_camerawork)
   const scan = request.gimbal_scan || {}
-  cruiseScanEnabled.value = Boolean(scan.enabled)
+  cruiseScanEnabled.value = Boolean(scan.enabled) && !cruiseAutoCamerawork.value
   cruiseScanDirection.value = scan.direction || 'right'
   cruiseScanOffset.value = scan.yaw_offset_deg ?? 15
   cruiseScanSpeed.value = scan.yaw_speed_deg_s ?? 5
@@ -2940,6 +3021,70 @@ async function refreshRobotPaths(showStatus = true, allowBusy = false) {
 function pingBackend() { sendWs('PING') }
 function setCameraAngle() { sendWs('ROBOT_CAMERA_ANGLE', { angle: cameraAngle.value }) }
 function sendGimbal() { sendWs('ROBOT_GIMBAL', { ...gimbalForm.value }) }
+
+function loadCameraworkFromSettings() {
+  const saved = settings.value?.automation?.camerawork
+  if (!saved) return
+  cameraworkForm.value = {
+    anchor_yaw: Number(saved.anchor_yaw ?? 0),
+    anchor_pitch: Number(saved.anchor_pitch ?? 0),
+    anchor_zoom: Number(saved.anchor_zoom ?? 1),
+    yaw_min: Number(saved.yaw_min ?? -60),
+    yaw_max: Number(saved.yaw_max ?? 60),
+    pitch_min: Number(saved.pitch_min ?? -15),
+    pitch_max: Number(saved.pitch_max ?? 15),
+    zoom_min: Number(saved.zoom_min ?? 1),
+    zoom_max: Number(saved.zoom_max ?? 1.5),
+    speed_min: Number(saved.speed_min ?? 2),
+    speed_max: Number(saved.speed_max ?? 5)
+  }
+  cameraworkLoaded.value = true
+  cameraworkDirty.value = false
+}
+
+function markCameraworkDirty() {
+  cameraworkDirty.value = true
+  cameraworkStatus.value = ''
+}
+
+function useCurrentCameraworkAnchor() {
+  if (robot.value.yaw == null || robot.value.pitch == null) return
+  cameraworkForm.value.anchor_yaw = Math.round(Number(robot.value.yaw))
+  cameraworkForm.value.anchor_pitch = Math.round(Number(robot.value.pitch))
+  markCameraworkDirty()
+}
+
+async function saveCameraworkPreference() {
+  if (cameraworkWarning.value || cameraworkSaving.value) return
+  cameraworkSaving.value = true
+  cameraworkStatusKind.value = 'muted'
+  cameraworkStatus.value = '正在保存自动运镜设置…'
+  try {
+    settings.value = await api('/camerawork-preference', {
+      method: 'POST',
+      body: JSON.stringify(Object.fromEntries(
+        Object.entries(cameraworkForm.value).map(([key, value]) => [key, Number(value)])
+      ))
+    })
+    cameraworkLoaded.value = false
+    cameraworkDirty.value = false
+    loadCameraworkFromSettings()
+    cameraworkStatusKind.value = 'success'
+    cameraworkStatus.value = '自动运镜设置已保存。'
+  } catch (err) {
+    cameraworkStatusKind.value = 'danger'
+    cameraworkStatus.value = `保存失败：${humanError(err.message)}`
+  } finally {
+    cameraworkSaving.value = false
+  }
+}
+
+async function goToCameraworkSettings() {
+  active.value = 'robot'
+  await nextTick()
+  document.getElementById('automatic-camerawork-settings')?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+}
+
 function captureStart() {
   captureStatusKind.value = 'muted'
   captureStatus.value = '正在开始录制…'
