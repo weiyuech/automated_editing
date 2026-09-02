@@ -8,7 +8,7 @@ import shutil
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-DESTINATION = ROOT / "Automated-Video-Editing-0.1.3-External-Media-Tools-Source"
+DESTINATION = ROOT / "Automated-Video-Editing-0.1.4-External-Media-Tools-Source"
 
 FILES = {
     "SOURCE_DELIVERY_README.md": "README.md",

@@ -58,6 +58,12 @@ class RobotAdapter(ABC):
     def heartbeat_yaw(self) -> float | None: ...
 
     @abstractmethod
+    def heartbeat_pitch(self) -> float | None: ...
+
+    @abstractmethod
+    def heartbeat_revision(self) -> int | None: ...
+
+    @abstractmethod
     async def stop_motion(self) -> RobotState: ...
 
     @abstractmethod
@@ -100,6 +106,8 @@ class HardwareRobotAdapter(RobotAdapter):
         self._arrival_event = asyncio.Event()
         self._arrival_result: str | None = None
         self._heartbeat_yaw: float | None = None
+        self._heartbeat_pitch: float | None = None
+        self._heartbeat_revision: int | None = None
 
     async def configure_websocket_url(self, websocket_url: str) -> RobotState:
         next_url = websocket_url.strip()
@@ -215,6 +223,14 @@ class HardwareRobotAdapter(RobotAdapter):
         value is safe to poll while a sweep is in flight.
         """
         return self._heartbeat_yaw
+
+    def heartbeat_pitch(self) -> float | None:
+        """Gimbal pitch as last reported by the robot, never an optimistic command target."""
+        return self._heartbeat_pitch
+
+    def heartbeat_revision(self) -> int | None:
+        """Monotonic gimbal-heartbeat revision, or None until the first physical sample."""
+        return self._heartbeat_revision
 
     async def sweep_camera(self, target_yaw: float, yaw_speed: float) -> RobotState:
         """Drive the gimbal toward target_yaw at an explicit speed.
@@ -579,6 +595,8 @@ class HardwareRobotAdapter(RobotAdapter):
             self.state.yaw = _maybe_float(gimbal.get("yaw"))
             self._heartbeat_yaw = self.state.yaw
             self.state.pitch = _maybe_float(gimbal.get("pitch"))
+            self._heartbeat_pitch = self.state.pitch
+            self._heartbeat_revision = (self._heartbeat_revision or 0) + 1
             if self.state.yaw is not None:
                 self.state.camera_angle = self.state.yaw
 
@@ -671,6 +689,14 @@ class RobotService:
 
     def heartbeat_yaw(self) -> float | None:
         return self.adapter.heartbeat_yaw()
+
+    def heartbeat_pitch(self) -> float | None:
+        reader = getattr(self.adapter, "heartbeat_pitch", None)
+        return reader() if callable(reader) else None
+
+    def heartbeat_revision(self) -> int | None:
+        reader = getattr(self.adapter, "heartbeat_revision", None)
+        return reader() if callable(reader) else None
 
     async def stop_motion(self) -> RobotState:
         state = await self.adapter.stop_motion()

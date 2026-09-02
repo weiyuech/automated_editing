@@ -1,8 +1,8 @@
 import asyncio
-from contextlib import suppress
 import json
 import re
 import tempfile
+from contextlib import suppress
 from pathlib import Path
 
 import pytest
@@ -21,7 +21,7 @@ from automated_video_editing_backend.services.cruise import CruiseService
 from automated_video_editing_backend.services.robot import HardwareRobotAdapter, RobotService
 
 
-def heartbeat(goal_status, object_status="done", goal_id=1, yaw=None):
+def heartbeat(goal_status, object_status="done", goal_id=1, yaw=None, pitch=0):
     payload = {
         "system": {"status": "ready", "battery": 90},
         "map": {"mode": "localization", "name": "map1", "status": "ready"},
@@ -34,7 +34,12 @@ def heartbeat(goal_status, object_status="done", goal_id=1, yaw=None):
         },
     }
     if yaw is not None:
-        payload["gimbal"] = {"record_status": "recording", "yaw": yaw, "pitch": 0, "mode": 1}
+        payload["gimbal"] = {
+            "record_status": "recording",
+            "yaw": yaw,
+            "pitch": pitch,
+            "mode": 1,
+        }
     return json.dumps(payload)
 
 
@@ -89,16 +94,30 @@ async def test_lost_connection_resolves_a_pending_arrival():
     assert await adapter.wait_for_arrival(timeout_s=0.05) == "failed"
 
 
+@pytest.mark.asyncio
+async def test_hardware_adapter_keeps_raw_heartbeat_pitch_separate_from_command_tracking():
+    adapter = armed_adapter()
+    await adapter._handle_message(heartbeat("going", yaw=7, pitch=-3))
+
+    assert adapter.heartbeat_yaw() == 7
+    assert adapter.heartbeat_pitch() == -3
+    assert adapter.heartbeat_revision() == 1
+    await adapter._handle_message(heartbeat("going", yaw=8, pitch=-2))
+    assert adapter.heartbeat_revision() == 2
+
+
 class FakeAdapter:
     """Duck-typed robot that reports arrival for every goal except those in fail_ids."""
 
     def __init__(self, fail_ids=()):
-        self.state = RobotState(connected=True, yaw=0.0)
+        self.state = RobotState(connected=True, yaw=0.0, pitch=0.0)
         self.fail_ids = set(fail_ids)
         self.goals = []
         self.sweeps = []
+        self.gimbal_commands = []
         self.recording_calls = []
         self.arrival_timeouts = []
+        self.gimbal_revision = 0
 
     async def status(self):
         return self.state
@@ -128,6 +147,19 @@ class FakeAdapter:
 
     def heartbeat_yaw(self):
         return self.state.yaw
+
+    def heartbeat_pitch(self):
+        return self.state.pitch
+
+    def heartbeat_revision(self):
+        return self.gimbal_revision
+
+    async def set_gimbal(self, command):
+        self.gimbal_commands.append(command)
+        self.state.yaw = command.yaw_end
+        self.state.pitch = command.pitch_end
+        self.gimbal_revision += 1
+        return self.state
 
     async def start_recording(self):
         self.recording_calls.append("start")

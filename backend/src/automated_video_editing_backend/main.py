@@ -38,7 +38,7 @@ from automated_video_editing_backend.services.tts import TTSService
 def create_app() -> FastAPI:
     ensure_generated_dirs()
     configure_diagnostics(GENERATED_DIRS["logs"] / "diagnostics.log")
-    log_event("info", "backend.started", version="0.1.2")
+    log_event("info", "backend.started", version="0.1.4")
     events = EventHub()
     settings = SettingsService()
     media = MediaService()
@@ -73,7 +73,7 @@ def create_app() -> FastAPI:
             await framing_test.close()
             await robot.disconnect()
 
-    app = FastAPI(title="Automated Video Editing Backend", version="0.1.2", lifespan=lifespan)
+    app = FastAPI(title="Automated Video Editing Backend", version="0.1.4", lifespan=lifespan)
     app.add_middleware(
         CORSMiddleware,
         # electron-vite serves the installed renderer from file://, whose browser origin is

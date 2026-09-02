@@ -97,13 +97,16 @@ cruise drives, and manual camera control stays usable throughout a run.
 under **镜头设置**; a cruise is refused when the operator has never saved that profile.
 
 - Anchor and yaw/pitch/zoom limits are absolute poses inside the existing manual-control limits.
-- Before recording and whenever intentional camerawork ends, the complete pose returns to the
-  anchor. The old random temporary-hold style no longer exists.
-- While the base travels, yaw and pitch use either adaptive wander (relative weight 50) or
-  ping-pong (relative weight 30). From a left-side pose, wander chooses a broad rightward sweep
-  or a small further-left move; the right-side case is mirrored. Every leg re-reads current yaw.
-- Zoom remains fixed during transit. It is commanded only after arrival, then returns to the
-  anchor zoom together with yaw and pitch.
+- Before recording, at every point, and when the cruise ends, the complete pose returns to the
+  anchor. The old random temporary hold at an arbitrary pose no longer exists.
+- While the base travels, the planner repeatedly chooses adaptive wander (50%), ping-pong (30%),
+  or one slow return-to-anchor action (20%). Reaching the anchor immediately returns control to
+  the planner; it does not turn the remainder of the transit into a static hold.
+- From a left-side pose, adaptive wander chooses a broad rightward sweep 80% of the time or a
+  small further-left move 20% of the time; the right-side case is mirrored. Every leg re-reads
+  the physical heartbeat pose and all targets stay inside the configured limits.
+- Zoom remains fixed during transit. After arrival, yaw and pitch first return to the anchor;
+  zoom then moves on that safe composition and the complete pose settles visibly at the anchor.
 - The separately configured parked scan is ignored when automatic camerawork is enabled, so two
   planners never issue competing gimbal commands.
 

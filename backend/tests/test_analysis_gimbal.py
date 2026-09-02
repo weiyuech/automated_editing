@@ -11,13 +11,13 @@ def _write_track(video: Path, samples):
     Path(str(video) + ".gimbal.json").write_text(json.dumps({"samples": samples}), encoding="utf-8")
 
 
-def test_gimbal_track_rescues_a_visually_static_but_panning_window(tmp_path):
+def test_static_motion_remains_static_even_when_gimbal_is_moving(tmp_path):
     video = tmp_path / "v.mp4"
     _write_track(video, [[0, 0, 0], [1, 3, 0], [2, 6, 0], [3, 9, 0], [4, 12, 0]])  # ~3 deg/s pan
     scenes = [{"start": 0, "end": 4, "quality_profile": [{"start": 0, "end": 4, "motion": 0.02}]}]
     _lift_static_windows_with_gimbal(video, scenes)
-    assert scenes[0]["quality_profile"][0]["motion"] == 0.35
-    assert scenes[0]["motion"] == 0.35  # scene-level motion recomputed
+    assert scenes[0]["quality_profile"][0]["motion"] == 0.0
+    assert scenes[0]["motion"] == 0.0
 
 
 def test_no_sidecar_leaves_analysis_untouched(tmp_path):
@@ -27,12 +27,20 @@ def test_no_sidecar_leaves_analysis_untouched(tmp_path):
     assert scenes[0]["quality_profile"][0]["motion"] == 0.02
 
 
-def test_static_window_with_a_still_gimbal_is_not_rescued(tmp_path):
+def test_static_window_with_a_still_gimbal_is_not_promoted(tmp_path):
     video = tmp_path / "v.mp4"
     _write_track(video, [[0, 10, 5], [1, 10, 5], [2, 10, 5], [3, 10, 5]])  # gimbal held still
     scenes = [{"start": 0, "end": 3, "quality_profile": [{"start": 0, "end": 3, "motion": 0.02}]}]
     _lift_static_windows_with_gimbal(video, scenes)
-    assert scenes[0]["quality_profile"][0]["motion"] == 0.02
+    assert scenes[0]["quality_profile"][0]["motion"] == 0.0
+
+
+def test_gimbal_still_forces_static_score_even_with_visual_motion(tmp_path):
+    video = tmp_path / "v.mp4"
+    _write_track(video, [[0, 10, 5], [1, 10, 5], [2, 10, 5], [3, 10, 5]])  # gimbal held still
+    scenes = [{"start": 0, "end": 3, "quality_profile": [{"start": 0, "end": 3, "motion": 0.9}]}]
+    _lift_static_windows_with_gimbal(video, scenes)
+    assert scenes[0]["quality_profile"][0]["motion"] == 0.0
 
 
 def test_gimbal_rate_is_travel_per_second():

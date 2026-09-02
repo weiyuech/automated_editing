@@ -880,13 +880,12 @@ class AnalysisService:
         return [{"start": 0.0, "end": 6.0, "score": 1.0}]
 
 
-# Telemetry rescue: a slow pan over a plain surface changes few pixels, so the visual motion
-# reads dead even though the gimbal was moving. When a cruise recorded a gimbal track beside the
-# video (see CruiseService), lift those windows out of the static band so the scorer keeps them.
+# Telemetry scoring rule: when either the picture or physical gimbal is static, do not treat the
+# window as movement-heavy; keep it in the static band for selection and pacing.
 GIMBAL_SIDECAR_SUFFIX = ".gimbal.json"
-_GIMBAL_STATIC_MOTION = 0.12   # visual motion at/below this is a static candidate to rescue
-_GIMBAL_MOVING_DEG_S = 1.0     # measured gimbal travel above this counts as real camerawork
-_GIMBAL_LIFTED_MOTION = 0.35   # motion value a rescued window is raised to (clears the dead band)
+_GIMBAL_STATIC_MOTION = 0.12   # visual motion at/below this is considered static
+_GIMBAL_MOVING_DEG_S = 1.0     # measured gimbal travel above this is considered moving
+_GIMBAL_STATIC_MOTION_SCORE = 0.0  # override to a clearly static motion score
 
 
 def _read_gimbal_track(video_path: Path) -> list[tuple[float, float, float]]:
@@ -919,11 +918,12 @@ def _gimbal_rate(track: list[tuple[float, float, float]], start: float, end: flo
 
 
 def _lift_static_windows_with_gimbal(video_path: Path, scenes: list[dict[str, Any]]) -> None:
-    """Rescue visually-static windows the gimbal was actually panning through.
+    """Keep windows that are visually static, or physically static, as static.
 
-    No sidecar (imported footage, or a cruise that recorded none) -> nothing happens, so ordinary
-    analysis is unchanged. Only windows whose *visual* motion is dead but whose *gimbal* travel is
-    real are lifted; scene-level motion is then recomputed so the scorer sees the rescue.
+    The previous behavior promoted visual static with hidden gimbal motion to avoid false negatives on
+    plain walls. This was too aggressive: it also made a visibly stable scene appear animated in
+    downstream logic. Now either visual-static OR low gimbal-rate windows are held at very low motion
+    so the quality model can score them as stable.
     """
     track = _read_gimbal_track(video_path)
     if not track:
@@ -932,11 +932,14 @@ def _lift_static_windows_with_gimbal(video_path: Path, scenes: list[dict[str, An
         profile = scene.get("quality_profile") or []
         changed = False
         for window in profile:
-            if float(window.get("motion", 1.0)) > _GIMBAL_STATIC_MOTION:
-                continue
+            visual_static = float(window.get("motion", 1.0)) <= _GIMBAL_STATIC_MOTION
             rate = _gimbal_rate(track, float(window.get("start", 0.0)), float(window.get("end", 0.0)))
-            if rate >= _GIMBAL_MOVING_DEG_S:
-                window["motion"] = max(float(window.get("motion", 0.0)), _GIMBAL_LIFTED_MOTION)
+            gimbal_static = rate <= _GIMBAL_MOVING_DEG_S
+            if visual_static or gimbal_static:
+                window["motion"] = min(
+                    _GIMBAL_STATIC_MOTION_SCORE,
+                    float(window.get("motion", 0.0)),
+                )
                 changed = True
         if changed and profile:
             total = sum(max(0.0, w["end"] - w["start"]) for w in profile) or 1.0
