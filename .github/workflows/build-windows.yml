@@ -198,11 +198,6 @@ jobs:
                if line.strip().startswith("FFMPEG:")),
               "FFMPEG: UNKNOWN",
           )
-          if not ffmpeg_line.endswith("YES"):
-              raise SystemExit(
-                  f"External-tools runtime cannot decode H.264 through OpenCV ({ffmpeg_line})."
-              )
-
           ffmpeg = shutil.which("ffmpeg")
           if not ffmpeg:
               raise SystemExit("Test-only FFmpeg is missing from PATH.")
@@ -228,11 +223,13 @@ jobs:
               finally:
                   capture.release()
               if not opened or not decoded or frame is None or frame.size == 0:
+                  frame_size = 0 if frame is None else frame.size
                   raise SystemExit(
-                      f"OpenCV advertised FFmpeg but failed to decode an actual H.264 frame "
-                      f"({ffmpeg_line})."
+                      "OpenCV failed to decode an actual H.264 frame "
+                      f"(opened={opened}, decoded={decoded}, frame_size={frame_size}; "
+                      f"build info: {ffmpeg_line})."
                   )
-          print(f"OpenCV decoded an actual H.264 frame ({ffmpeg_line}).")
+          print(f"OpenCV decoded an actual H.264 frame (build info: {ffmpeg_line}).")
           PY
 
       - name: Verify retained runtime assets
