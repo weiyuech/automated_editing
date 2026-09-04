@@ -144,10 +144,15 @@ FFMPEG_BUILDS = {
         "member": "ffmpeg",
     },
     "win64": {
-        # Immutable upstream snapshot: FFmpeg n8.1.2-34-g9b6c8969e0. Do not use the BtbN
-        # `latest` tag here; its asset is replaced daily under the same URL.
-        "url": "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-08-11-13-11/ffmpeg-n8.1.2-34-g9b6c8969e0-win64-gpl-8.1.zip",
-        "sha256": "05eedc113542be39af5d0f78f0b1093bafb89c98cecf25b77e8644670293107f",
+        # BtbN keeps ordinary daily builds for only 14 days. This is the final August 2026
+        # build, covered by its documented two-year retention for each month's last build.
+        # Keep the immutable URL and archive digest together; never fall back to floating latest.
+        "url": (
+            "https://github.com/BtbN/FFmpeg-Builds/releases/download/"
+            "autobuild-2026-08-31-13-27/"
+            "ffmpeg-n8.1.2-50-g1a748fe2cd-win64-gpl-8.1.zip"
+        ),
+        "sha256": "273abb45f3f9f76c303e35ff39f5bb6c23c163ae65f6244a32b7d4a7f6cf0616",
         "member": "ffmpeg.exe",
         "probe_member": "ffprobe.exe",
     },
