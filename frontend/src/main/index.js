@@ -3,7 +3,8 @@ import { execFile, spawn } from 'node:child_process'
 import { randomBytes } from 'node:crypto'
 import { createServer } from 'node:net'
 import { existsSync, mkdirSync, appendFileSync, copyFileSync, readFileSync, writeFileSync } from 'node:fs'
-import { delimiter, dirname, extname, join, relative, resolve, sep } from 'node:path'
+import { delimiter, dirname, extname, isAbsolute, join, relative, resolve, sep } from 'node:path'
+import { ensureDeletableManagedPath, ensureInspectableMediaPath } from './path-policy.js'
 
 const SOURCE_ROOT = resolve(__dirname, '../../../')
 const DEFAULT_BACKEND_PORT = 4817
@@ -181,36 +182,36 @@ function migrateLegacySettings() {
   }
 }
 
-const PREVIEWABLE_EXTS = new Set([
-  '.mp4', '.mov', '.m4v', '.mkv', '.webm', '.avi',
-  '.mp3', '.wav', '.m4a', '.aac', '.flac', '.ogg',
-  '.jpg', '.jpeg', '.png', '.webp'
-])
-
 function ensureManagedPath(targetPath) {
-  const root = appRoot()
-  const resolved = resolve(String(targetPath || ''))
-  const allowedRoots = [
-    join(root, 'data', 'downloads'),
-    join(root, 'data', 'tts'),
-    join(root, 'data', 'seedance'),
-    join(root, 'exports'),
-    join(root, 'previews'),
-    join(root, '.cache')
-  ]
-  const relation = relative(root, resolved)
-  const insideWorkspace = !(relation.startsWith('..') || relation === '' || relation.includes(`..${sep}`))
-  if (insideWorkspace && allowedRoots.some((root) => resolved === root || resolved.startsWith(`${root}${sep}`))) {
-    return resolved
-  }
+  return ensureInspectableMediaPath(appRoot(), targetPath)
+}
 
-  // Imported clips live wherever the operator keeps them — Desktop, Photos — so limiting
-  // this to the app's own folders made 打开/定位 fail for every imported file. Outside the
-  // workspace we still refuse anything that is not media, so no executable can be opened.
-  if (PREVIEWABLE_EXTS.has(extname(resolved).toLowerCase())) {
-    return resolved
+const VIDEO_FILE_EXTS = new Set(['.mp4', '.mov', '.m4v', '.mkv', '.webm', '.avi'])
+const AUDIO_FILE_EXTS = new Set(['.mp3', '.wav', '.m4a', '.aac', '.flac', '.ogg'])
+
+function isInsideDirectory(directory, targetPath) {
+  const relation = relative(resolve(directory), resolve(targetPath))
+  return relation === '' || (!(relation === '..' || relation.startsWith(`..${sep}`)) && !isAbsolute(relation))
+}
+
+/** Hidden sidecars are part of the media item, even though the library deliberately does not
+ * show them as separate assets. Move them to the trash with their owner so an old subtitle or
+ * narration manifest can never attach itself to a future file that reuses the same stem. */
+function managedCompanionPaths(targetPath) {
+  const extension = extname(targetPath).toLowerCase()
+  const stem = extension ? targetPath.slice(0, -extension.length) : targetPath
+  const root = appRoot()
+  if (VIDEO_FILE_EXTS.has(extension) && isInsideDirectory(join(root, 'exports'), targetPath)) {
+    return [`${stem}.ass`, `${stem}.subtitles.json`]
   }
-  throw new Error('Only media files can be opened or revealed')
+  if (VIDEO_FILE_EXTS.has(extension) && isInsideDirectory(join(root, 'data', 'downloads'), targetPath)) {
+    // Capture notes use the complete media filename, including its extension.
+    return [`${targetPath}.capture.json`]
+  }
+  if (AUDIO_FILE_EXTS.has(extension) && isInsideDirectory(join(root, 'data', 'tts'), targetPath)) {
+    return [`${stem}.json`]
+  }
+  return []
 }
 
 function pythonExecutable() {
@@ -381,8 +382,18 @@ ipcMain.handle('reveal-managed-path', (_event, targetPath) => {
 })
 
 ipcMain.handle('trash-managed-path', async (_event, targetPath) => {
-  await shell.trashItem(ensureManagedPath(targetPath))
-  return true
+  const managedTarget = ensureDeletableManagedPath(appRoot(), targetPath)
+  const companions = managedCompanionPaths(managedTarget).filter((path) => existsSync(path))
+  await shell.trashItem(managedTarget)
+  const companionFailures = []
+  for (const companion of companions) {
+    try {
+      await shell.trashItem(ensureDeletableManagedPath(appRoot(), companion, true))
+    } catch (error) {
+      companionFailures.push({ path: companion, message: error?.message || String(error) })
+    }
+  }
+  return { trashed: true, companionFailures }
 })
 
 /** Stop the backend for good, not just politely.

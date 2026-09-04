@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import itertools
+import json
 import re
 import subprocess
 from pathlib import Path
@@ -18,17 +19,79 @@ from pathlib import Path
 import cv2
 import numpy as np
 import pytest
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
 
+from automated_video_editing_backend.api.routes import build_router
 from automated_video_editing_backend.core.models import (
     EditTimeline,
+    MediaItem,
     SubtitleCue,
     SubtitleTrack,
+    TimelineAudioBed,
     TimelineClip,
 )
 from automated_video_editing_backend.services import subtitles
 from automated_video_editing_backend.services.render import RenderService, _filter_argument
 
 NARRATION = "机器人从大厅出发，缓缓驶过展区。前方是新品体验台，这里陈列着今年的旗舰产品。"
+
+
+@pytest.mark.parametrize(
+    "contents",
+    [
+        "{not valid json",
+        json.dumps({
+            "video": "另一个成片.mp4",
+            "cues": [{"start": 0, "end": 1, "text": "不应静默丢失"}],
+        }, ensure_ascii=False),
+    ],
+)
+def test_legacy_export_with_present_invalid_subtitles_is_not_treated_as_subtitle_free(
+    monkeypatch, tmp_path, contents,
+):
+    monkeypatch.setenv("APP_BRIDGE_TOKEN", "subtitle-test-token")
+    video = tmp_path / "旧成片.mp4"
+    video.write_bytes(b"video")
+    renderer = RenderService()
+    renderer.subtitle_sidecar_path(video).write_text(contents, encoding="utf-8")
+    item = MediaItem(id="legacy-export", path=str(video), kind="video", metadata={})
+
+    class MediaStub:
+        def get(self, media_id):
+            return item if media_id == item.id else None
+
+    unused = object()
+    app = FastAPI()
+    app.include_router(
+        build_router(
+            robot=unused,
+            capture=unused,
+            cruise=unused,
+            cruise_routes=unused,
+            media=MediaStub(),
+            jobs=type("JobsStub", (), {"renderer": renderer})(),
+            vault=unused,
+            settings=unused,
+            llm=unused,
+            tts=unused,
+            seedance=unused,
+            renamer=unused,
+            framing_test=unused,
+            admin_access=unused,
+        ),
+        prefix="/api",
+    )
+
+    response = TestClient(app).get(
+        "/api/subtitles/track",
+        params={"media_id": item.id},
+        headers={"x-bridge-token": "subtitle-test-token"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["track"] is None
+    assert "已停止按无字幕处理" in response.json()["problem"]
 
 
 def _words(text: str = NARRATION, step_ms: int = 190, hold_ms: int = 180):
@@ -189,7 +252,7 @@ def test_moving_the_voiceover_moves_the_subtitles_by_the_same_amount(tmp_path):
             title="t",
             output_path=str(tmp_path / f"o{offset}.mp4"),
             clips=[TimelineClip(media_id="m", source_path=str(tmp_path / "a.mp4"),
-                                start=0, duration=6, timeline_start=0)],
+                                start=0, duration=9, timeline_start=0)],
             voiceover_path=str(tmp_path / "voice.mp3"),
             voiceover_start_seconds=offset,
             subtitles=SubtitleTrack(cues=cues),
@@ -206,6 +269,40 @@ def test_moving_the_voiceover_moves_the_subtitles_by_the_same_amount(tmp_path):
     # The audio moved by the same 2.5s, from the same field.
     assert "adelay=2500" in moved_args
     assert "adelay" not in still_args
+
+
+def test_carried_track_entirely_outside_the_output_creates_no_subtitle_family(tmp_path):
+    """A non-empty source track is not proof that this shorter re-cut contains any text."""
+    from automated_video_editing_backend.core.models import TimelineAudioBed
+
+    service = RenderService()
+    output = tmp_path / "later-recut.mp4"
+    timeline = EditTimeline(
+        title="later recut",
+        output_path=str(output),
+        clips=[TimelineClip(
+            media_id="m", source_path=str(tmp_path / "picture.mp4"),
+            start=0, duration=2, timeline_start=0,
+        )],
+        audio_bed=TimelineAudioBed(
+            source_path=str(tmp_path / "earlier-export.mp4"),
+            source_start=10,
+            timeline_start=0,
+            has_voiceover=True,
+        ),
+        subtitles=SubtitleTrack(cues=[
+            SubtitleCue(start=1, end=2, text="already finished"),
+            SubtitleCue(start=4, end=5, text="also before the retained sound"),
+        ]),
+    )
+
+    assert service.output_subtitle_cues(timeline) == []
+    assert service.write_subtitle_script(timeline) is None
+    assert asyncio.run(service.render_master(timeline)) is None
+    assert not output.with_suffix(".ass").exists()
+    assert not output.with_suffix(".subtitles.json").exists()
+    assert not (tmp_path / "later-recut 母版.mp4").exists()
+    assert not (tmp_path / "later-recut 母版.subtitles.json").exists()
 
 
 def test_recut_subtitles_follow_the_soundtrack_they_came_with(tmp_path):
@@ -244,6 +341,90 @@ def test_recut_subtitles_follow_the_soundtrack_they_came_with(tmp_path):
     assert timeline.voiceover_start_seconds == 0
 
 
+def test_recut_sidecars_stay_inside_each_finished_video_timeline(tmp_path):
+    """A retained soundtrack may begin after some of its old cues, twice in succession.
+
+    Each sidecar is the input to the next manual fine-tune.  It therefore must contain the
+    finished video's clock — never negative source-relative times, nor cues beyond the picture
+    that will disappear when FFmpeg stops on the video stream.
+    """
+    service = RenderService()
+    first_output = tmp_path / "第一次微调.mp4"
+    first = EditTimeline(
+        title="first recut",
+        output_path=str(first_output),
+        clips=[TimelineClip(
+            media_id="picture", source_path=str(tmp_path / "picture.mp4"),
+            start=0, duration=5, timeline_start=0,
+        )],
+        audio_bed=TimelineAudioBed(
+            source_path=str(tmp_path / "earlier-master.mp4"),
+            source_start=3, timeline_start=1,
+            has_voiceover=True,
+        ),
+        subtitles=SubtitleTrack(cues=[
+            # Ends before the retained soundtrack begins: drop it.
+            SubtitleCue(start=0.25, end=1.75, text="已经说完"),
+            # Crosses the beginning of this output: retain it, clamped to zero.
+            SubtitleCue(start=1.5, end=2.5, text="跨越开头"),
+            SubtitleCue(start=3, end=4, text="完整保留"),
+            # Crosses the finished video's end: retain only its visible interval.
+            SubtitleCue(start=6.25, end=8.5, text="跨越结尾"),
+            # Begins after the picture has ended: drop it.
+            SubtitleCue(start=7.1, end=8, text="画面外"),
+        ]),
+    )
+
+    service.write_subtitle_script(first)
+    first_payload = service.read_subtitle_sidecar(first_output)
+    assert first_payload is not None
+    assert first_payload["cues"] == [
+        {"start": 0.0, "end": 0.5, "text": "跨越开头"},
+        {"start": 1.0, "end": 2.0, "text": "完整保留"},
+        {"start": 4.25, "end": 5.0, "text": "跨越结尾"},
+    ]
+    first_track = SubtitleTrack.model_validate({
+        field: first_payload[field]
+        for field in (
+            "cues", "font", "size", "side_margin", "bottom_margin", "outline", "shadow",
+            "primary_colour", "outline_colour", "max_lines",
+        )
+    })
+
+    # Re-cut that output again from 0.25s into its mixed soundtrack.  The source begins after
+    # the destination, so this exercises the same negative-offset boundary on generation two.
+    second_output = tmp_path / "第二次微调.mp4"
+    second = EditTimeline(
+        title="second recut",
+        output_path=str(second_output),
+        clips=[TimelineClip(
+            media_id="new-picture", source_path=str(tmp_path / "new-picture.mp4"),
+            start=0, duration=3, timeline_start=0,
+        )],
+        audio_bed=TimelineAudioBed(
+            source_path=str(first_output),
+            source_start=0.25, timeline_start=0,
+            has_voiceover=True,
+        ),
+        subtitles=first_track,
+    )
+
+    service.write_subtitle_script(second)
+    second_payload = service.read_subtitle_sidecar(second_output)
+    assert second_payload is not None
+    second_track = SubtitleTrack.model_validate({
+        field: second_payload[field]
+        for field in (
+            "cues", "font", "size", "side_margin", "bottom_margin", "outline", "shadow",
+            "primary_colour", "outline_colour", "max_lines",
+        )
+    })
+    assert [cue.model_dump() for cue in second_track.cues] == [
+        {"start": 0.0, "end": 0.25, "text": "跨越开头"},
+        {"start": 0.75, "end": 1.75, "text": "完整保留"},
+    ]
+
+
 def test_the_cue_file_is_found_from_either_the_video_or_its_own_path(tmp_path):
     """Callers hold one of two things, and both have to resolve to the same file.
 
@@ -271,6 +452,160 @@ def test_the_cue_file_is_found_from_either_the_video_or_its_own_path(tmp_path):
     broken = tmp_path / "broken.mp4"
     service.subtitle_sidecar_path(broken).write_text("{not json", encoding="utf-8")
     assert service.read_subtitle_sidecar(broken) is None
+
+
+def test_a_sidecar_bound_to_another_video_is_never_loaded(tmp_path):
+    service = RenderService()
+    video = tmp_path / "当前母版.mp4"
+    sidecar = service.subtitle_sidecar_path(video)
+    sidecar.write_text(json.dumps({
+        "video": "别的成片.mp4",
+        "cues": [{"start": 0, "end": 1, "text": "不应出现"}],
+    }, ensure_ascii=False), encoding="utf-8")
+
+    assert service.read_subtitle_sidecar(video) is None
+    assert service.read_subtitle_sidecar(sidecar, expected_video_path=video) is None
+
+
+@pytest.mark.parametrize("invalid_binding", ["", 123, ["成片.mp4"]])
+def test_a_present_malformed_video_binding_is_not_treated_as_legacy(
+    tmp_path, invalid_binding
+):
+    service = RenderService()
+    video = tmp_path / "成片.mp4"
+    service.subtitle_sidecar_path(video).write_text(
+        json.dumps({
+            "video": invalid_binding,
+            "cues": [{"start": 0, "end": 1, "text": "不能认领"}],
+        }, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    assert service.read_subtitle_sidecar(video) is None
+
+
+@pytest.mark.parametrize(
+    "invalid_cues",
+    [
+        {"start": 0, "end": 1, "text": "not a list"},
+        [{"start": 0, "end": 1}],
+        [{"start": "now", "end": 1, "text": "bad time"}],
+        [{"start": 1, "end": 1, "text": "zero duration"}],
+        [{"start": 2, "end": 1, "text": "backwards"}],
+        [{"start": 0, "end": 1, "text": "   "}],
+    ],
+)
+def test_malformed_or_non_visible_cues_fail_closed(invalid_cues, tmp_path):
+    service = RenderService()
+    video = tmp_path / "strict-sidecar.mp4"
+    service.subtitle_sidecar_path(video).write_text(
+        json.dumps({"video": video.name, "cues": invalid_cues}),
+        encoding="utf-8",
+    )
+
+    assert service.read_subtitle_sidecar(video) is None
+
+
+def test_blank_cues_do_not_create_subtitle_artifacts_or_a_master(tmp_path):
+    service = RenderService()
+    timeline = EditTimeline(
+        title="blank subtitle",
+        output_path=str(tmp_path / "成片.mp4"),
+        clips=[TimelineClip(
+            media_id="m", source_path=str(tmp_path / "source.mp4"),
+            start=0, duration=1, timeline_start=0,
+        )],
+        subtitles=SubtitleTrack(cues=[SubtitleCue(start=0, end=0.8, text=" \t ")]),
+    )
+
+    assert service.output_subtitle_cues(timeline) == []
+    assert service.write_subtitle_script(timeline) is None
+    assert asyncio.run(service.render_master(timeline)) is None
+    assert not (tmp_path / "成片.ass").exists()
+    assert not (tmp_path / "成片.subtitles.json").exists()
+    assert not (tmp_path / "成片 母版.mp4").exists()
+
+
+def test_subtitle_data_write_failure_aborts_before_creating_ass(monkeypatch, tmp_path):
+    timeline = EditTimeline(
+        title="sidecar failure",
+        output_path=str(tmp_path / "成片.mp4"),
+        clips=[TimelineClip(
+            media_id="m", source_path=str(tmp_path / "source.mp4"),
+            start=0, duration=1, timeline_start=0,
+        )],
+        subtitles=SubtitleTrack(cues=[SubtitleCue(start=0, end=0.8, text="一句")]),
+    )
+    monkeypatch.setattr(
+        "automated_video_editing_backend.services.render.write_json",
+        lambda *_args, **_kwargs: False,
+    )
+
+    with pytest.raises(RuntimeError, match="字幕数据无法保存"):
+        RenderService().write_subtitle_script(timeline)
+
+    assert not (tmp_path / "成片.ass").exists()
+
+
+def test_failed_delivery_render_removes_partial_video_and_subtitle_family(
+    monkeypatch, tmp_path
+):
+    service = RenderService()
+    output = tmp_path / "失败成片.mp4"
+    timeline = EditTimeline(
+        title="failed delivery",
+        output_path=str(output),
+        clips=[TimelineClip(
+            media_id="m", source_path=str(tmp_path / "source.mp4"),
+            start=0, duration=1, timeline_start=0,
+        )],
+        subtitles=SubtitleTrack(cues=[SubtitleCue(start=0, end=0.8, text="一句")]),
+    )
+
+    async def fail_after_opening_target(args):
+        Path(args[-1]).write_bytes(b"partial mp4")
+        raise RuntimeError("simulated decoder failure")
+
+    monkeypatch.setattr(service, "supports_subtitles", lambda: True)
+    monkeypatch.setattr(service, "_run", fail_after_opening_target)
+
+    with pytest.raises(RuntimeError, match="decoder failure"):
+        asyncio.run(service.render(timeline))
+
+    assert not output.exists()
+    assert not output.with_suffix(".ass").exists()
+    assert not output.with_suffix(".subtitles.json").exists()
+
+
+def test_delivery_render_never_overwrites_an_existing_family_member(
+    monkeypatch, tmp_path
+):
+    service = RenderService()
+    output = tmp_path / "已有成片.mp4"
+    existing_sidecar = output.with_suffix(".subtitles.json")
+    existing_sidecar.write_text('{"video": "older.mp4"}', encoding="utf-8")
+    timeline = EditTimeline(
+        title="collision",
+        output_path=str(output),
+        clips=[TimelineClip(
+            media_id="m", source_path=str(tmp_path / "source.mp4"),
+            start=0, duration=1, timeline_start=0,
+        )],
+    )
+    called = False
+
+    async def should_not_run(_args):
+        nonlocal called
+        called = True
+
+    monkeypatch.setattr(service, "_run", should_not_run)
+
+    with pytest.raises(RuntimeError, match="目标文件已存在"):
+        asyncio.run(service.render(timeline))
+
+    assert called is False
+    assert existing_sidecar.read_text(encoding="utf-8") == '{"video": "older.mp4"}'
+    assert not output.exists()
 
 
 def test_the_two_ways_of_placing_narration_do_not_interfere(tmp_path):
@@ -442,6 +777,273 @@ def test_a_subtitled_export_also_yields_a_clean_master(tmp_path, source, ffmpeg)
     assert np.count_nonzero(top > 40) == 0, "the master is a different edit, not just untitled"
 
 
+def test_master_is_not_reported_when_its_canonical_subtitles_cannot_be_saved(
+    monkeypatch, tmp_path,
+):
+    service = RenderService()
+    timeline = EditTimeline(
+        title="master sidecar failure",
+        output_path=str(tmp_path / "成片.mp4"),
+        clips=[TimelineClip(
+            media_id="m", source_path=str(tmp_path / "source.mp4"),
+            start=0, duration=1, timeline_start=0,
+        )],
+        subtitles=SubtitleTrack(cues=[SubtitleCue(start=0, end=0.8, text="一句")]),
+    )
+    service.write_subtitle_script(timeline)
+
+    async def fake_run(args):
+        Path(args[-1]).write_bytes(b"rendered master")
+
+    monkeypatch.setattr(service, "_run", fake_run)
+    monkeypatch.setattr(
+        "automated_video_editing_backend.services.render.write_json",
+        lambda *_args, **_kwargs: False,
+    )
+
+    with pytest.raises(RuntimeError, match="母版字幕数据无法保存"):
+        asyncio.run(service.render_master(timeline))
+
+    assert not (tmp_path / "成片 母版.mp4").exists()
+    assert not (tmp_path / "成片 母版.subtitles.json").exists()
+
+
+def test_cancelled_master_render_removes_partial_output(monkeypatch, tmp_path):
+    service = RenderService()
+    timeline = EditTimeline(
+        title="cancelled master",
+        output_path=str(tmp_path / "成片.mp4"),
+        clips=[TimelineClip(
+            media_id="m", source_path=str(tmp_path / "source.mp4"),
+            start=0, duration=1, timeline_start=0,
+        )],
+        subtitles=SubtitleTrack(cues=[SubtitleCue(start=0, end=0.8, text="一句")]),
+    )
+
+    async def cancelled_run(args):
+        Path(args[-1]).write_bytes(b"partial master")
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(service, "_run", cancelled_run)
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(service.render_master(timeline))
+
+    assert not (tmp_path / "成片 母版.mp4").exists()
+    assert not (tmp_path / "成片 母版.subtitles.json").exists()
+
+
+def test_master_never_rebinds_another_videos_subtitle_layer(monkeypatch, tmp_path):
+    service = RenderService()
+    timeline = EditTimeline(
+        title="mismatched master sidecar",
+        output_path=str(tmp_path / "成片.mp4"),
+        clips=[TimelineClip(
+            media_id="m", source_path=str(tmp_path / "source.mp4"),
+            start=0, duration=1, timeline_start=0,
+        )],
+        subtitles=SubtitleTrack(cues=[SubtitleCue(start=0, end=0.8, text="一句")]),
+    )
+    service.subtitle_sidecar_path(timeline.output_path).write_text(
+        json.dumps({
+            "video": "别的成片.mp4",
+            "cues": [{"start": 0, "end": 0.8, "text": "不应继承"}],
+        }, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    async def fake_run(args):
+        Path(args[-1]).write_bytes(b"rendered master")
+
+    monkeypatch.setattr(service, "_run", fake_run)
+
+    with pytest.raises(RuntimeError, match="属于另一个成片"):
+        asyncio.run(service.render_master(timeline))
+
+    assert not (tmp_path / "成片 母版.mp4").exists()
+    assert not (tmp_path / "成片 母版.subtitles.json").exists()
+
+
+def test_master_rejects_a_present_malformed_video_binding(monkeypatch, tmp_path):
+    service = RenderService()
+    timeline = EditTimeline(
+        title="malformed master sidecar",
+        output_path=str(tmp_path / "成片.mp4"),
+        clips=[TimelineClip(
+            media_id="m", source_path=str(tmp_path / "source.mp4"),
+            start=0, duration=1, timeline_start=0,
+        )],
+        subtitles=SubtitleTrack(cues=[SubtitleCue(start=0, end=0.8, text="一句")]),
+    )
+    service.subtitle_sidecar_path(timeline.output_path).write_text(
+        json.dumps({
+            "video": 123,
+            "cues": [{"start": 0, "end": 0.8, "text": "不应继承"}],
+        }, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    async def fake_run(args):
+        Path(args[-1]).write_bytes(b"rendered master")
+
+    monkeypatch.setattr(service, "_run", fake_run)
+
+    with pytest.raises(RuntimeError, match="video 绑定无效"):
+        asyncio.run(service.render_master(timeline))
+
+    assert not (tmp_path / "成片 母版.mp4").exists()
+    assert not (tmp_path / "成片 母版.subtitles.json").exists()
+
+
+def test_a_future_export_survives_restart_and_can_be_recut_from_its_master(
+    tmp_path, source, ffmpeg,
+):
+    """Exercise the complete boundary the UI relies on, not only each file in isolation.
+
+    A future render writes a delivery, a clean master and their cue layers; the backend then
+    restarts and has to rediscover which file is safe to re-cut.  手动微调 takes the master's
+    mixed soundtrack as one bed and draws the retained cues over the newly assembled picture.
+    """
+    from uuid import uuid4
+
+    from automated_video_editing_backend.core.paths import generated_path
+    from automated_video_editing_backend.services.media import MediaService
+
+    renderer = RenderService()
+    stem = f"subtitle-restart-{uuid4().hex[:8]}"
+    delivery = generated_path("exports", f"{stem}.mp4")
+    master = generated_path("exports", f"{stem} 母版.mp4")
+    voiceover = tmp_path / "reviewed-voice.wav"
+    subprocess.run(
+        [ffmpeg, "-y", "-v", "error", "-f", "lavfi", "-i",
+         "sine=frequency=440:sample_rate=48000:duration=2.9", str(voiceover)],
+        check=True,
+    )
+    expected = SubtitleTrack(
+        cues=[
+            SubtitleCue(start=0.25, end=1.15, text="六和桥"),
+            SubtitleCue(start=1.35, end=2.55, text="OPC 展台"),
+        ],
+        font="noto_sans_sc",
+        size=0.052,
+        side_margin=0.09,
+        bottom_margin=0.11,
+        outline=0.08,
+        shadow=0.03,
+        primary_colour="FFF4CC",
+        outline_colour="101010",
+        max_lines=2,
+    )
+    timeline = EditTimeline(
+        title="restart source",
+        output_path=str(delivery),
+        output_width=640,
+        output_height=360,
+        clips=[TimelineClip(
+            media_id="source", source_path=source, start=0, duration=2.9, timeline_start=0,
+        )],
+        voiceover_path=str(voiceover),
+        subtitles=expected,
+    )
+    companions = [
+        delivery,
+        master,
+        delivery.with_suffix(".ass"),
+        delivery.with_suffix(".subtitles.json"),
+        master.with_suffix(".subtitles.json"),
+    ]
+
+    try:
+        assert asyncio.run(renderer.render(timeline)) == str(delivery)
+        assert asyncio.run(renderer.render_master(timeline)) == str(master)
+
+        library = tmp_path / "media-library.json"
+        media = MediaService(path=library)
+        group = f"export:{uuid4()}"
+        media.register_generated_path(delivery, kind="video", metadata={
+            "source": "exports",
+            "role": "export",
+            "export_group": group,
+            "variant": "subtitled",
+            "variant_label": "成片（带字幕）",
+            "subtitles_path": str(delivery.with_suffix(".subtitles.json")),
+            "has_burned_subtitles": True,
+            "has_voiceover": True,
+        })
+        media.register_generated_path(master, kind="video", metadata={
+            "source": "exports",
+            "role": "export",
+            "export_group": group,
+            "variant": "master",
+            "variant_label": "母版（无字幕）",
+            "subtitles_path": str(master.with_suffix(".subtitles.json")),
+            "has_burned_subtitles": False,
+            "has_voiceover": True,
+        })
+
+        # Reconstructing MediaService is the backend-restart boundary. These are precisely the
+        # metadata lookup and sidecar read performed by GET /subtitles/track.
+        reopened = MediaService(path=library)
+        restored = next(item for item in reopened.list_items() if item.path == str(master))
+        assert restored.metadata["variant"] == "master"
+        assert restored.metadata["has_burned_subtitles"] is False
+        assert restored.metadata["has_voiceover"] is True
+        payload = renderer.read_subtitle_sidecar(restored.metadata["subtitles_path"])
+        assert payload is not None
+        assert payload["cues"] == [cue.model_dump() for cue in expected.cues]
+        for field in (
+            "font", "size", "side_margin", "bottom_margin", "outline", "shadow",
+            "primary_colour", "outline_colour", "max_lines",
+        ):
+            assert payload[field] == getattr(expected, field)
+
+        carried = SubtitleTrack.model_validate({
+            field: payload[field]
+            for field in (
+                "cues", "font", "size", "side_margin", "bottom_margin", "outline", "shadow",
+                "primary_colour", "outline_colour", "max_lines",
+            )
+        })
+        recut_delivery = tmp_path / "微调成片.mp4"
+        recut = EditTimeline(
+            title="微调成片",
+            output_path=str(recut_delivery),
+            output_width=640,
+            output_height=360,
+            clips=[TimelineClip(
+                media_id=restored.id, source_path=restored.path,
+                start=0, duration=2.8, timeline_start=0,
+            )],
+            audio_bed=TimelineAudioBed(
+                source_path=restored.path, source_start=0, timeline_start=0,
+                has_voiceover=True,
+            ),
+            subtitles=carried,
+        )
+        assert asyncio.run(renderer.render(recut)) == str(recut_delivery)
+        recut_master = asyncio.run(renderer.render_master(recut))
+        assert recut_master == str(tmp_path / "微调成片 母版.mp4")
+        assert renderer.read_subtitle_sidecar(recut_delivery)["cues"] == payload["cues"]
+        assert renderer.read_subtitle_sidecar(recut_master)["cues"] == payload["cues"]
+
+        def frame_at(path: str | Path, name: str):
+            frame = tmp_path / f"{name}.png"
+            subprocess.run(
+                [ffmpeg, "-y", "-v", "error", "-ss", "0.7", "-i", str(path),
+                 "-frames:v", "1", "-update", "1", str(frame)],
+                check=True,
+            )
+            return cv2.imread(str(frame), cv2.IMREAD_GRAYSCALE)
+
+        rendered = frame_at(recut_delivery, "recut-delivery")
+        clean = frame_at(recut_master, "recut-master")
+        assert rendered is not None and clean is not None
+        assert np.count_nonzero(cv2.absdiff(rendered, clean) > 40) > 300
+    finally:
+        for path in companions:
+            path.unlink(missing_ok=True)
+
+
 def test_subtitle_sidecar_records_that_its_soundtrack_contains_voiceover(tmp_path):
     timeline = EditTimeline(
         title="voice metadata",
@@ -539,6 +1141,182 @@ def test_a_word_without_timing_is_dropped_rather_than_defaulted():
         {"word": "空", "start_time": "later", "end_time": 1600},
     ]
     assert subtitles.normalise_words(records) == [("好", 1.0, 1.2)]
+
+
+def test_sidecar_restores_reviewed_characters_without_changing_provider_timing(tmp_path):
+    sidecar = tmp_path / "voice.json"
+    sidecar.write_text(json.dumps({
+        "text": "六和桥OPC",
+        "words": [
+            {"word": "六合桥", "start_time": 100, "end_time": 700},
+            {"word": "opc", "start_time": 720, "end_time": 1300},
+        ],
+    }, ensure_ascii=False), encoding="utf-8")
+
+    words, problem = subtitles.load_words(sidecar)
+
+    assert problem is None
+    assert [word["word"] for word in words] == ["六和桥", "OPC"]
+    assert words[0]["start_time"] == 100
+    assert words[0]["end_time"] == 700
+    assert words[1]["start_time"] == 720
+    assert words[1]["end_time"] == 1300
+
+
+def test_reordered_equal_length_labels_use_safe_proportional_timing():
+    source = "今天经过六和桥"
+    words = subtitles.restore_source_spelling([
+        {"word": "今经过天", "start_time": 100, "end_time": 700},
+        {"word": "六合桥", "start_time": 720, "end_time": 1300},
+    ], source)
+
+    # Equal character count is not sufficient evidence: the moved 天 produces both an insert
+    # and a delete in sequence alignment, so the source is spread safely over the spoken range.
+    assert "".join(word["word"] for word in words) == source
+    assert [word["word"] for word in words] == list(source)
+    assert words[0]["start_time"] == 100
+    assert words[-1]["end_time"] == 1300
+    assert all(
+        first["start_time"] <= first["end_time"] <= second["end_time"]
+        for first, second in itertools.pairwise(words)
+    )
+
+
+def test_missing_provider_character_is_aligned_to_neighbouring_token():
+    source = "欢迎来到六和桥"
+    words = subtitles.restore_source_spelling([
+        {"word": "欢迎来到", "start_time": 0, "end_time": 500},
+        {"word": "六合", "start_time": 520, "end_time": 900},
+    ], source)
+
+    assert [word["word"] for word in words] == ["欢迎来到", "六和桥"]
+    assert words[1]["start_time"] == 520
+    assert words[1]["end_time"] == 900
+
+
+def test_unrelated_equal_length_labels_never_replace_reviewed_source_by_position():
+    words = subtitles.restore_source_spelling([
+        {"word": "完全错", "start_time": 0, "end_time": 900},
+    ], "六和桥")
+
+    assert [word["word"] for word in words] == ["六", "和", "桥"]
+    assert words[0]["start_time"] == 0
+    assert words[-1]["end_time"] == 900
+
+
+@pytest.mark.parametrize(
+    "bad_token",
+    [
+        "not an object",
+        {"word": "欢迎", "end_time": 1100},
+        {"word": "", "start_time": 720, "end_time": 1100},
+        {"word": "欢迎", "start_time": "later", "end_time": 1100},
+        {"word": "欢迎", "start_time": float("nan"), "end_time": 1100},
+        {"word": "欢迎", "start_time": 1200, "end_time": 1100},
+    ],
+)
+def test_one_bad_provider_token_never_restores_provider_spelling(bad_token):
+    source = "六和桥欢迎您"
+    words = subtitles.restore_source_spelling([
+        {"word": "六合桥", "start_time": 100, "end_time": 700},
+        bad_token,
+        {"word": "您", "start_time": 1300, "end_time": 1500},
+    ], source)
+
+    assert "".join(word["word"] for word in words) == source
+    assert "六合桥" not in "".join(word["word"] for word in words)
+    assert words[0]["start_time"] == 100
+    assert words[-1]["end_time"] == 1500
+    assert all(
+        first["start_time"] <= first["end_time"] <= second["end_time"]
+        and first["start_time"] <= second["start_time"]
+        for first, second in itertools.pairwise(words)
+    )
+
+
+def test_rebuilt_reviewed_text_preserves_meaningful_spaces():
+    source = "OPC 六和桥 欢迎您"
+    words = subtitles.restore_source_spelling([
+        {"word": "opc", "start_time": 0, "end_time": 450},
+        {"word": "损坏", "end_time": 900},
+        {"word": "您", "start_time": 1100, "end_time": 1500},
+    ], source, duration_ms=1500)
+
+    assert "".join(word["word"] for word in words) == source
+    spoken = subtitles.normalise_words(words)
+    assert "".join(word for word, _start, _end in spoken) == source
+    cues = subtitles.build_cues(spoken, capacity=100)
+    assert [cue.text for cue in cues] == [source]
+
+
+def test_truncated_provider_fragment_cannot_compress_a_full_reviewed_sentence(tmp_path):
+    sidecar = tmp_path / "truncated-voice.json"
+    sidecar.write_text(json.dumps({
+        "text": "六和桥欢迎您参观今天的展览",
+        "duration_ms": 5000,
+        "words": [
+            {"word": "六合桥", "start_time": 0, "end_time": 120},
+            {"word": "损坏", "end_time": 4000},
+        ],
+    }, ensure_ascii=False), encoding="utf-8")
+
+    words, problem = subtitles.load_words(sidecar)
+
+    assert words == []
+    assert "时间戳损坏" in problem
+
+
+def test_out_of_order_provider_times_rebuild_reviewed_text_in_spoken_order():
+    words = subtitles.restore_source_spelling([
+        {"word": "六", "start_time": 700, "end_time": 900},
+        {"word": "合", "start_time": 100, "end_time": 300},
+        {"word": "桥", "start_time": 1000, "end_time": 1200},
+    ], "六和桥")
+
+    assert "".join(word["word"] for word in words) == "六和桥"
+    assert [word["start_time"] for word in words] == sorted(
+        word["start_time"] for word in words
+    )
+    assert words[0]["start_time"] == 100
+    assert words[-1]["end_time"] == 1200
+
+
+def test_all_invalid_provider_tokens_fail_closed_without_provider_text(tmp_path):
+    sidecar = tmp_path / "unsafe-voice.json"
+    sidecar.write_text(json.dumps({
+        "text": "六和桥",
+        "words": [{"word": "六合桥", "end_time": 700}],
+    }, ensure_ascii=False), encoding="utf-8")
+
+    words, problem = subtitles.load_words(sidecar)
+
+    assert words == []
+    assert "时间戳损坏" in problem
+
+
+def test_provider_labels_fail_closed_when_reviewed_source_text_is_missing(tmp_path):
+    sidecar = tmp_path / "unsafe-provider-only-voice.json"
+    sidecar.write_text(json.dumps({
+        "words": [{"word": "六合桥", "start_time": 100, "end_time": 700}],
+    }, ensure_ascii=False), encoding="utf-8")
+
+    words, problem = subtitles.load_words(sidecar)
+
+    assert words == []
+    assert "时间戳损坏" in problem
+
+
+def test_final_short_cue_does_not_outlive_the_last_spoken_word():
+    cues = subtitles.cues_from_words(
+        [{"word": "好", "start_time": 100, "end_time": 280}],
+        subtitles.SubtitleStyle(),
+        1280,
+        720,
+    )
+
+    assert len(cues) == 1
+    assert cues[0].start == pytest.approx(0.1)
+    assert cues[0].end == pytest.approx(0.28)
 
 
 def test_asking_for_subtitles_without_a_voiceover_says_so(tmp_path):

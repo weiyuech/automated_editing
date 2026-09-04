@@ -4,9 +4,10 @@ import asyncio
 import json
 import random
 import time
+from collections.abc import Callable
 from contextlib import suppress
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 from automated_video_editing_backend.core.events import EventHub
 from automated_video_editing_backend.core.models import (
@@ -475,38 +476,49 @@ class CruiseService:
     def _adaptive_yaw_target(self, current: float, config: CameraworkConfig) -> float:
         """Pick the exact large-opposite/small-outward movement requested by operators.
 
-        Positive yaw is physical left in this protocol. Therefore a value above the midpoint
-        is left of the configured frame: its large move subtracts toward the right boundary,
-        while its optional outward move adds only a small fraction of the remaining left room.
-        The decision is repeated from the real current pose for every leg, not once per cruise.
+        Positive yaw is physical left in this protocol and negative yaw is physical right,
+        regardless of whether the configured interval is symmetric. A left-side pose therefore
+        moves broadly toward the right boundary, or uses only a small fraction of its remaining
+        left room; the right-side case mirrors it. Every leg re-reads the real current pose.
         """
         low, high = config.yaw_min, config.yaw_max
         current = _clamp(current, low, high)
-        midpoint = (low + high) / 2.0
-        span = high - low
-        deadband = max(1.0, span * 0.05)
-
-        if current > midpoint + deadband:  # physically left
+        # Left/right is a physical protocol convention, not a property of the operator's
+        # configured interval: positive yaw is left and negative yaw is right.  Using the
+        # interval midpoint reverses the bias for valid asymmetric ranges (for example +5°
+        # inside -10°..+50° is still physically left, even though it is below +20°).
+        if current > 0:  # physically left
             inward_room = current - low
             outward_room = high - current
-            if outward_room <= 0.1 or random.random() < _CW_OPPOSITE_PROB:
+            choose_opposite = inward_room > 0.1 and (
+                outward_room <= 0.1 or random.random() < _CW_OPPOSITE_PROB
+            )
+            if choose_opposite:
                 distance = max(1.0, random.uniform(*_CW_OPPOSITE_DISTANCE) * inward_room)
                 return round(_clamp(current - distance, low, high))
             distance = max(1.0, random.uniform(*_CW_OUTWARD_DISTANCE) * outward_room)
             return round(_clamp(current + distance, low, high))
 
-        if current < midpoint - deadband:  # physically right
+        if current < 0:  # physically right
             inward_room = high - current
             outward_room = current - low
-            if outward_room <= 0.1 or random.random() < _CW_OPPOSITE_PROB:
+            choose_opposite = inward_room > 0.1 and (
+                outward_room <= 0.1 or random.random() < _CW_OPPOSITE_PROB
+            )
+            if choose_opposite:
                 distance = max(1.0, random.uniform(*_CW_OPPOSITE_DISTANCE) * inward_room)
                 return round(_clamp(current + distance, low, high))
             distance = max(1.0, random.uniform(*_CW_OUTWARD_DISTANCE) * outward_room)
             return round(_clamp(current - distance, low, high))
 
-        # Around centre there is no "farther outward" side. Pick either physical direction
-        # equally, but still demand a visible medium/large sweep rather than camera jitter.
-        if random.random() < 0.5:
+        # At the physical centre there is no "farther outward" side. Pick either available
+        # direction equally, but still demand a visible medium/large sweep rather than jitter.
+        right_room = current - low
+        left_room = high - current
+        choose_right = right_room > 0.1 and (
+            left_room <= 0.1 or random.random() < 0.5
+        )
+        if choose_right:
             distance = max(1.0, random.uniform(*_CW_CENTER_DISTANCE) * (current - low))
             return round(_clamp(current - distance, low, high))
         distance = max(1.0, random.uniform(*_CW_CENTER_DISTANCE) * (high - current))
@@ -523,20 +535,29 @@ class CruiseService:
     def _pingpong_poses(
         self, current_yaw: float, config: CameraworkConfig,
     ) -> tuple[tuple[float, float], tuple[float, float]]:
-        """Return opposite-first endpoints, one clearly inside each half of the yaw range."""
+        """Return opposite-first endpoints on physical sides when the allowed range permits."""
         midpoint = (config.yaw_min + config.yaw_max) / 2.0
-        quarter = (config.yaw_max - config.yaw_min) * 0.25
+        span = config.yaw_max - config.yaw_min
+        quarter = span * 0.25
+        # Prefer genuinely negative/right and positive/left endpoints whenever the configured
+        # range contains them. A one-sided range falls back to its lower and upper quarters.
+        right_high = min(0.0, midpoint - quarter)
+        if right_high <= config.yaw_min:
+            right_high = config.yaw_min + quarter
+        left_low = max(0.0, midpoint + quarter)
+        if left_low >= config.yaw_max:
+            left_low = config.yaw_max - quarter
         right = (
-            round(random.uniform(config.yaw_min, midpoint - quarter)),
+            round(random.uniform(config.yaw_min, right_high)),
             random.randint(config.pitch_min, config.pitch_max),
         )
         left = (
-            round(random.uniform(midpoint + quarter, config.yaw_max)),
+            round(random.uniform(left_low, config.yaw_max)),
             random.randint(config.pitch_min, config.pitch_max),
         )
-        if current_yaw > midpoint:  # currently left: sweep right first
+        if current_yaw > 0:  # currently left: sweep right first
             return right, left
-        if current_yaw < midpoint:  # currently right: sweep left first
+        if current_yaw < 0:  # currently right: sweep left first
             return left, right
         return (right, left) if random.random() < 0.5 else (left, right)
 

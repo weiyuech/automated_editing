@@ -12,13 +12,13 @@ from automated_video_editing_backend.core.models import (
     CameraAngle,
     CameraworkConfig,
     CameraworkPreferenceSaveRequest,
-    GimbalMoveRequest,
     CruiseRequest,
     CruiseRouteSaveRequest,
     EditBatchRequest,
     EditJobRequest,
     EditTimeline,
     FramingPreferenceSaveRequest,
+    GimbalMoveRequest,
     MoveCommand,
     RobotGoalCommand,
     SeedanceFrameRequest,
@@ -26,6 +26,8 @@ from automated_video_editing_backend.core.models import (
     SettingsUpdateRequest,
     TimelineDraftRequest,
     TTSGenerateRequest,
+    VoiceoverDraftRequest,
+    VoiceoverDraftResult,
 )
 from automated_video_editing_backend.core.paths import RootPathError, ensure_inside_root
 from automated_video_editing_backend.core.security import require_http_token, token_matches
@@ -73,6 +75,20 @@ class SwitchMapRequest(BaseModel):
 
 class RenameMediaRequest(BaseModel):
     name: str
+
+
+class MediaPoolUpdateRequest(BaseModel):
+    source_media_ids: list[str] = Field(default_factory=list, max_length=10_000)
+    music_media_ids: list[str] = Field(default_factory=list, max_length=10_000)
+    voiceover_media_ids: list[str] = Field(default_factory=list, max_length=10_000)
+    effect_media_ids: list[str] = Field(default_factory=list, max_length=10_000)
+
+
+class MediaTrashPreflightRequest(BaseModel):
+    paths: list[Annotated[str, Field(min_length=1, max_length=4096)]] = Field(
+        min_length=1,
+        max_length=1000,
+    )
 
 
 class AdminUnlockRequest(BaseModel):
@@ -163,6 +179,10 @@ def build_router(
         x_admin_token: str | None = Header(default=None),
     ) -> None:
         admin_access.require(x_admin_token)
+
+    def require_consistent_export_library() -> None:
+        if media.generated_metadata_problem:
+            raise HTTPException(status_code=409, detail=media.generated_metadata_problem)
 
     @router.get("/health")
     async def health(_: Secured = None) -> dict[str, str]:
@@ -417,23 +437,50 @@ def build_router(
 
     @router.get("/media")
     async def media_list(_: Secured = None):
+        require_consistent_export_library()
         return media.list_items()
+
+    @router.get("/media/pool")
+    async def media_pool(_: Secured = None):
+        return media.media_pool()
+
+    @router.put("/media/pool")
+    async def media_pool_update(request: MediaPoolUpdateRequest, _: Secured = None):
+        try:
+            return media.update_media_pool(request.model_dump())
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @router.get("/media/vault")
     async def media_vault(_: Secured = None):
+        require_consistent_export_library()
         return vault.list_assets()
 
     @router.get("/media/calendar")
     async def media_calendar(_: Secured = None):
+        require_consistent_export_library()
         return vault.calendar()
 
     @router.get("/media/storage")
     async def media_storage(_: Secured = None):
+        require_consistent_export_library()
         return vault.storage_report()
 
     @router.post("/media/cleanup-safe")
     async def media_cleanup_safe(_: Secured = None):
         return vault.safe_cleanup()
+
+    @router.post("/media/trash-preflight")
+    async def media_trash_preflight(
+        request: MediaTrashPreflightRequest, _: Secured = None
+    ):
+        """Refuse a desktop trash operation while an accepted edit still owns any path."""
+        if any(jobs.is_path_in_use(path) for path in dict.fromkeys(request.paths)):
+            raise HTTPException(
+                status_code=409,
+                detail="An editing job is using this media right now",
+            )
+        return {"ready": True}
 
     @router.post("/media/{media_id}/rename")
     async def media_rename(media_id: str, request: RenameMediaRequest, _: Secured = None):
@@ -446,6 +493,12 @@ def build_router(
     @router.post("/media/{media_id}/forget")
     async def media_forget(media_id: str, _: Secured = None):
         """Remove an imported clip from the library without touching the file on disk."""
+        selected = media.get(media_id)
+        if selected is not None and jobs.is_path_in_use(selected.path):
+            raise HTTPException(
+                status_code=409,
+                detail="An editing job is using this media right now",
+            )
         item = media.forget(media_id)
         if item is None:
             raise HTTPException(
@@ -515,12 +568,22 @@ def build_router(
         sidecar = (item.metadata or {}).get("subtitles_path")
         # Falling back to the paired name covers an export made before this was recorded, and
         # one picked up by a library scan rather than registered by the job that made it.
-        track = jobs.renderer.read_subtitle_sidecar(sidecar or item.path)
+        requested_sidecar = sidecar or item.path
+        paired_sidecar = jobs.renderer.subtitle_sidecar_path(requested_sidecar)
+        track = jobs.renderer.read_subtitle_sidecar(
+            requested_sidecar,
+            expected_video_path=item.path,
+        )
         # "This export never had subtitles" and "its cue file has gone missing" both arrive here
         # as an empty track, and they are not the same news. Only the second means the operator
         # is about to re-cut something and silently lose words it used to have.
         problem = ""
-        if track is None and sidecar:
+        if track is None and paired_sidecar.exists():
+            problem = (
+                "这个成片旁边存在字幕数据，但文件已损坏、内容为空或不属于该成片；"
+                "为避免静默丢失字幕，已停止按无字幕处理。"
+            )
+        elif track is None and sidecar:
             problem = "这个成片记录过字幕，但字幕文件已经找不到了，重新剪不会带上字幕。"
         return {
             "media_id": media_id,
@@ -603,7 +666,35 @@ def build_router(
 
     @router.get("/tts/quota")
     async def tts_quota(_: Secured = None):
-        return tts.quota()
+        try:
+            return tts.quota()
+        except RuntimeError as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    @router.post("/tts/draft", response_model=VoiceoverDraftResult)
+    async def tts_draft(request: VoiceoverDraftRequest, _: Secured = None):
+        """Create an LLM draft without synthesising or spending TTS quota.
+
+        Drafting and synthesis are intentionally separate API actions: the operator must be
+        able to compare the source with the result, edit it, and explicitly choose which text
+        becomes customer-facing speech.
+        """
+        try:
+            source_text = request.text.strip()
+            if not source_text:
+                raise ValueError("Voiceover needs text")
+            draft_text = await llm.draft_voiceover(source_text, request.target_seconds)
+            if not draft_text.strip():
+                raise ValueError("Nothing usable was found in the text")
+            return VoiceoverDraftResult(
+                source_text=source_text,
+                draft_text=draft_text.strip(),
+                target_seconds=request.target_seconds,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except RuntimeError as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
 
     @router.post("/tts/generate")
     async def tts_generate(request: TTSGenerateRequest, _: Secured = None):
@@ -614,15 +705,15 @@ def build_router(
                 raise ValueError("Voiceover needs text")
 
             if request.use_llm:
-                final_text = await llm.draft_voiceover(request.text, request.target_seconds)
-            else:
-                final_text = request.text
-
-            if not final_text.strip():
-                raise ValueError("Nothing usable was found in the text")
-            return await tts.synthesize(request, final_text)
+                # The old endpoint rewrote and synthesised in one paid action. Keep the field
+                # for a clear compatibility error, but never let a caller bypass /tts/draft and
+                # the operator's explicit version choice.
+                raise ValueError("Voiceover draft must be reviewed before synthesis")
+            return await tts.synthesize(request, request.text)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except RuntimeError as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
 
     @router.get("/seedance/assets")
     async def seedance_assets(_: Secured = None):
@@ -630,10 +721,21 @@ def build_router(
 
     @router.get("/seedance/quota")
     async def seedance_quota(_: Secured = None):
-        return seedance.quota()
+        try:
+            return seedance.quota()
+        except RuntimeError as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
 
     @router.delete("/seedance/assets/{asset_id}")
     async def seedance_delete(asset_id: str, _: Secured = None):
+        asset = seedance.get_asset(asset_id)
+        if asset is None:
+            raise HTTPException(status_code=404, detail="Effect not found")
+        if asset.output_path and jobs.is_path_in_use(asset.output_path):
+            raise HTTPException(
+                status_code=409,
+                detail="An editing job is using this media right now",
+            )
         if not seedance.delete_asset(asset_id):
             raise HTTPException(status_code=404, detail="Effect not found")
         return {"deleted": True}
@@ -644,6 +746,8 @@ def build_router(
             return await seedance.extract_frame(request.source_video_media_id, request.timestamp_seconds)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except RuntimeError as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
 
     @router.post("/seedance/generate")
     async def seedance_generate(request: SeedanceGenerateRequest, _: Secured = None):
@@ -651,5 +755,7 @@ def build_router(
             return await seedance.generate(request)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except RuntimeError as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
 
     return router

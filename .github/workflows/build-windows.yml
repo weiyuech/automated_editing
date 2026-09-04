@@ -112,6 +112,10 @@ jobs:
         working-directory: frontend
         run: pnpm install --frozen-lockfile
 
+      - name: Test Electron filesystem boundaries
+        working-directory: frontend
+        run: pnpm run test:main
+
       - name: Build Windows installer
         working-directory: frontend
         run: pnpm run dist:win
@@ -180,6 +184,57 @@ jobs:
       - name: Add test-only FFmpeg to PATH
         run: echo "$GITHUB_WORKSPACE/backend/vendor/ffmpeg/win64" >> "$GITHUB_PATH"
 
+      - name: Verify OpenCV can decode video
+        run: |
+          python - <<'PY'
+          import cv2
+          import shutil
+          import subprocess
+          import tempfile
+          from pathlib import Path
+
+          ffmpeg_line = next(
+              (line.strip() for line in cv2.getBuildInformation().splitlines()
+               if line.strip().startswith("FFMPEG:")),
+              "FFMPEG: UNKNOWN",
+          )
+          if not ffmpeg_line.endswith("YES"):
+              raise SystemExit(
+                  f"External-tools runtime cannot decode H.264 through OpenCV ({ffmpeg_line})."
+              )
+
+          ffmpeg = shutil.which("ffmpeg")
+          if not ffmpeg:
+              raise SystemExit("Test-only FFmpeg is missing from PATH.")
+          with tempfile.TemporaryDirectory() as directory:
+              fixture = Path(directory) / "opencv-h264-smoke.mp4"
+              subprocess.run(
+                  [
+                      ffmpeg,
+                      "-hide_banner",
+                      "-loglevel", "error",
+                      "-f", "lavfi",
+                      "-i", "color=c=black:s=64x64:d=0.4:r=5",
+                      "-c:v", "libx264",
+                      "-pix_fmt", "yuv420p",
+                      "-y", str(fixture),
+                  ],
+                  check=True,
+              )
+              capture = cv2.VideoCapture(str(fixture))
+              try:
+                  opened = capture.isOpened()
+                  decoded, frame = capture.read()
+              finally:
+                  capture.release()
+              if not opened or not decoded or frame is None or frame.size == 0:
+                  raise SystemExit(
+                      f"OpenCV advertised FFmpeg but failed to decode an actual H.264 frame "
+                      f"({ffmpeg_line})."
+                  )
+          print(f"OpenCV decoded an actual H.264 frame ({ffmpeg_line}).")
+          PY
+
       - name: Verify retained runtime assets
         run: |
           python - <<'PY'
@@ -234,6 +289,10 @@ jobs:
       - name: Install frontend dependencies
         working-directory: frontend
         run: pnpm install --frozen-lockfile
+
+      - name: Test Electron filesystem boundaries
+        working-directory: frontend
+        run: pnpm run test:main
 
       - name: Build external-media-tools installer
         working-directory: frontend

@@ -1,6 +1,11 @@
-from pathlib import Path
-import pytest
+import asyncio
+import json
+import shutil
 import tempfile
+from pathlib import Path
+from uuid import uuid4
+
+import pytest
 from pydantic import ValidationError
 
 from automated_video_editing_backend.core.models import (
@@ -10,9 +15,18 @@ from automated_video_editing_backend.core.models import (
     SettingsUpdateRequest,
     TTSGenerateRequest,
 )
+from automated_video_editing_backend.core.paths import generated_path
 from automated_video_editing_backend.services.media import MediaService
 from automated_video_editing_backend.services.settings import SettingsService
 from automated_video_editing_backend.services.tts import TTSService
+
+
+@pytest.fixture
+def tts_root():
+    root = generated_path("cache", "test-tts", uuid4().hex[:8])
+    root.mkdir(parents=True, exist_ok=True)
+    yield root
+    shutil.rmtree(root, ignore_errors=True)
 
 
 def test_settings_masks_and_preserves_blank_secrets(tmp_path):
@@ -160,12 +174,12 @@ async def test_tts_generation_creates_audio_asset(monkeypatch, tmp_path):
     service.usage_path = tmp_path / "usage.json"  # keep the daily counter out of real data/tts
 
     async def fake_request(text):
-        return b"fake-mp3", {"duration_ms": 320, "words": [{"word": "你", "start_time": 0, "end_time": 120}], "phonemes": []}
+        return b"fake-mp3", {"duration_ms": 320, "words": [{"word": "六合桥", "start_time": 0, "end_time": 120}], "phonemes": []}
 
     monkeypatch.setattr(service, "_request_sync_tts", fake_request)
     result = await service.synthesize(
-        TTSGenerateRequest(title="unit voice", text="你好"),
-        "你好",
+        TTSGenerateRequest(title="unit voice", text="六和桥"),
+        "六和桥",
     )
 
     try:
@@ -173,11 +187,63 @@ async def test_tts_generation_creates_audio_asset(monkeypatch, tmp_path):
         assert result.asset.duration_ms == 320
         assert result.media_item.kind == "audio"
         assert result.media_item.metadata["role"] == "tts_voice"
-        assert result.words[0]["word"] == "你"
+        assert result.words[0]["word"] == "六和桥"
+        assert result.words[0]["start_time"] == 0
+        assert result.words[0]["end_time"] == 120
     finally:
         Path(result.asset.audio_path).unlink(missing_ok=True)
         if result.asset.metadata_path:
             Path(result.asset.metadata_path).unlink(missing_ok=True)
+
+
+@pytest.mark.asyncio
+async def test_tts_metadata_failure_never_publishes_orphan_audio(monkeypatch, tmp_path):
+    import automated_video_editing_backend.services.tts as tts_module
+
+    settings = SettingsService(path=tmp_path / "settings.json")
+    settings.replace_for_development({
+        "tts": {
+            "enabled": True,
+            "app_id": "app-id",
+            "access_token": "access-token",
+            "voice_type": "BV001_streaming",
+            "cluster": "volcano_tts",
+        }
+    })
+    media = MediaService(path=tmp_path / "media-library.json")
+    service = TTSService(settings, media)
+    service.tts_dir = tmp_path / "tts"
+    service.tts_dir.mkdir()
+    service.usage_path = tmp_path / "usage.json"
+    durable_write = tts_module.write_json
+
+    async def fake_request(_text):
+        return b"fake-mp3", {
+            "duration_ms": 320,
+            "words": [{"word": "六和桥", "start_time": 0, "end_time": 320}],
+            "phonemes": [],
+        }
+
+    monkeypatch.setattr(service, "_request_sync_tts", fake_request)
+    monkeypatch.setattr(
+        "automated_video_editing_backend.services.tts.ensure_inside_root",
+        lambda path: Path(path).resolve(),
+    )
+
+    def fail_only_metadata(path, payload):
+        if Path(path).parent == service.tts_dir:
+            return False
+        return durable_write(path, payload)
+
+    monkeypatch.setattr(tts_module, "write_json", fail_only_metadata)
+
+    with pytest.raises(RuntimeError, match="旁白文字和时间数据无法保存"):
+        await service.synthesize(TTSGenerateRequest(title="失败旁白", text="六和桥"), "六和桥")
+
+    assert list(service.tts_dir.iterdir()) == []
+    assert service.list_assets() == []
+    assert service.quota().used == 1
+    assert service.quota().pending == 0
 
 
 def test_resource_id_is_derived_from_cluster(tmp_path):
@@ -193,6 +259,30 @@ def test_resource_id_is_derived_from_cluster(tmp_path):
     assert service._resource_id({"cluster": "volcano_icl", "resource_id": "volc.custom"}) == "volc.custom"
 
 
+def test_tts_duration_falls_back_to_the_latest_valid_word_timestamp(tmp_path):
+    service = TTSService(
+        SettingsService(path=tmp_path / "settings.json"),
+        MediaService(path=tmp_path / "media-library.json"),
+    )
+
+    assert service._duration_ms(
+        {},
+        [
+            {"word": "六和", "end_time": "720"},
+            {"word": "桥", "end_time": 1250.8},
+            {"word": "损坏", "end_time": "later"},
+        ],
+    ) == 1250
+    assert service._duration_ms(
+        {"duration": "0"},
+        [{"word": "六和桥", "end_time": 900}],
+    ) == 900
+    assert service._duration_ms(
+        {"duration": "640"},
+        [{"word": "六和桥", "end_time": 900}],
+    ) == 640
+
+
 @pytest.mark.asyncio
 async def test_cloned_voice_request_sends_resource_id_header(monkeypatch, tmp_path):
     """volcano_icl must carry X-Api-Resource-Id (or the cloned voice returns no timestamps);
@@ -204,7 +294,7 @@ async def test_cloned_voice_request_sends_resource_id_header(monkeypatch, tmp_pa
         text = ""
 
         def json(self):
-            return {"code": 3000, "data": "", "addition": {"duration": "100"}}
+            return {"code": 3000, "data": "ZmFrZQ==", "addition": {"duration": "100"}}
 
     class FakeClient:
         def __init__(self, *a, **k):
@@ -234,6 +324,67 @@ async def test_cloned_voice_request_sends_resource_id_header(monkeypatch, tmp_pa
                                          "voice_type": "BV001_streaming", "cluster": "volcano_tts"}})
     await TTSService(std, media)._request_sync_tts("你好")
     assert "X-Api-Resource-Id" not in captured["headers"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("encoded_audio", [None, "", "not-valid-base64%%%"])
+async def test_empty_or_invalid_provider_audio_never_publishes_but_keeps_reserved_quota(
+    monkeypatch,
+    tmp_path,
+    encoded_audio,
+):
+    settings = SettingsService(path=tmp_path / "settings.json")
+    settings.replace_for_development({"tts": {
+        "enabled": True,
+        "app_id": "a",
+        "access_token": "t",
+        "voice_type": "BV001_streaming",
+        "cluster": "volcano_tts",
+        "daily_limit": 1,
+    }})
+    media = MediaService(path=tmp_path / "media-library.json")
+    service = TTSService(settings, media)
+    service.tts_dir = tmp_path / "tts"
+    service.tts_dir.mkdir()
+    service.usage_path = tmp_path / "usage.json"
+
+    class FakeResponse:
+        status_code = 200
+        text = ""
+
+        def json(self):
+            return {
+                "code": 3000,
+                "data": encoded_audio,
+                "addition": {"duration": "100"},
+            }
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def post(self, *args, **kwargs):
+            return FakeResponse()
+
+    monkeypatch.setattr(
+        "automated_video_editing_backend.services.tts.httpx.AsyncClient",
+        FakeClient,
+    )
+
+    with pytest.raises(ValueError, match="音频"):
+        await service.synthesize(TTSGenerateRequest(title="bad", text="六和桥"), "六和桥")
+
+    assert service.quota().used == 1
+    assert service.quota().pending == 0
+    assert list(service.tts_dir.iterdir()) == []
+    assert service.usage_path.exists()
+    assert all(Path(item.path).parent != service.tts_dir for item in media.list_items())
 
 
 @pytest.mark.asyncio
@@ -270,6 +421,303 @@ async def test_voiceover_daily_limit_counts_and_blocks(monkeypatch, tmp_path):
             Path(result.asset.audio_path).unlink(missing_ok=True)
             if result.asset.metadata_path:
                 Path(result.asset.metadata_path).unlink(missing_ok=True)
+
+
+def test_corrupt_tts_usage_blocks_quota_across_restart(tmp_path):
+    settings = SettingsService(path=tmp_path / "settings.json")
+    usage_path = tmp_path / "usage.json"
+    usage_path.write_text('{"broken":', encoding="utf-8")
+
+    service = TTSService(settings, MediaService(path=tmp_path / "media-library.json"))
+    service.usage_path = usage_path
+    with pytest.raises(RuntimeError, match="旁白额度记录不可用"):
+        service.quota()
+
+    quarantined = list(tmp_path.glob("usage.json.corrupt-*"))
+    assert len(quarantined) == 1
+    reopened = TTSService(settings, MediaService(path=tmp_path / "reopened-media.json"))
+    reopened.usage_path = usage_path
+    with pytest.raises(RuntimeError, match="已保留的损坏文件"):
+        reopened.quota()
+
+
+def test_tts_usage_accepts_legacy_integer_counts_and_restores_that_shape_after_settlement(
+    tmp_path,
+):
+    usage_path = tmp_path / "usage.json"
+    service = TTSService(
+        SettingsService(path=tmp_path / "settings.json"),
+        MediaService(path=tmp_path / "media-library.json"),
+    )
+    service.usage_path = usage_path
+    today = service.quota().date
+    usage_path.write_text(json.dumps({today: 2}), encoding="utf-8")
+
+    before = service.quota()
+    assert (before.used, before.pending) == (2, 0)
+
+    reservation_id = service._reserve_usage(today)
+    reserved = json.loads(usage_path.read_text(encoding="utf-8"))[today]
+    assert reserved == {"used": 3, "pending": [reservation_id]}
+
+    service._settle_usage(today, reservation_id)
+    assert json.loads(usage_path.read_text(encoding="utf-8")) == {today: 3}
+    after = service.quota()
+    assert (after.used, after.pending) == (3, 0)
+
+
+def test_pending_tts_reservation_remains_counted_across_restart(tmp_path):
+    usage_path = tmp_path / "usage.json"
+    settings = SettingsService(path=tmp_path / "settings.json")
+    settings.replace_for_development({"tts": {"daily_limit": 1}})
+    service = TTSService(settings, MediaService(path=tmp_path / "media-library.json"))
+    service.usage_path = usage_path
+    today = service.quota().date
+
+    reservation_id = service._reserve_usage(today)
+    assert reservation_id
+
+    reopened = TTSService(settings, MediaService(path=tmp_path / "reopened-media.json"))
+    reopened.usage_path = usage_path
+    quota = reopened.quota()
+    assert (quota.used, quota.pending, quota.remaining) == (1, 1, 0)
+
+
+def test_unreadable_tts_usage_blocks_quota(monkeypatch, tmp_path):
+    service = TTSService(
+        SettingsService(path=tmp_path / "settings.json"),
+        MediaService(path=tmp_path / "media-library.json"),
+    )
+    service.usage_path = tmp_path / "usage.json"
+    monkeypatch.setattr(
+        "automated_video_editing_backend.services.tts.read_json",
+        lambda _path: (None, "usage.json 无法读取：permission denied"),
+    )
+
+    with pytest.raises(RuntimeError, match="permission denied"):
+        service.quota()
+    with pytest.raises(RuntimeError, match="旁白额度记录不可用"):
+        service.quota()
+
+
+def test_tts_usage_write_failure_latches_generation_closed(monkeypatch, tmp_path):
+    service = TTSService(
+        SettingsService(path=tmp_path / "settings.json"),
+        MediaService(path=tmp_path / "media-library.json"),
+    )
+    service.usage_path = tmp_path / "usage.json"
+    monkeypatch.setattr(
+        "automated_video_editing_backend.services.tts.write_json",
+        lambda *_args, **_kwargs: False,
+    )
+
+    with pytest.raises(RuntimeError, match="usage.json 无法保存"):
+        service._increment_usage("2026-09-04")
+    with pytest.raises(RuntimeError, match="已停止生成"):
+        service.quota()
+
+
+@pytest.mark.asyncio
+async def test_tts_reservation_write_failure_prevents_provider_call(
+    monkeypatch,
+    tmp_path,
+    tts_root,
+):
+    import automated_video_editing_backend.services.tts as tts_module
+
+    settings = SettingsService(path=tmp_path / "settings.json")
+    settings.replace_for_development({
+        "tts": {
+            "enabled": True,
+            "app_id": "a",
+            "access_token": "t",
+            "voice_type": "BV001_streaming",
+            "cluster": "volcano_tts",
+            "daily_limit": 1,
+        }
+    })
+    media = MediaService(path=tmp_path / "media-library.json")
+    service = TTSService(settings, media)
+    service.tts_dir = tts_root
+    service.usage_path = tts_root / "usage.json"
+    durable_write = tts_module.write_json
+
+    provider_calls = 0
+
+    async def fake_request(_text):
+        nonlocal provider_calls
+        provider_calls += 1
+        return b"fake-mp3", {"duration_ms": 100, "words": [], "phonemes": []}
+
+    def fail_only_usage(path, payload):
+        if Path(path) == service.usage_path:
+            return False
+        return durable_write(path, payload)
+
+    monkeypatch.setattr(service, "_request_sync_tts", fake_request)
+    monkeypatch.setattr(tts_module, "write_json", fail_only_usage)
+
+    with pytest.raises(RuntimeError, match="usage.json 无法保存"):
+        await service.synthesize(TTSGenerateRequest(title="unaccounted", text="一"), "一")
+
+    assert list(tts_root.iterdir()) == []
+    assert not [item for item in media.list_items() if Path(item.path).parent == tts_root]
+    assert provider_calls == 0
+    with pytest.raises(RuntimeError, match="已停止生成"):
+        service.quota()
+
+
+@pytest.mark.asyncio
+async def test_provider_failure_settles_pending_but_never_refunds_daily_slot(
+    monkeypatch,
+    tmp_path,
+    tts_root,
+):
+    settings = SettingsService(path=tmp_path / "settings.json")
+    settings.replace_for_development({"tts": {
+        "enabled": True,
+        "app_id": "a",
+        "access_token": "t",
+        "voice_type": "BV001_streaming",
+        "cluster": "volcano_tts",
+        "daily_limit": 1,
+    }})
+    service = TTSService(settings, MediaService(path=tmp_path / "media-library.json"))
+    service.tts_dir = tts_root
+    service.usage_path = tts_root / "usage.json"
+    today = service.quota().date
+    provider_calls = 0
+    reservation_seen = False
+
+    async def failed_request(_text):
+        nonlocal provider_calls, reservation_seen
+        provider_calls += 1
+        persisted = json.loads(service.usage_path.read_text(encoding="utf-8"))
+        record = persisted[today]
+        reservation_seen = record["used"] == 1 and len(record["pending"]) == 1
+        raise ValueError("语音服务暂时不可用")
+
+    monkeypatch.setattr(service, "_request_sync_tts", failed_request)
+
+    with pytest.raises(ValueError, match="暂时不可用.*本次已计入今日旁白次数"):
+        await service.synthesize(TTSGenerateRequest(title="failed", text="一"), "一")
+
+    assert reservation_seen is True
+    quota = service.quota()
+    assert (quota.used, quota.pending, quota.remaining) == (1, 0, 0)
+    assert json.loads(service.usage_path.read_text(encoding="utf-8")) == {
+        today: 1,
+    }
+    with pytest.raises(ValueError, match="今日旁白生成已达上限"):
+        await service.synthesize(TTSGenerateRequest(title="retry", text="二"), "二")
+    assert provider_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_tts_settlement_write_failure_leaves_durable_pending_slot(
+    monkeypatch,
+    tmp_path,
+    tts_root,
+):
+    import automated_video_editing_backend.services.tts as tts_module
+
+    settings = SettingsService(path=tmp_path / "settings.json")
+    settings.replace_for_development({"tts": {
+        "enabled": True,
+        "app_id": "a",
+        "access_token": "t",
+        "voice_type": "BV001_streaming",
+        "cluster": "volcano_tts",
+        "daily_limit": 1,
+    }})
+    media = MediaService(path=tmp_path / "media-library.json")
+    service = TTSService(settings, media)
+    service.tts_dir = tts_root
+    service.usage_path = tts_root / "usage.json"
+    today = service.quota().date
+    durable_write = tts_module.write_json
+    usage_writes = 0
+
+    async def fake_request(_text):
+        return b"fake-mp3", {"duration_ms": 100, "words": [], "phonemes": []}
+
+    def fail_settlement(path, payload):
+        nonlocal usage_writes
+        if Path(path) == service.usage_path:
+            usage_writes += 1
+            if usage_writes == 2:
+                return False
+        return durable_write(path, payload)
+
+    monkeypatch.setattr(service, "_request_sync_tts", fake_request)
+    monkeypatch.setattr(tts_module, "write_json", fail_settlement)
+
+    with pytest.raises(RuntimeError, match="usage.json 无法保存"):
+        await service.synthesize(TTSGenerateRequest(title="settlement", text="一"), "一")
+
+    persisted = json.loads(service.usage_path.read_text(encoding="utf-8"))
+    record = persisted[today]
+    assert record["used"] == 1
+    assert len(record["pending"]) == 1
+
+    reopened = TTSService(settings, MediaService(path=tmp_path / "reopened-media.json"))
+    reopened.usage_path = service.usage_path
+    quota = reopened.quota()
+    assert (quota.used, quota.pending, quota.remaining) == (1, 1, 0)
+
+
+@pytest.mark.asyncio
+async def test_last_tts_slot_cannot_be_spent_by_two_concurrent_requests(
+    monkeypatch,
+    tmp_path,
+    tts_root,
+):
+    settings = SettingsService(path=tmp_path / "settings.json")
+    settings.replace_for_development({
+        "tts": {
+            "enabled": True,
+            "app_id": "a",
+            "access_token": "t",
+            "voice_type": "BV001_streaming",
+            "cluster": "volcano_tts",
+            "daily_limit": 1,
+        }
+    })
+    service = TTSService(settings, MediaService(path=tmp_path / "media-library.json"))
+    service.tts_dir = tts_root
+    service.usage_path = tts_root / "usage.json"
+    provider_started = asyncio.Event()
+    release_provider = asyncio.Event()
+    provider_calls = 0
+
+    async def fake_request(_text):
+        nonlocal provider_calls
+        provider_calls += 1
+        provider_started.set()
+        await release_provider.wait()
+        return b"fake-mp3", {"duration_ms": 100, "words": [], "phonemes": []}
+
+    monkeypatch.setattr(service, "_request_sync_tts", fake_request)
+    first_task = asyncio.create_task(
+        service.synthesize(TTSGenerateRequest(title="first", text="一"), "一")
+    )
+    await provider_started.wait()
+    second_task = asyncio.create_task(
+        service.synthesize(TTSGenerateRequest(title="second", text="二"), "二")
+    )
+    await asyncio.sleep(0)
+    assert provider_calls == 1
+
+    release_provider.set()
+    first = await first_task
+    with pytest.raises(ValueError, match="今日旁白生成已达上限"):
+        await second_task
+
+    assert provider_calls == 1
+    assert service.quota().used == 1
+    Path(first.asset.audio_path).unlink(missing_ok=True)
+    if first.asset.metadata_path:
+        Path(first.asset.metadata_path).unlink(missing_ok=True)
 
 
 def test_seedance_summary_surfaces_both_models(tmp_path):

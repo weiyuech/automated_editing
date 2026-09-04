@@ -1,13 +1,27 @@
 from __future__ import annotations
 
 import hashlib
-from datetime import datetime, timezone
+from collections.abc import Iterable
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Iterable
 
-from automated_video_editing_backend.core.models import CleanupResult, MediaAsset, MediaCalendarDay, MediaItem, StorageBucket, StorageReport
+from automated_video_editing_backend.core.models import (
+    CleanupResult,
+    MediaAsset,
+    MediaCalendarDay,
+    MediaItem,
+    StorageBucket,
+    StorageReport,
+)
 from automated_video_editing_backend.core.paths import APP_ROOT, GENERATED_DIRS, ensure_inside_root
-from automated_video_editing_backend.services.media import AUDIO_EXTS, IMAGE_EXTS, VIDEO_EXTS, MediaService, role_for_kind
+from automated_video_editing_backend.services.media import (
+    AUDIO_EXTS,
+    IMAGE_EXTS,
+    VIDEO_EXTS,
+    GeneratedMetadataPersistenceError,
+    MediaService,
+    role_for_kind,
+)
 
 MANAGED_AREAS = {
     "downloads": GENERATED_DIRS["data"] / "downloads",
@@ -38,6 +52,11 @@ class MediaVaultService:
         self.media = media
 
     def list_assets(self) -> list[MediaAsset]:
+        if self.media and self.media.generated_metadata_problem:
+            # Scanning exports without their valid manifest would make every delivery/master
+            # pair look like unrelated flat files. Stop and surface the retained manifest error
+            # instead of silently changing the meaning of the user's library.
+            raise GeneratedMetadataPersistenceError(self.media.generated_metadata_problem)
         by_path: dict[str, MediaAsset] = {}
         for area, folder in MANAGED_AREAS.items():
             for asset in self._scan_area(area, folder):
@@ -128,6 +147,10 @@ class MediaVaultService:
             if path.is_file():
                 if area in {"tts", "seedance"} and path.suffix.lower() == ".json":
                     continue
+                # Capture timing/point notes belong to the downloaded recording. They are moved
+                # to the trash as its companion and must not appear as a second, unusable asset.
+                if area == "downloads" and path.name.endswith(".capture.json"):
+                    continue
                 # The subtitle layer belongs to its export, not beside it in the library. It is
                 # a couple of kilobytes of cue timings, and listing one per finished video would
                 # bury the videos themselves.
@@ -141,8 +164,8 @@ class MediaVaultService:
     def _asset_from_path(self, area: str, path: Path) -> MediaAsset:
         resolved = ensure_inside_root(path)
         stat = resolved.stat()
-        modified = datetime.fromtimestamp(stat.st_mtime, timezone.utc)
-        created = datetime.fromtimestamp(stat.st_ctime, timezone.utc)
+        modified = datetime.fromtimestamp(stat.st_mtime, UTC)
+        created = datetime.fromtimestamp(stat.st_ctime, UTC)
         ext = resolved.suffix.lower()
         kind = self._kind_for_extension(ext)
         role = self._role_for(area, kind)
@@ -171,8 +194,8 @@ class MediaVaultService:
             return None
         resolved = path.resolve()
         stat = resolved.stat()
-        modified = datetime.fromtimestamp(stat.st_mtime, timezone.utc)
-        created = datetime.fromtimestamp(stat.st_ctime, timezone.utc)
+        modified = datetime.fromtimestamp(stat.st_mtime, UTC)
+        created = datetime.fromtimestamp(stat.st_ctime, UTC)
         ext = resolved.suffix.lower()
         kind = self._kind_for_extension(ext)
         role = str(item.metadata.get("role") or role_for_kind(kind))

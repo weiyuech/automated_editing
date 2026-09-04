@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any, Literal
 from uuid import uuid4
@@ -9,7 +9,7 @@ from pydantic import BaseModel, Field, computed_field, field_validator, model_va
 
 
 def utc_now() -> datetime:
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 class RobotMode(StrEnum):
@@ -897,11 +897,25 @@ class ProviderTestResult(BaseModel):
 
 class TTSGenerateRequest(BaseModel):
     title: str = "voiceover"
-    text: str = Field(default="", max_length=1500)
+    # Reviewed LLM drafts can be longer than the original prompt (up to ~2,400 Chinese
+    # characters for the current 600-second targeting limit), so the synthesis boundary must
+    # accept the reviewed result instead of only the shorter source prompt.
+    text: str = Field(default="", max_length=4000)
     use_llm: bool = False
     # Desired spoken length in seconds. Only meaningful with use_llm: the LLM is what shapes
     # the script to length. The backend turns it into a target 字数; blank keeps the old prompt.
     target_seconds: float | None = Field(default=None, ge=1, le=600)
+
+
+class VoiceoverDraftRequest(BaseModel):
+    text: str = Field(default="", max_length=1500)
+    target_seconds: float | None = Field(default=None, ge=1, le=600)
+
+
+class VoiceoverDraftResult(BaseModel):
+    source_text: str
+    draft_text: str
+    target_seconds: float | None = None
 
 
 class TTSAsset(BaseModel):
@@ -922,6 +936,9 @@ class TTSQuota(BaseModel):
     used: int = 0
     limit: int = 100
     remaining: int = 100
+    # Reservations are already included in ``used``. Exposing their count lets status and
+    # diagnostics distinguish an unfinished provider call without ever handing its slot back.
+    pending: int = 0
 
 
 class TTSGenerateResult(BaseModel):

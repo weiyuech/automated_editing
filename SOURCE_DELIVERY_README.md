@@ -1,6 +1,6 @@
 # Automated Video Editing — external media tools source delivery
 
-Version: 0.1.4
+Version: 0.1.5
 
 This directory contains the application source, tests, build manifests, authored interface
 assets, and third-party notices for the external media tools edition.  It contains no version

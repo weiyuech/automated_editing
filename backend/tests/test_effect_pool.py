@@ -1,6 +1,9 @@
 import random
 
+import pytest
+
 from automated_video_editing_backend.core.models import (
+    EditBatchRequest,
     EditJobRequest,
     EditTimeline,
     MediaItem,
@@ -77,6 +80,31 @@ def test_deal_effects_auto_without_ranking_is_random_subset():
 
 def _service(items, duration=3.0):
     return JobService(DummyEvents(), FakeMedia(items), None, None, FakeRenderer(duration))
+
+
+def test_media_pool_accepts_only_generated_video_effects():
+    source = MediaItem(
+        id="source",
+        path="/x/source.mp4",
+        kind="video",
+        metadata={"source": "local_import", "role": "raw_video"},
+    )
+    effect = MediaItem(
+        id="effect", path="/x/effect.mp4", kind="video", metadata={"role": "seedance_effect"},
+    )
+    service = _service([source, effect])
+
+    service._validate_batch_request(EditBatchRequest(
+        media_ids=[source.id],
+        intro_effect_media_ids=[effect.id],
+        outro_effect_media_ids=[effect.id],
+    ))
+
+    with pytest.raises(ValueError, match="Effect pool"):
+        service._validate_batch_request(EditBatchRequest(
+            media_ids=[source.id],
+            intro_effect_media_ids=[source.id],
+        ))
 
 
 def test_intro_prepends_shifts_clips_and_pushes_bed_when_cover_off():

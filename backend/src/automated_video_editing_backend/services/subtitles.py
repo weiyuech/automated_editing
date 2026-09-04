@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import base64
+import itertools
 import json
+import math
 import re
+import unicodedata
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, replace
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any
 
@@ -198,7 +202,276 @@ def load_words(metadata_path: str | Path) -> tuple[list[dict[str, Any]], str | N
     words = data.get("words")
     if not isinstance(words, list) or not words:
         return [], "该配音没有逐字时间戳，无法生成字幕"
-    return words, None
+    restored = restore_source_spelling(
+        words,
+        str(data.get("text") or ""),
+        duration_ms=data.get("duration_ms"),
+    )
+    if not restored:
+        return [], "该配音的逐字时间戳损坏，无法安全生成字幕"
+    return restored, None
+
+
+@dataclass(frozen=True)
+class _TimestampToken:
+    record: dict[str, Any]
+    key: str
+    text: str
+    start: float
+    end: float
+
+
+def restore_source_spelling(
+    raw_words: list[dict[str, Any]],
+    source_text: str,
+    *,
+    duration_ms: Any = None,
+) -> list[dict[str, Any]]:
+    """Use the reviewed source as text and the provider response only as a timing guide.
+
+    Provider labels can normalise spelling (``OPC`` → ``opc`` or ``六和桥`` → ``六合桥``),
+    omit punctuation, or occasionally shift a character. A character-level sequence alignment
+    maps the reviewed source back onto trustworthy timing tokens. Weak or reordered alignments
+    fall back to inexpensive proportional timing across the provider's spoken interval, so the
+    customer never sees text that differs from the version approved for narration.
+    """
+    source = re.sub(r"\s+", " ", source_text).strip()
+    if not source or not raw_words:
+        # Provider timing labels are not an authoritative transcript. Without the reviewed text
+        # there is no safe spelling to restore (a place name may already have been normalised),
+        # so callers must surface timestamps/subtitles as unavailable rather than leak those
+        # labels into the finished video.
+        return []
+
+    tokens: list[_TimestampToken] = []
+    valid_indices: list[int] = []
+    discarded_token = False
+    for index, record in enumerate(raw_words):
+        if not isinstance(record, dict):
+            discarded_token = True
+            continue
+        key = "word" if isinstance(record.get("word"), str) else "text"
+        value = record.get(key)
+        if not isinstance(value, str) or not value:
+            discarded_token = True
+            continue
+        try:
+            start = float(record["start_time"])
+            end = float(record["end_time"])
+        except (KeyError, TypeError, ValueError):
+            discarded_token = True
+            continue
+        if not math.isfinite(start) or not math.isfinite(end) or end < start:
+            discarded_token = True
+            continue
+        tokens.append(_TimestampToken(record, key, value, start, end))
+        valid_indices.append(index)
+
+    if not tokens:
+        # With no trustworthy spoken interval there is nowhere safe to place even the reviewed
+        # characters. Returning the provider labels here would reintroduce exactly the names the
+        # operator corrected, so callers must treat this as "timestamps unavailable" instead.
+        return []
+    out_of_order = any(
+        later.start < earlier.start or later.end < earlier.end
+        for earlier, later in itertools.pairwise(tokens)
+    )
+    if not _spoken_interval_is_plausible(tokens, duration_ms):
+        # A provider may return one valid-looking token and then truncate the response. Stretching
+        # an entire approved paragraph over that tiny fragment makes every later subtitle appear
+        # at the start of the narration. The provider's total audio duration is the authority for
+        # deciding whether the surviving interval is complete enough to reuse.
+        return []
+    if discarded_token or out_of_order:
+        boundary_missing = valid_indices[0] != 0 or valid_indices[-1] != len(raw_words) - 1
+        if boundary_missing and _positive_duration_ms(duration_ms) is None:
+            # With no trustworthy total duration and a damaged first/last record, there is no
+            # evidence for where the approved sentence begins or ends. Internal damage remains
+            # recoverable when both outer provider timestamps survived.
+            return []
+        # A partially damaged response cannot preserve token-by-token alignment: the missing
+        # record may have contained any part of the approved sentence. Keep the real outer
+        # spoken interval from the valid records and rebuild a monotonic clock for the complete
+        # reviewed source. This sacrifices some word-level precision but never its spelling or
+        # order, and is safer than silently splicing provider text back into customer subtitles.
+        return _proportional_source_timing(tokens, source)
+
+    provider = "".join(token.text for token in tokens)
+    provider_keys = [_alignment_key(char) for char in provider]
+    source_keys = [_alignment_key(char) for char in source]
+    if not provider_keys:
+        return []
+
+    # Exact normalised order is the common path and avoids running the sequence matcher.
+    if provider_keys == source_keys:
+        return _restore_by_position(tokens, source)
+
+    matcher = SequenceMatcher(None, provider_keys, source_keys)
+    opcodes = matcher.get_opcodes()
+    if not _alignment_is_confident(matcher.ratio(), opcodes, len(provider), len(source)):
+        return _proportional_source_timing(tokens, source)
+
+    provider_to_token = [
+        token_index
+        for token_index, token in enumerate(tokens)
+        for _char in token.text
+    ]
+    source_to_provider: list[int | None] = [None] * len(source)
+    for tag, provider_start, provider_end, source_start, source_end in opcodes:
+        if tag == "equal":
+            for provider_index, source_index in zip(
+                range(provider_start, provider_end),
+                range(source_start, source_end),
+                strict=True,
+            ):
+                source_to_provider[source_index] = provider_index
+        elif tag == "replace" and provider_end > provider_start:
+            provider_count = provider_end - provider_start
+            source_count = source_end - source_start
+            for offset, source_index in enumerate(range(source_start, source_end)):
+                relative = (offset + 0.5) / max(1, source_count)
+                provider_offset = min(provider_count - 1, int(relative * provider_count))
+                source_to_provider[source_index] = provider_start + provider_offset
+        elif tag == "insert":
+            # The provider omitted source characters. Attach them to the nearest surrounding
+            # spoken token without extending the narration beyond its real start or end.
+            left = provider_start - 1 if provider_start > 0 else None
+            right = provider_start if provider_start < len(provider) else None
+            for offset, source_index in enumerate(range(source_start, source_end)):
+                if left is None:
+                    source_to_provider[source_index] = right
+                elif right is None:
+                    source_to_provider[source_index] = left
+                else:
+                    halfway = (source_end - source_start) / 2
+                    source_to_provider[source_index] = left if offset < halfway else right
+
+    if any(index is None for index in source_to_provider):
+        return _proportional_source_timing(tokens, source)
+    token_mapping = [provider_to_token[index] for index in source_to_provider if index is not None]
+    if any(second < first for first, second in itertools.pairwise(token_mapping)):
+        return _proportional_source_timing(tokens, source)
+    return _source_text_on_tokens(tokens, source, token_mapping)
+
+
+def _positive_duration_ms(value: Any) -> float | None:
+    try:
+        duration = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(duration) or duration <= 0:
+        return None
+    return duration
+
+
+def _spoken_interval_is_plausible(
+    tokens: Sequence[_TimestampToken],
+    duration_ms: Any,
+) -> bool:
+    """Reject a surviving provider fragment that cannot represent the complete audio."""
+    duration = _positive_duration_ms(duration_ms)
+    if duration is None:
+        return True
+    start = min(token.start for token in tokens)
+    end = max(token.end for token in tokens)
+    span = end - start
+    tolerance = max(300.0, duration * 0.2)
+    return (
+        span >= duration * 0.2
+        and start <= tolerance
+        and end >= duration - tolerance
+        and end <= duration + tolerance
+    )
+
+
+def _alignment_key(char: str) -> str:
+    if char.isspace():
+        return " "
+    return unicodedata.normalize("NFKC", char).casefold()
+
+
+def _alignment_is_confident(
+    ratio: float,
+    opcodes: Sequence[tuple[str, int, int, int, int]],
+    provider_length: int,
+    source_length: int,
+) -> bool:
+    if ratio < 0.55:
+        return False
+    tags = {opcode[0] for opcode in opcodes}
+    # An insertion and a deletion together commonly indicate moved/reordered text. Sequence
+    # matching is monotonic, so pretending that move has a trustworthy word time is unsafe.
+    if "insert" in tags and "delete" in tags:
+        return False
+    longest_provider_change = max(
+        (end - start for tag, start, end, _s, _e in opcodes if tag != "equal"),
+        default=0,
+    )
+    longest_source_change = max(
+        (end - start for tag, _p, _q, start, end in opcodes if tag != "equal"),
+        default=0,
+    )
+    allowance = max(2, math.ceil(max(provider_length, source_length) * 0.35))
+    return longest_provider_change <= allowance and longest_source_change <= allowance
+
+
+def _restore_by_position(tokens: Sequence[_TimestampToken], source: str) -> list[dict[str, Any]]:
+    if sum(len(token.text) for token in tokens) != len(source):
+        return _proportional_source_timing(tokens, source)
+    restored: list[dict[str, Any]] = []
+    cursor = 0
+    for token in tokens:
+        next_cursor = cursor + len(token.text)
+        copy = dict(token.record)
+        copy[token.key] = source[cursor:next_cursor]
+        restored.append(copy)
+        cursor = next_cursor
+    return restored
+
+
+def _source_text_on_tokens(
+    tokens: Sequence[_TimestampToken],
+    source: str,
+    token_mapping: Sequence[int],
+) -> list[dict[str, Any]]:
+    chunks: list[tuple[int, list[str]]] = []
+    for char, token_index in zip(source, token_mapping, strict=True):
+        if not chunks or chunks[-1][0] != token_index:
+            chunks.append((token_index, [char]))
+        else:
+            chunks[-1][1].append(char)
+    restored: list[dict[str, Any]] = []
+    for token_index, characters in chunks:
+        token = tokens[token_index]
+        copy = dict(token.record)
+        copy[token.key] = "".join(characters)
+        restored.append(copy)
+    return restored
+
+
+def _proportional_source_timing(
+    tokens: Sequence[_TimestampToken], source: str,
+) -> list[dict[str, Any]]:
+    """Low-confidence fallback: exact source characters spread over the real spoken interval."""
+    start = min(token.start for token in tokens)
+    end = max(token.end for token in tokens)
+    weights = [
+        0.2 if char.isspace() else 0.35 if unicodedata.category(char).startswith("P") else 1.0
+        for char in source
+    ]
+    total = sum(weights) or 1.0
+    elapsed = 0.0
+    restored: list[dict[str, Any]] = []
+    for char, weight in zip(source, weights, strict=True):
+        char_start = start + (end - start) * elapsed / total
+        elapsed += weight
+        char_end = start + (end - start) * elapsed / total
+        restored.append({
+            "word": char,
+            "start_time": round(char_start, 3),
+            "end_time": round(char_end, 3),
+        })
+    return restored
 
 
 def normalise_words(raw_words: Iterable[dict[str, Any]]) -> list[tuple[str, float, float]]:
@@ -215,7 +488,7 @@ def normalise_words(raw_words: Iterable[dict[str, Any]]) -> list[tuple[str, floa
         text = record.get("word")
         if text is None:
             text = record.get("text")
-        if not isinstance(text, str) or not text.strip():
+        if not isinstance(text, str) or not text:
             continue
         try:
             start = float(record["start_time"]) / 1000.0
@@ -340,7 +613,14 @@ def _settle_timing(cues: list[Cue]) -> list[Cue]:
         end = cue.end
         if cue.duration < MIN_CUE_SECONDS:
             wanted = cue.start + MIN_CUE_SECONDS
-            ceiling = cues[index + 1].start - CUE_GAP_SECONDS if index + 1 < len(cues) else wanted
+            # Only stretch into a *known* gap before another timed cue. The previous final-cue
+            # fallback used ``wanted`` as its own ceiling and could leave the last sentence on
+            # screen after the final spoken word and even after the audio had ended.
+            ceiling = (
+                cues[index + 1].start - CUE_GAP_SECONDS
+                if index + 1 < len(cues)
+                else cue.end
+            )
             end = max(cue.end, min(wanted, ceiling))
         if index + 1 < len(cues):
             end = min(end, cues[index + 1].start - CUE_GAP_SECONDS)

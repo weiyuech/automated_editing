@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import functools
 import json
+import math
 import os
 import platform
 import shutil
@@ -10,7 +11,10 @@ import subprocess
 import sys
 from pathlib import Path
 
-from automated_video_editing_backend.core.models import EditTimeline
+from pydantic import ValidationError
+
+from automated_video_editing_backend.core.models import EditTimeline, SubtitleTrack
+from automated_video_editing_backend.core.store import read_json, write_json
 from automated_video_editing_backend.services import subtitles as subtitle_layer
 
 # Music sits under narration at this level. amix's own normalisation is switched off, so this
@@ -289,6 +293,13 @@ class RenderService:
         track = timeline.subtitles
         if not track or not track.cues:
             return None
+        cues = self.output_subtitle_cues(timeline)
+        if not cues:
+            # The soundtrack may begin part-way through an earlier export. If every carried cue
+            # lies before that retained interval (or beyond this picture), this output genuinely
+            # has no subtitle layer: do not leave an empty sidecar/ASS pair that later makes it
+            # look subtitled or demands a redundant clean master.
+            return None
         style = subtitle_layer.SubtitleStyle(
             font=track.font,
             size=track.size,
@@ -300,18 +311,42 @@ class RenderService:
             outline_colour=track.outline_colour,
             max_lines=track.max_lines,
         )
-        cues = [
-            subtitle_layer.Cue(start=cue.start, end=cue.end, text=cue.text) for cue in track.cues
-        ]
-        offset = self.subtitle_offset(timeline)
         script = subtitle_layer.to_ass(
-            cues, style, int(timeline.output_width), int(timeline.output_height), offset=offset,
+            cues, style, int(timeline.output_width), int(timeline.output_height), offset=0.0,
         )
         path = Path(timeline.output_path).with_suffix(".ass")
         path.parent.mkdir(parents=True, exist_ok=True)
-        self._write_subtitle_sidecar(timeline, track, offset)
+        self._write_subtitle_sidecar(timeline, track, cues)
         path.write_text(script, encoding="utf-8")
         return path
+
+    def output_subtitle_cues(self, timeline: EditTimeline) -> list[subtitle_layer.Cue]:
+        """Cues that are actually visible on this finished video's own clock.
+
+        This is the single subtitle-presence boundary used by ASS rendering, durable sidecars,
+        export metadata and clean-master creation. A carried track may be non-empty while none of
+        it overlaps a manual re-cut; treating the input track itself as proof of visible text is
+        what used to publish an empty sidecar and then fail while trying to create its master.
+        """
+        track = timeline.subtitles
+        if not track or not track.cues:
+            return []
+        offset = self.subtitle_offset(timeline)
+        output_duration = sum(max(0.0, float(clip.duration)) for clip in timeline.clips)
+        persisted: list[subtitle_layer.Cue] = []
+        for cue in track.cues:
+            text = cue.text.strip()
+            if not text:
+                # A timestamp interval with no visible characters is not a subtitle. Keeping it
+                # would create an empty ASS/sidecar pair, demand a redundant master and then make
+                # the strict sidecar reader call our own freshly written data corrupted.
+                continue
+            start = round(max(0.0, float(cue.start) + offset), 3)
+            end = round(min(output_duration, float(cue.end) + offset), 3)
+            if end <= start:
+                continue
+            persisted.append(subtitle_layer.Cue(start=start, end=end, text=text))
+        return persisted
 
     SIDECAR_SUFFIX = ".subtitles.json"
 
@@ -327,14 +362,15 @@ class RenderService:
             return path
         return path.with_suffix(self.SIDECAR_SUFFIX)
 
-    def _write_subtitle_sidecar(self, timeline, track, offset: float) -> None:
+    def _write_subtitle_sidecar(self, timeline, track, cues) -> None:
         """Record the cues in *this export's own* time, so a later re-cut can pick them up.
 
         Deliberately not the same numbers as the track carries. A track's cues are relative to
-        its audio; written here they are shifted by `offset` into the finished video's timeline.
-        That is what makes the file self-contained: 手动微调 sees "this video says these words at
-        these times" and needs to know nothing about how the export was originally assembled —
-        whether there was a voiceover input, where it sat, or what it was mixed with.
+        its audio; `output_subtitle_cues` has already shifted and clipped them into the finished
+        video's timeline. That is what makes the file self-contained: 手动微调 sees "this
+        video says these words at these times" and needs to know nothing about how the export
+        was originally assembled — whether there was a voiceover input, where it sat, or what it
+        was mixed with.
 
         The `.ass` cannot serve this purpose. It is a rendering of the layer, not the layer:
         already wrapped into lines for one frame size, with punctuation trimmed, and lossy to
@@ -357,22 +393,59 @@ class RenderService:
             "outline_colour": track.outline_colour,
             "max_lines": track.max_lines,
             "cues": [
-                {"start": round(cue.start + offset, 3), "end": round(cue.end + offset, 3),
-                 "text": cue.text}
-                for cue in track.cues
+                {"start": cue.start, "end": cue.end, "text": cue.text}
+                for cue in cues
             ],
         }
         target = self.subtitle_sidecar_path(timeline.output_path)
-        target.write_text(json.dumps(payload, ensure_ascii=False, indent=1), encoding="utf-8")
+        if not write_json(target, payload):
+            raise RuntimeError(f"字幕数据无法保存：{target.name}")
 
-    def read_subtitle_sidecar(self, output_path: str | Path) -> dict | None:
+    def read_subtitle_sidecar(
+        self,
+        output_path: str | Path,
+        expected_video_path: str | Path | None = None,
+    ) -> dict | None:
         """The cue list saved beside an export, or None when it has none or cannot be read."""
         path = self.subtitle_sidecar_path(output_path)
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             return None
-        return data if isinstance(data, dict) and data.get("cues") else None
+        if not isinstance(data, dict):
+            return None
+        if "video" in data:
+            binding = data.get("video")
+            if not isinstance(binding, str) or not binding:
+                return None
+            requested = Path(expected_video_path) if expected_video_path else Path(output_path)
+            if expected_video_path or not requested.name.endswith(self.SIDECAR_SUFFIX):
+                if binding != requested.name:
+                    return None
+            else:
+                expected_stem = requested.name.removesuffix(self.SIDECAR_SUFFIX)
+                if Path(binding).stem != expected_stem:
+                    return None
+        try:
+            # Treat the sidecar as an external persistence boundary, even though the app wrote
+            # it. A non-empty object/string in `cues` used to pass the truthiness check, make the
+            # route report no problem, and then disappear in the manual editor as though the
+            # operator had chosen an unsubtitled source. Validating the complete layer here
+            # turns every malformed field into the existing fail-closed `problem` path.
+            track = SubtitleTrack.model_validate(data, strict=True)
+        except ValidationError:
+            return None
+        if not track.cues or any(
+            not math.isfinite(cue.start)
+            or not math.isfinite(cue.end)
+            or cue.end <= cue.start
+            or not cue.text.strip()
+            for cue in track.cues
+        ):
+            return None
+        validated = dict(data)
+        validated.update(track.model_dump(mode="json"))
+        return validated
 
     def master_output_path(self, timeline: EditTimeline) -> Path:
         """Where the subtitle-free copy of an export goes.
@@ -393,36 +466,75 @@ class RenderService:
         copy is what lets the picture underneath be swapped — a still, an effect clip, anything —
         while the subtitle layer is simply drawn again over the new arrangement.
         """
-        if not (timeline.subtitles and timeline.subtitles.cues):
+        if not self.output_subtitle_cues(timeline):
             return None
         target = self.master_output_path(timeline)
+        target_sidecar = self.subtitle_sidecar_path(target)
+        if target.exists() or target_sidecar.exists():
+            raise RuntimeError(f"母版目标文件已存在：{target.name}")
         args = self.build_ffmpeg_args(timeline, None)
         args[-1] = str(target)
-        await self._run(args)
-        # Give the master its own paired timing layer. Generated-media entries are rebuilt by
-        # scanning after an app restart, so an in-memory pointer to the delivery's sidecar is
-        # not durable. A paired file lets the clean master rediscover its words by filename.
-        source_sidecar = self.subtitle_sidecar_path(timeline.output_path)
-        target_sidecar = self.subtitle_sidecar_path(target)
         try:
-            data = json.loads(source_sidecar.read_text(encoding="utf-8"))
+            await self._run(args)
+            # Give the master its own paired timing layer. Generated-media entries are rebuilt
+            # by scanning after an app restart, so an in-memory pointer to the delivery's
+            # sidecar is not durable.
+            source_sidecar = self.subtitle_sidecar_path(timeline.output_path)
+            data, problem = read_json(source_sidecar)
+            if problem:
+                raise RuntimeError(f"母版字幕数据无法读取：{problem}")
+            if not isinstance(data, dict) or not data.get("cues"):
+                raise RuntimeError(f"母版字幕数据缺失：{source_sidecar.name}")
+            if "video" in data:
+                binding = data.get("video")
+                if not isinstance(binding, str) or not binding:
+                    raise RuntimeError("母版字幕数据中的 video 绑定无效")
+            else:
+                binding = None
+            if binding is not None and binding != Path(timeline.output_path).name:
+                raise RuntimeError(
+                    f"母版字幕数据属于另一个成片：{binding}"
+                )
             data["video"] = target.name
-            target_sidecar.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
-        except (OSError, json.JSONDecodeError):
-            pass
+            if not write_json(target_sidecar, data):
+                raise RuntimeError(f"母版字幕数据无法保存：{target_sidecar.name}")
+        except BaseException:
+            # This is a new, incomplete derivative created by this call, not an existing user
+            # file. Do not let a cue-less or partially encoded master appear in the library.
+            target.unlink(missing_ok=True)
+            target_sidecar.unlink(missing_ok=True)
+            raise
         return str(target)
 
     async def render(self, timeline: EditTimeline) -> str:
-        subtitle_path = self.write_subtitle_script(timeline)
-        if subtitle_path is not None and not self.supports_subtitles():
-            # Refused rather than rendered without them. An export that quietly comes out with no
-            # text looks exactly like one where the narration had no timings, and the operator
-            # would have no way to tell that the cause was the binary.
-            raise RuntimeError(
-                f"当前 FFmpeg 不能把字幕压进画面（缺少 libass）：{self.ffmpeg_binary()}。"
-                "请运行 scripts/prepare_assets.py 获取可用的 FFmpeg。"
-            )
-        await self._run(self.build_ffmpeg_args(timeline, subtitle_path))
+        target = Path(timeline.output_path)
+        family = (
+            target,
+            target.with_suffix(".ass"),
+            self.subtitle_sidecar_path(target),
+        )
+        existing = [path.name for path in family if path.exists()]
+        if existing:
+            raise RuntimeError(f"成片目标文件已存在：{', '.join(existing)}")
+        try:
+            subtitle_path = self.write_subtitle_script(timeline)
+            if subtitle_path is not None and not self.supports_subtitles():
+                # Refused rather than rendered without them. An export that quietly comes out
+                # with no text looks exactly like one where narration had no timings, and the
+                # operator would have no way to tell that the cause was the binary.
+                raise RuntimeError(
+                    f"当前 FFmpeg 不能把字幕压进画面（缺少 libass）：{self.ffmpeg_binary()}。"
+                    "请运行 scripts/prepare_assets.py 获取可用的 FFmpeg。"
+                )
+            await self._run(self.build_ffmpeg_args(timeline, subtitle_path))
+        except BaseException:
+            # FFmpeg creates/truncates its target before it knows every decoder/filter will
+            # succeed. This family was proven absent above and belongs only to this invocation,
+            # so remove every partial artifact rather than let the library rediscover it as a
+            # flat completed export.
+            for path in family:
+                path.unlink(missing_ok=True)
+            raise
         return timeline.output_path
 
     async def _run(self, args: list[str]) -> None:

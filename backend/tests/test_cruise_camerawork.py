@@ -104,6 +104,29 @@ def test_right_pose_mirrors_to_large_left_or_small_right():
     assert all(config.yaw_min <= target <= config.yaw_max for target in targets)
 
 
+@pytest.mark.parametrize(
+    ("current", "yaw_min", "yaw_max", "opposite"),
+    [
+        (5.0, -10, 50, lambda target: target < 0),
+        (-5.0, -50, 10, lambda target: target > 0),
+    ],
+)
+def test_asymmetric_range_uses_protocol_zero_for_left_right_bias(
+    current, yaw_min, yaw_max, opposite,
+):
+    random.seed(31)
+    service = _service()
+    config = _config(yaw_min=yaw_min, yaw_max=yaw_max, anchor_yaw=0)
+    targets = [service._adaptive_yaw_target(current, config) for _ in range(2000)]
+    opposite_targets = [target for target in targets if opposite(target)]
+
+    # +yaw is physically left and -yaw is physically right regardless of an asymmetric range.
+    # The broad move crosses the real zero about 80% of the time; the other move remains a
+    # smaller continuation on the current physical side. Every result remains operator-bounded.
+    assert 78 <= len(opposite_targets) / 20 <= 82
+    assert all(yaw_min <= target <= yaw_max for target in targets)
+
+
 def test_wander_poses_respect_every_operator_range():
     random.seed(3)
     service = _service()
@@ -125,6 +148,17 @@ def test_pingpong_starts_on_the_side_opposite_the_current_pose():
     assert first_from_left[0] < 0 < second_from_left[0]
     first_from_right, second_from_right = service._pingpong_poses(-12, config)
     assert first_from_right[0] > 0 > second_from_right[0]
+
+
+def test_pingpong_uses_physical_sides_inside_asymmetric_ranges():
+    random.seed(8)
+    service = _service()
+
+    first, second = service._pingpong_poses(5, _config(yaw_min=-10, yaw_max=50))
+    assert -10 <= first[0] <= 0 < second[0] <= 50
+
+    first, second = service._pingpong_poses(-5, _config(yaw_min=-50, yaw_max=10))
+    assert -50 <= second[0] < 0 <= first[0] <= 10
 
 
 class _ParkedRobot:

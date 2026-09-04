@@ -4,6 +4,14 @@ Subtitles are burned in from the narration's own per-word timestamps. There is n
 recognition involved and none is needed: the TTS provider already reports when it said each word,
 so the text and its timing are both known exactly.
 
+The display is sentence/phrase level, not word highlighting: timed words are grouped into a
+readable cue, and the whole cue is visible from its first word through its last word. Provider
+token labels are aligned against the reviewed narration source, so `OPC` is not silently
+rewritten as `opc`, nor `六和桥` as `六合桥`, while trustworthy provider timings are still kept.
+The reviewed source is always the displayed text. If labels were omitted, added or reordered and
+the alignment is not confident, sentence timing falls back to a proportional distribution over
+the real spoken interval instead of trusting a coincidentally equal character count.
+
 An explicit 16:9 or 9:16 framing preset is applied before the ASS subtitle filter. With no preset,
 the source frame is retained instead. Cue wrapping, font size and safe margins are therefore
 calculated for the actual final frame in either case; converting to portrait does not clip a
@@ -15,14 +23,23 @@ one renders without them and says so in its warnings rather than failing.
 
 ## It is a layer, not something baked into the plan
 
-Each export writes a sibling `.ass` file next to the video — `我的视频.mp4` gets `我的视频.ass`.
-That file *is* the subtitle layer:
+Each subtitled delivery writes two sibling files next to the video: `我的视频.ass` is the
+renderable text layer, while `我的视频.subtitles.json` is the durable source of truth for the
+reviewed cue text, exact timing, style, and narration presence. Its paired subtitle-free master
+also receives its own `.subtitles.json`, so it can reload the exact same track in 手动微调 after
+an application restart.
+
+The `.ass` file is the drawable subtitle layer:
 
 - One `ass=` filter draws it over the finished picture. Nothing about it is tied to how the edit
   was cut, so the same track can be laid over any video.
 - Re-timing it is a text rewrite. Nothing is re-encoded, and no images are generated.
-- It is readable and hand-correctable. If the TTS misheard a product name, fix that line and burn
-  it again.
+- It is readable and hand-correctable. A product-name correction can be made before burning it
+  again; normal in-app re-editing uses the canonical JSON rather than trying to parse the ASS.
+
+These companion files stay hidden from the media-library asset list and travel with their video
+when it is renamed or moved to the system trash. Exported videos never become automatic-editing
+source material; only an explicit 手动微调 selection can use the clean master or another export.
 
 This is why the earlier plan — one PNG per cue, composited at render time — was dropped. It made
 the subtitles a property of one particular render, so 手动微调 could not touch them without
@@ -78,9 +95,9 @@ Words → cues, breaking in this order of preference:
    makes a stutter of two-character flashes
 4. Wherever the line would otherwise overflow the frame or run past 5 seconds
 
-Cues shorter than 1 second are stretched into the silence after them, where there is silence to
-take. Where there is not, they stay short rather than overlapping the next line — a subtitle that
-outlives its own sentence is worse than a brief one.
+Cues shorter than 1 second are stretched only into a known silence before the next timed cue.
+Where there is not one — including after the last spoken word — they stay short rather than
+overlap or outlive the narration.
 
 Line breaking is done in Python rather than left to libass, because Chinese has no spaces to break
 at and libass's guess is not stable across sizes. Automatic wrapping stays switched on in the

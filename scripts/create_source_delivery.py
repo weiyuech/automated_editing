@@ -8,7 +8,7 @@ import shutil
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-DESTINATION = ROOT / "Automated-Video-Editing-0.1.4-External-Media-Tools-Source"
+DESTINATION = ROOT / "Automated-Video-Editing-0.1.5-External-Media-Tools-Source"
 
 FILES = {
     "SOURCE_DELIVERY_README.md": "README.md",
@@ -30,6 +30,7 @@ TREES = (
     ("backend/src", "backend/src"),
     ("backend/tests", "backend/tests"),
     ("frontend/src", "frontend/src"),
+    ("frontend/tests", "frontend/tests"),
     ("docs", "docs"),
 )
 
@@ -107,9 +108,13 @@ def build_delivery() -> None:
 
     for source_name, destination_name in TREES:
         source_root = ROOT / source_name
-        for source in sorted(source_root.rglob("*")):
-            if should_copy(source):
-                copy_file(source, DESTINATION / destination_name / source.relative_to(source_root))
+        if not source_root.is_dir():
+            raise SystemExit(f"Required source tree is missing: {source_name}")
+        sources = [source for source in sorted(source_root.rglob("*")) if should_copy(source)]
+        if not sources:
+            raise SystemExit(f"Required source tree is empty: {source_name}")
+        for source in sources:
+            copy_file(source, DESTINATION / destination_name / source.relative_to(source_root))
 
     for name in SCRIPT_FILES:
         copy_file(ROOT / "scripts" / name, DESTINATION / "scripts" / name)

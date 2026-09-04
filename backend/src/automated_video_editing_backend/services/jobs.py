@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import random
 from datetime import datetime
 from pathlib import Path
@@ -14,8 +15,10 @@ from automated_video_editing_backend.core.models import (
     FOOTAGE_MIX_LEVELS,
     EditBatchRequest,
     EditJobRequest,
+    EditTimeline,
     JobRecord,
     JobStatus,
+    SubtitleTrack,
     TimelineClip,
     TimelineDraftRequest,
     utc_now,
@@ -33,7 +36,7 @@ from automated_video_editing_backend.services.editorial import (
     smart_family,
 )
 from automated_video_editing_backend.services.media import MediaService
-from automated_video_editing_backend.services.naming import safe_stem
+from automated_video_editing_backend.services.naming import safe_stem, validate_filename
 from automated_video_editing_backend.services.render import RenderService
 from automated_video_editing_backend.services.semantic import SemanticAlignment, SemanticService
 from automated_video_editing_backend.services.settings import SettingsService
@@ -170,6 +173,8 @@ class JobService:
         self._resolve_policy(request)
         if not request.output_name or request.output_name == "export.mp4":
             request.output_name = self._next_output_name(request.title)
+        else:
+            request.output_name = self._safe_output_name(request.output_name)
         return await self._announce(request)
 
     async def _announce(self, request: EditJobRequest, timeline=None) -> JobRecord:
@@ -498,8 +503,11 @@ class JobService:
         return capacity
 
     async def create_from_timeline(self, timeline) -> JobRecord:
-        if not timeline.output_path or Path(timeline.output_path).is_dir():
+        if not str(timeline.output_path or "").strip():
             timeline.output_path = str(GENERATED_DIRS["exports"] / self._next_output_name(timeline.title))
+        else:
+            timeline.output_path = str(self._managed_export_path(timeline.output_path))
+        self._bind_manual_subtitle_sources(timeline)
         if timeline.output_fit == "contain" and timeline.clips:
             size = self._source_size_from_path(timeline.clips[0].source_path)
             if size:
@@ -536,6 +544,79 @@ class JobService:
         await self.events.publish("JOB_CREATED", job.model_dump(mode="json"))
         asyncio.create_task(self._run(job.id))
         return job
+
+    def _bind_manual_subtitle_sources(self, timeline: EditTimeline) -> None:
+        """Bind manual renders to the soundtrack's authoritative persisted subtitle layer.
+
+        The UI performs the same checks for immediate feedback, but this endpoint also serves
+        older clients and is the final authority. A client copy can be missing, stale or taken
+        from another export, so a valid sidecar replaces it rather than merely proving it exists.
+        Selecting an export for inspection remains allowed; only submitting an unsafe re-cut is
+        rejected.
+        """
+        items = self.media.list_items()
+        by_path: dict[str, list] = {}
+        for item in items:
+            by_path.setdefault(self._path_key(item.path), []).append(item)
+
+        for clip in timeline.clips:
+            source_key = self._path_key(clip.source_path)
+            matching = by_path.get(source_key, [])
+            # Check burned provenance before a stale-id diagnostic: the physical file is what
+            # FFmpeg would open, so a forged id must never turn the safety message into an
+            # opportunity to retry the same unsafe pixels through another client.
+            if any(bool(item.metadata.get("has_burned_subtitles")) for item in matching):
+                raise ValueError(
+                    "已选成片的字幕已烧录在画面中，不能用于手动微调；"
+                    "请改用同组的母版（无字幕）"
+                )
+            claimed = self.media.get(clip.media_id)
+            if claimed is not None and self._path_key(claimed.path) != source_key:
+                raise ValueError("手动微调素材的 media_id 与文件路径不一致，请刷新媒体库后重试")
+            if not matching:
+                # Stale ids are harmless when the canonical path is still present in the
+                # library after a restart. An unknown path is not: it could be an unregistered
+                # partial export or a client-selected file outside every persistence boundary.
+                raise ValueError("手动微调素材不在媒体库中，请重新选择后再渲染")
+
+        bed = getattr(timeline, "audio_bed", None)
+        if bed is None:
+            if timeline.subtitles and timeline.subtitles.cues:
+                raise ValueError("手动微调字幕没有可验证的原声绑定，请重新选择保留原声")
+            timeline.subtitles = None
+            return
+        bed_items = by_path.get(self._path_key(bed.source_path), [])
+        if not bed_items:
+            raise ValueError("保留的原声不在媒体库中，请重新选择后再渲染")
+        if any(bool(item.metadata.get("has_burned_subtitles")) for item in bed_items):
+            raise ValueError(
+                "保留的原声来自已烧录字幕的成片，不能用于手动微调；"
+                "请改用同组的母版（无字幕）"
+            )
+
+        bed_item = bed_items[0]
+
+        recorded_sidecar = bed_item.metadata.get("subtitles_path")
+        canonical_sidecar = self.renderer.subtitle_sidecar_path(bed_item.path)
+        if not recorded_sidecar and not canonical_sidecar.exists():
+            if timeline.subtitles and timeline.subtitles.cues:
+                raise ValueError("保留的原声没有可验证的字幕数据，请重新选择素材")
+            timeline.subtitles = None
+            return
+
+        authoritative = self.renderer.read_subtitle_sidecar(
+            recorded_sidecar or bed_item.path,
+            expected_video_path=bed_item.path,
+        )
+        if authoritative is None:
+            raise ValueError(
+                "保留的原声记录过字幕，但字幕数据缺失、损坏或不属于该母版；"
+                "请重新选择同组的有效母版"
+            )
+        # read_subtitle_sidecar has already applied strict persistence validation. Reconstructing
+        # the model here intentionally discards envelope fields (video/version/has_voiceover) and
+        # gives rendering exactly the layer owned by this audio bed, never a client-supplied copy.
+        timeline.subtitles = SubtitleTrack.model_validate(authoritative, strict=True)
 
     async def draft_timeline(self, request: TimelineDraftRequest):
         job_request = EditJobRequest(
@@ -652,7 +733,7 @@ class JobService:
             raise ValueError("No source videos selected")
         for media_id in request.media_ids:
             item = self.media.get(media_id)
-            if not item or item.kind != "video" or item.metadata.get("role") != "raw_video":
+            if not item or not MediaService.is_automatic_source(item):
                 raise ValueError("Source videos must be imported video media")
         if request.music_media_id:
             item = self.media.get(request.music_media_id)
@@ -662,11 +743,17 @@ class JobService:
             item = self.media.get(request.voiceover_media_id)
             if not item or item.kind != "audio" or item.metadata.get("role") != "tts_voice":
                 raise ValueError("Voiceover must be generated TTS media")
+        for media_id in (request.intro_effect_media_id, request.outro_effect_media_id):
+            if not media_id:
+                continue
+            item = self.media.get(media_id)
+            if not item or item.kind != "video" or item.metadata.get("role") != "seedance_effect":
+                raise ValueError("Effect pool must contain generated video effect media")
 
     def _validate_batch_request(self, request: EditBatchRequest) -> None:
         for media_id in request.media_ids:
             item = self.media.get(media_id)
-            if not item or item.kind != "video" or item.metadata.get("role") != "raw_video":
+            if not item or not MediaService.is_automatic_source(item):
                 raise ValueError("Source videos must be imported video media")
         for media_id in request.music_media_ids:
             item = self.media.get(media_id)
@@ -676,6 +763,13 @@ class JobService:
             item = self.media.get(media_id)
             if not item or item.kind != "audio" or item.metadata.get("role") != "tts_voice":
                 raise ValueError("Voiceover pool must contain generated TTS media")
+        for media_id in dict.fromkeys([
+            *request.intro_effect_media_ids,
+            *request.outro_effect_media_ids,
+        ]):
+            item = self.media.get(media_id)
+            if not item or item.kind != "video" or item.metadata.get("role") != "seedance_effect":
+                raise ValueError("Effect pool must contain generated video effect media")
 
     async def _run(self, job_id: str) -> None:
         async with self._render_slots:
@@ -730,25 +824,24 @@ class JobService:
             # Both paths converge here with a finished timeline; attach any 片头/片尾 effects
             # the batch assigned to this output before it renders.
             self._decorate_timeline(timeline, job.request)
+            # Defense in depth for restored/internal jobs: rendering must never be able to place
+            # an export in data/downloads, where a restart would rediscover it as raw footage.
+            timeline.output_path = str(self._managed_export_path(timeline.output_path))
             job.warnings = list(getattr(timeline, "warnings", []) or [])
             job.progress = 0.7
             job.message = "Rendering export"
             await self.events.publish("JOB_UPDATED", job.model_dump(mode="json"))
 
-            result_path = await self.renderer.render(timeline)
             # One group covers the delivered file and its subtitle-free master, so the library
             # shows a single entry per finished video rather than doubling in length the day
             # subtitles were switched on. Recorded here rather than inferred from the filenames
             # because an operator may rename either file.
             group = f"export:{job.id}"
-            subtitled = bool(getattr(timeline, "subtitles", None) and timeline.subtitles.cues)
-            # Both halves point at the same cue file. 手动微调 looks it up from whichever one the
-            # operator picked, so re-cutting the master can put the words back over the new
-            # arrangement — recorded here rather than guessed from the filename, because either
-            # file can be renamed.
-            sidecar = (
-                str(self.renderer.subtitle_sidecar_path(result_path)) if subtitled else ""
-            )
+            # A carried track is not necessarily visible in this cut: manual fine-tuning may
+            # start the retained soundtrack after every old cue. Use the renderer's one
+            # output-clock projection for rendering, metadata and master creation alike.
+            subtitled = bool(self.renderer.output_subtitle_cues(timeline))
+            inherited_burned_subtitles = self._inherits_burned_subtitles(timeline)
             has_voiceover = bool(
                 getattr(timeline, "voiceover_path", None)
                 or (
@@ -756,39 +849,34 @@ class JobService:
                     and timeline.audio_bed.has_voiceover
                 )
             )
-            self.media.register_generated_path(
-                Path(result_path),
-                kind="video",
-                metadata={
-                    "source": "exports", "role": "export", "job_id": job.id,
-                    "export_group": group,
-                    "variant": "subtitled" if subtitled else "single",
-                    "variant_label": "成片（带字幕）" if subtitled else "成片",
-                    "subtitles_path": sidecar,
-                    "has_voiceover": has_voiceover,
-                    "output_width": timeline.output_width,
-                    "output_height": timeline.output_height,
-                    "output_aspect_ratio": job.request.output_aspect_ratio,
-                    "output_crop_x": timeline.output_crop_x,
-                    "output_crop_y": timeline.output_crop_y,
-                    "editorial_preset": timeline.editorial_preset,
-                    "planning_diagnostics": timeline.planning_diagnostics,
-                    # Re-cutting a file that already has text painted into it drags the old
-                    # subtitles along at the wrong times, so the UI has to be able to say so.
-                    "has_burned_subtitles": subtitled,
-                },
+            planned_delivery = Path(timeline.output_path)
+            planned_master = (
+                self.renderer.master_output_path(timeline) if subtitled else None
             )
-            master_path = await self.renderer.render_master(timeline)
-            if master_path:
-                self.media.register_generated_path(
-                    Path(master_path),
-                    kind="video",
-                    metadata={
+            publish_family = self._export_publish_family(
+                planned_delivery,
+                planned_master,
+            )
+            existing = [path.name for path in publish_family if path.exists()]
+            if existing:
+                # Prove ownership before creating either half. Cleanup after a later failure can
+                # then remove the entire family without ever touching an older user file.
+                raise RuntimeError(f"成片组目标文件已存在：{', '.join(existing)}")
+
+            try:
+                result_path = await self.renderer.render(timeline)
+                # Each half receives its own canonical cue sidecar. 手动微调 can therefore load
+                # the exact words and style from whichever variant the operator picked, while
+                # renaming or deleting one variant never makes the other depend on its filename.
+                sidecar = (
+                    str(self.renderer.subtitle_sidecar_path(result_path)) if subtitled else ""
+                )
+                delivery_metadata = {
                         "source": "exports", "role": "export", "job_id": job.id,
                         "export_group": group,
-                        "variant": "master",
-                        "variant_label": "母版（无字幕）",
-                        "subtitles_path": str(self.renderer.subtitle_sidecar_path(master_path)),
+                        "variant": "subtitled" if subtitled else "single",
+                        "variant_label": "成片（带字幕）" if subtitled else "成片",
+                        "subtitles_path": sidecar,
                         "has_voiceover": has_voiceover,
                         "output_width": timeline.output_width,
                         "output_height": timeline.output_height,
@@ -797,9 +885,44 @@ class JobService:
                         "output_crop_y": timeline.output_crop_y,
                         "editorial_preset": timeline.editorial_preset,
                         "planning_diagnostics": timeline.planning_diagnostics,
-                        "has_burned_subtitles": False,
-                    },
-                )
+                        # Re-cutting a file that already has text painted into it drags the old
+                        # subtitles along at the wrong times, so the UI has to be able to say so.
+                        "has_burned_subtitles": (
+                            subtitled or inherited_burned_subtitles
+                        ),
+                    }
+                master_path = await self.renderer.render_master(timeline)
+                registrations = [(Path(result_path), "video", delivery_metadata)]
+                if subtitled:
+                    if not master_path:
+                        raise RuntimeError("带字幕成片没有生成对应母版")
+                    master_metadata = {
+                            "source": "exports", "role": "export", "job_id": job.id,
+                            "export_group": group,
+                            "variant": "master",
+                            "variant_label": "母版（无字幕）",
+                            "subtitles_path": str(
+                                self.renderer.subtitle_sidecar_path(master_path)
+                            ),
+                            "has_voiceover": has_voiceover,
+                            "output_width": timeline.output_width,
+                            "output_height": timeline.output_height,
+                            "output_aspect_ratio": job.request.output_aspect_ratio,
+                            "output_crop_x": timeline.output_crop_x,
+                            "output_crop_y": timeline.output_crop_y,
+                            "editorial_preset": timeline.editorial_preset,
+                            "planning_diagnostics": timeline.planning_diagnostics,
+                            # The master removes only the subtitle layer added by this render.
+                            # Text already baked into a source export remains pixels and must
+                            # keep warning the next manual fine-tune generation.
+                            "has_burned_subtitles": inherited_burned_subtitles,
+                        }
+                    registrations.append((Path(master_path), "video", master_metadata))
+                # Delivery + master become visible together, after both files and both subtitle
+                # sidecars exist. One manifest replacement and one in-memory commit publish them.
+                self.media.register_generated_paths(registrations)
+            except BaseException as publish_exc:  # noqa: BLE001 - cancellation also needs cleanup
+                self._discard_unregistered_export_group(publish_family, publish_exc)
             job.status = JobStatus.SUCCEEDED
             job.progress = 1
             job.message = "Export complete"
@@ -811,6 +934,76 @@ class JobService:
         finally:
             job.updated_at = utc_now()
             await self.events.publish("JOB_UPDATED", job.model_dump(mode="json"))
+
+    @staticmethod
+    def _export_publish_family(
+        delivery: Path,
+        master: Path | None,
+    ) -> tuple[Path, ...]:
+        paths = [
+            delivery,
+            delivery.with_suffix(".ass"),
+            delivery.with_suffix(".subtitles.json"),
+        ]
+        if master is not None:
+            paths.extend(
+                [
+                    master,
+                    master.with_suffix(".ass"),
+                    master.with_suffix(".subtitles.json"),
+                ]
+            )
+        return tuple(dict.fromkeys(paths))
+
+    @staticmethod
+    def _discard_unregistered_export_group(
+        paths: tuple[Path, ...],
+        registration_exc: BaseException,
+    ) -> None:
+        """Remove a newly-created group that could not acquire its durable identity.
+
+        The caller first proved that every member was absent, and this remains deliberately
+        limited to the managed exports directory. It never repairs or guesses about older files;
+        it only prevents the current failed job from publishing a partial group.
+        """
+        export_root = GENERATED_DIRS["exports"].resolve()
+        resolved = [path.resolve() for path in paths]
+        if any(
+            target != export_root and export_root not in target.parents
+            for target in resolved
+        ):
+            raise registration_exc
+        failures = []
+        for member in resolved:
+            try:
+                member.unlink(missing_ok=True)
+            except OSError as exc:
+                failures.append(f"{member.name}: {exc}")
+        if failures:
+            raise RuntimeError(
+                f"{registration_exc}；未登记成片清理失败：{' | '.join(failures)}"
+            ) from registration_exc
+        raise registration_exc
+
+    def _inherits_burned_subtitles(self, timeline: EditTimeline) -> bool:
+        """Whether any source clip already carries subtitle pixels that encoding cannot remove."""
+        items = self.media.list_items()
+        by_path: dict[str, list] = {}
+        for item in items:
+            by_path.setdefault(self._path_key(item.path), []).append(item)
+        for clip in getattr(timeline, "clips", []) or []:
+            source_key = self._path_key(clip.source_path)
+            claimed = self.media.get(clip.media_id)
+            if claimed is not None and self._path_key(claimed.path) != source_key:
+                # The path is what FFmpeg will really read. Never let a client pair it with a
+                # different, harmless-looking id to evade persisted provenance checks.
+                raise ValueError("手动微调素材的 media_id 与文件路径不一致，请刷新媒体库后重试")
+            if any(
+                bool(item.metadata.get("has_burned_subtitles"))
+                for item in by_path.get(source_key, [])
+            ):
+                return True
+        return False
 
     def _audio_duration(self, item) -> float | None:
         """Length of a voiceover, preferring the timing the TTS provider already reported."""
@@ -954,22 +1147,88 @@ class JobService:
     def is_path_in_use(self, path: str) -> bool:
         """Whether a queued or running render reads from or writes to this file.
 
-        Renaming underneath a running FFmpeg process fails the job, so the rename is
-        refused instead.
+        Renaming or deleting underneath a running job can either fail that job or publish an
+        incomplete export, so every filesystem mutation asks this one authoritative inventory.
+        It includes request ids because an automatic job has no timeline while it is analysing,
+        and includes both export variants because the delivery remains live while its clean
+        master is still being rendered.
         """
+        wanted = self._path_key(path)
         for job in self._jobs.values():
             if job.status not in {JobStatus.QUEUED, JobStatus.RUNNING}:
                 continue
+            # Automatic jobs do not have a timeline until analysis finishes. Resolve their
+            # accepted media ids as well, otherwise a rename during OpenCV/music analysis can
+            # move a file out from under the reader before `job.timeline` exists.
+            request = job.request
+            dependency_ids = [
+                *request.media_ids,
+                request.music_media_id,
+                request.voiceover_media_id,
+                request.intro_effect_media_id,
+                request.outro_effect_media_id,
+            ]
+            request_paths = [
+                item.path
+                for media_id in dependency_ids
+                if media_id and (item := self.media.get(media_id)) is not None
+            ]
+            if any(self._path_key(candidate) == wanted for candidate in request_paths):
+                return True
             timeline = job.timeline
             if timeline is None:
                 continue
             candidates = [getattr(timeline, "output_path", None),
                           getattr(timeline, "music_path", None),
-                          getattr(timeline, "voiceover_path", None)]
+                          getattr(timeline, "voiceover_path", None),
+                          getattr(job, "result_path", None)]
+            audio_bed = getattr(timeline, "audio_bed", None)
+            if audio_bed is not None:
+                candidates.append(getattr(audio_bed, "source_path", None))
             candidates.extend(clip.source_path for clip in getattr(timeline, "clips", []) or [])
-            if any(candidate == path for candidate in candidates):
+            track = getattr(timeline, "subtitles", None)
+            if track is not None and getattr(track, "cues", None):
+                candidates.append(str(self.renderer.master_output_path(timeline)))
+            if any(
+                candidate and self._path_key(candidate) == wanted
+                for candidate in candidates
+            ):
                 return True
         return False
+
+    @staticmethod
+    def _path_key(path: str) -> str:
+        """Canonical comparison key for existing inputs and not-yet-created outputs."""
+        try:
+            resolved = Path(path).expanduser().resolve(strict=False)
+        except (OSError, RuntimeError, ValueError):
+            return os.path.normcase(str(path))
+        return os.path.normcase(str(resolved))
+
+    @staticmethod
+    def _safe_output_name(value: str) -> str:
+        """A portable MP4 basename, never a relative or absolute path."""
+        name = validate_filename(value, ".mp4")
+        if Path(name).suffix.lower() != ".mp4":
+            raise ValueError("Export filename must end in .mp4")
+        return name
+
+    @classmethod
+    def _managed_export_path(cls, value: str | Path) -> Path:
+        """Resolve one flat output below the managed exports directory, or fail closed."""
+        candidate = Path(value).expanduser()
+        try:
+            resolved = candidate.resolve(strict=False)
+            export_root = GENERATED_DIRS["exports"].resolve()
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise ValueError("Export path is invalid") from exc
+        if resolved.parent != export_root:
+            raise ValueError(
+                "Export output must be written directly inside the managed exports folder"
+            )
+        if cls._safe_output_name(resolved.name) != resolved.name:
+            raise ValueError("Export filename must be a safe .mp4 basename")
+        return resolved
 
     def _next_output_name(self, title: str = "") -> str:
         """Name the export after what the operator called the edit.
@@ -985,7 +1244,20 @@ class JobService:
             name = f"{prefix} {stamp}{suffix}.mp4"
             if name in self._allocated_output_names:
                 continue
-            if (exports_dir / name).exists():
+            delivery = exports_dir / name
+            master = delivery.with_name(f"{delivery.stem} 母版{delivery.suffix}")
+            # A render owns this whole filename family. Reusing a delivery name merely because
+            # its video is gone could overwrite a surviving subtitle layer or clean master and
+            # attach yesterday's words to today's picture.
+            reserved_paths = (
+                delivery,
+                master,
+                delivery.with_suffix(".ass"),
+                delivery.with_suffix(".subtitles.json"),
+                master.with_suffix(".ass"),
+                master.with_suffix(".subtitles.json"),
+            )
+            if any(path.exists() for path in reserved_paths):
                 continue
             self._allocated_output_names.add(name)
             return name

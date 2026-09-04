@@ -1,3 +1,4 @@
+import asyncio
 import shutil
 import tempfile
 from pathlib import Path
@@ -147,6 +148,94 @@ def test_seedance_legacy_count_usage_preserves_spent_allowance(tmp_path, seedanc
     assert quota.used_seconds == 15
     assert quota.remaining_seconds == 35
     assert quota.remaining == 7
+
+
+def test_corrupt_seedance_usage_blocks_quota_across_restart(tmp_path, seedance_root):
+    settings = SettingsService(path=tmp_path / "settings.json")
+    usage_path = seedance_root / "usage.json"
+    seedance_root.mkdir(parents=True, exist_ok=True)
+    usage_path.write_text('{"broken":', encoding="utf-8")
+
+    service = SeedanceService(
+        settings,
+        MediaService(path=tmp_path / "media-library.json"),
+        RenderService(),
+        root=seedance_root,
+    )
+    with pytest.raises(RuntimeError, match="特效额度记录不可用"):
+        service.quota()
+
+    quarantined = list(seedance_root.glob("usage.json.corrupt-*"))
+    assert len(quarantined) == 1
+    reopened = SeedanceService(
+        settings,
+        MediaService(path=tmp_path / "reopened-media.json"),
+        RenderService(),
+        root=seedance_root,
+    )
+    with pytest.raises(RuntimeError, match="已保留的损坏文件"):
+        reopened.quota()
+
+
+def test_unreadable_seedance_usage_blocks_quota(monkeypatch, tmp_path, seedance_root):
+    service = SeedanceService(
+        SettingsService(path=tmp_path / "settings.json"),
+        MediaService(path=tmp_path / "media-library.json"),
+        RenderService(),
+        root=seedance_root,
+    )
+    monkeypatch.setattr(
+        "automated_video_editing_backend.services.seedance.read_json",
+        lambda _path: (None, "usage.json 无法读取：permission denied"),
+    )
+
+    with pytest.raises(RuntimeError, match="permission denied"):
+        service.quota()
+    with pytest.raises(RuntimeError, match="特效额度记录不可用"):
+        service.quota()
+
+
+@pytest.mark.asyncio
+async def test_seedance_usage_write_failure_prevents_paid_task_submission(
+    monkeypatch,
+    tmp_path,
+    seedance_root,
+):
+    settings = SettingsService(path=tmp_path / "settings.json")
+    settings.replace_for_development({
+        "seedance": {
+            "enabled": True,
+            "api_key": "ark-key",
+            "model": "seedance-model",
+            "daily_limit": 10,
+        }
+    })
+    service = SeedanceService(
+        settings,
+        MediaService(path=tmp_path / "media-library.json"),
+        RenderService(),
+        root=seedance_root,
+    )
+    submissions = 0
+
+    async def fake_submit(_asset_id):
+        nonlocal submissions
+        submissions += 1
+
+    monkeypatch.setattr(service, "_submit_and_download", fake_submit)
+    monkeypatch.setattr(
+        "automated_video_editing_backend.services.seedance.write_json",
+        lambda *_args, **_kwargs: False,
+    )
+
+    with pytest.raises(RuntimeError, match="usage.json 无法保存"):
+        await service.generate(SeedanceGenerateRequest(prompt="do not submit"))
+
+    await asyncio.sleep(0)
+    assert submissions == 0
+    assert list(service.effects_dir.iterdir()) == []
+    with pytest.raises(RuntimeError, match="已停止生成"):
+        service.quota()
 
 
 @pytest.mark.asyncio

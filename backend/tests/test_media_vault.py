@@ -1,7 +1,17 @@
+import json
+import os
 import tempfile
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from uuid import uuid4
+
+import pytest
+
 from automated_video_editing_backend.core.paths import generated_path
-from automated_video_editing_backend.services.media import MediaService
+from automated_video_editing_backend.services.media import (
+    GeneratedMetadataPersistenceError,
+    MediaService,
+)
 from automated_video_editing_backend.services.media_vault import MediaVaultService
 
 
@@ -27,6 +37,22 @@ def test_vault_classifies_downloads_and_exports_separately():
             path.unlink(missing_ok=True)
 
 
+def test_vault_hides_capture_sidecar_because_it_belongs_to_the_video():
+    video = generated_path("data", "downloads", f"capture-{uuid4().hex}.mp4")
+    sidecar = video.with_name(f"{video.name}.capture.json")
+    video.parent.mkdir(parents=True, exist_ok=True)
+    video.write_bytes(b"capture")
+    sidecar.write_text("{}", encoding="utf-8")
+
+    try:
+        paths = {asset.path for asset in MediaVaultService().list_assets()}
+        assert str(video) in paths
+        assert str(sidecar) not in paths
+    finally:
+        video.unlink(missing_ok=True)
+        sidecar.unlink(missing_ok=True)
+
+
 def test_vault_includes_registered_external_import(tmp_path):
     path = tmp_path / "local-import.mp4"
     path.write_bytes(b"placeholder")
@@ -39,6 +65,22 @@ def test_vault_includes_registered_external_import(tmp_path):
     assert by_path[item.path].role == "raw_video"
     assert by_path[item.path].area == "external"
     assert by_path[item.path].can_use_as_source is True
+
+
+def test_corrupt_export_manifest_is_reported_instead_of_flattening_the_vault(tmp_path):
+    export = generated_path("exports", f"vault-blocked-{uuid4().hex[:8]}.mp4")
+    export.write_bytes(b"delivery")
+    library = tmp_path / "media-library.json"
+    generated_manifest = library.with_name(f"{library.stem}-generated-metadata.json")
+    generated_manifest.write_text("{broken", encoding="utf-8")
+    try:
+        media = MediaService(path=library)
+        assert media.generated_metadata_problem
+
+        with pytest.raises(GeneratedMetadataPersistenceError, match="损坏"):
+            MediaVaultService(media).list_assets()
+    finally:
+        export.unlink(missing_ok=True)
 
 
 def test_vault_storage_report_marks_threshold():
@@ -98,11 +140,15 @@ def test_exports_are_never_offered_as_import_sources(tmp_path):
     from automated_video_editing_backend.core.paths import GENERATED_DIRS
     from automated_video_editing_backend.services.media import MediaService
 
-    export = GENERATED_DIRS["exports"] / "test-tuned-output.mp4"
+    export = GENERATED_DIRS["exports"] / f"test-tuned-output-{uuid4().hex[:8]}.mp4"
     export.write_bytes(b"rendered")
     try:
         media = MediaService(path=tmp_path / "media-library.json")
-        item = next(i for i in media.list_items() if i.path == str(export.resolve()))
+        item = media.register_generated_path(
+            export,
+            kind="video",
+            metadata={"source": "exports", "role": "export"},
+        )
 
         assert item.metadata["role"] == "export"
         assert item.metadata["role"] != "raw_video"
@@ -116,15 +162,10 @@ def test_exports_are_never_offered_as_import_sources(tmp_path):
 def test_an_imported_clip_files_under_the_day_it_was_imported(tmp_path):
     """An IMG_*.MOV keeps the mtime of the day it was filmed. Filing by that would hide it
     from today's calendar, which is where the operator just put it."""
-    import os
-    from datetime import datetime, timedelta, timezone as tz
-    from automated_video_editing_backend.services.media import MediaService
-    from automated_video_editing_backend.services.media_vault import MediaVaultService
-
     clip = tmp_path / "IMG_2026.MOV"
     clip.write_bytes(b"quicktime")
     # filmed two months ago
-    old = (datetime.now(tz.utc) - timedelta(days=60)).timestamp()
+    old = (datetime.now(UTC) - timedelta(days=60)).timestamp()
     os.utime(clip, (old, old))
 
     media = MediaService(path=tmp_path / "media-library.json")
@@ -140,11 +181,7 @@ def test_an_imported_clip_files_under_the_day_it_was_imported(tmp_path):
 
 def test_the_calendar_day_is_local_not_utc(tmp_path):
     """In +0800 anything before 08:00 local would otherwise land on the previous day."""
-    import os
-    from datetime import datetime, timezone as tz
     from automated_video_editing_backend.core.paths import GENERATED_DIRS
-    from automated_video_editing_backend.services.media import MediaService
-    from automated_video_editing_backend.services.media_vault import MediaVaultService
 
     export = GENERATED_DIRS["exports"] / "test-local-day.mp4"
     export.write_bytes(b"x")
@@ -157,14 +194,14 @@ def test_the_calendar_day_is_local_not_utc(tmp_path):
         asset = next(a for a in vault.list_assets() if a.path == str(export.resolve()))
 
         assert asset.day == local_2am.date().isoformat()
-        utc_day = datetime.fromtimestamp(local_2am.timestamp(), tz.utc).date().isoformat()
+        utc_day = datetime.fromtimestamp(local_2am.timestamp(), UTC).date().isoformat()
         if utc_day != local_2am.date().isoformat():
             assert asset.day != utc_day, "still computing the calendar day in UTC"
     finally:
         export.unlink(missing_ok=True)
 
 
-def test_an_export_and_its_master_are_one_entry_not_two():
+def test_an_export_and_its_master_are_one_entry_not_two_after_restart(tmp_path):
     """A subtitled export is saved twice, and the library must not double in length.
 
     The delivered cut and its subtitle-free master are two files but one finished video. They
@@ -174,28 +211,45 @@ def test_an_export_and_its_master_are_one_entry_not_two():
     """
     from automated_video_editing_backend.services.media import MediaService
 
-    delivery = generated_path("exports", "vault-group-test.mp4")
-    master = generated_path("exports", "vault-group-test 母版.mp4")
-    layer = generated_path("exports", "vault-group-test.ass")
+    stem = f"vault-group-{uuid4().hex[:8]}"
+    delivery = generated_path("exports", f"{stem}.mp4")
+    master = generated_path("exports", f"{stem} 母版.mp4")
+    layer = generated_path("exports", f"{stem}.ass")
+    delivery_subtitles = delivery.with_suffix(".subtitles.json")
+    master_subtitles = master.with_suffix(".subtitles.json")
     for path in (delivery, master):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(b"placeholder")
     layer.write_text("[Script Info]\n", encoding="utf-8")
+    for path in (delivery_subtitles, master_subtitles):
+        path.write_text('{"cues": [{"start": 0, "end": 1, "text": "一"}]}', encoding="utf-8")
 
     # Given its own library file: constructed without `path=`, it writes into the real data/
     # directory, which is what the guard in test_tests_do_not_write_project_data.py forbids.
-    media = MediaService(path=Path(tempfile.mkdtemp()) / "media-library.json")
+    library = tmp_path / "media-library.json"
+    media = MediaService(path=library)
     try:
         media.register_generated_path(delivery, kind="video", metadata={
             "source": "exports", "role": "export",
             "export_group": "export:test-1", "variant": "subtitled",
-            "variant_label": "成片（带字幕）"})
+            "variant_label": "成片（带字幕）",
+            "subtitles_path": str(delivery_subtitles),
+            "has_burned_subtitles": True,
+            "has_voiceover": True,
+        })
         media.register_generated_path(master, kind="video", metadata={
             "source": "exports", "role": "export",
             "export_group": "export:test-1", "variant": "master",
-            "variant_label": "母版（无字幕）"})
+            "variant_label": "母版（无字幕）",
+            "subtitles_path": str(master_subtitles),
+            "has_burned_subtitles": False,
+            "has_voiceover": True,
+        })
 
-        assets = MediaVaultService(media).list_assets()
+        # Reconstructing the service is the same boundary as restarting the backend. Generated
+        # ids may change, but the path-keyed render metadata must still join the two files.
+        reopened = MediaService(path=library)
+        assets = MediaVaultService(reopened).list_assets()
         by_path = {asset.path: asset for asset in assets}
 
         # Both carry the same group, so the library can fold them into one row.
@@ -204,11 +258,85 @@ def test_an_export_and_its_master_are_one_entry_not_two():
         assert by_path[str(delivery)].variant_label == "成片（带字幕）"
         assert by_path[str(master)].variant == "master"
 
+        reopened_items = {item.path: item for item in reopened.list_items()}
+        assert reopened_items[str(delivery)].metadata["subtitles_path"] == str(
+            delivery_subtitles
+        )
+        assert reopened_items[str(master)].metadata["subtitles_path"] == str(master_subtitles)
+        assert reopened_items[str(delivery)].metadata["has_burned_subtitles"] is True
+        assert reopened_items[str(master)].metadata["has_burned_subtitles"] is False
+        assert reopened_items[str(delivery)].metadata["has_voiceover"] is True
+        assert reopened_items[str(master)].metadata["has_voiceover"] is True
+
+        # Exports stay available to 手动微调 through role=export, but must never leak into
+        # the raw-video working pool and be automatically re-encoded as source footage.
+        pool = reopened.media_pool()
+        media_ids_by_path = {path: item.id for path, item in reopened_items.items()}
+        assert media_ids_by_path[str(delivery)] not in pool["source_media_ids"]
+        assert media_ids_by_path[str(master)] not in pool["source_media_ids"]
+
         # The cue file is bookkeeping, not an asset — one per video would bury the videos.
         assert str(layer) not in by_path
     finally:
-        for path in (delivery, master, layer):
+        for path in (delivery, master, layer, delivery_subtitles, master_subtitles):
             path.unlink(missing_ok=True)
+
+
+def test_unannotated_export_names_are_never_guessed_into_a_group(tmp_path):
+    """Even an exact-looking legacy pair stays flat unless a render explicitly grouped it."""
+    stem = f"vault-plain-{uuid4().hex[:8]}"
+    delivery = generated_path("exports", f"{stem}.mp4")
+    master = generated_path("exports", f"{stem} 母版.mp4")
+    similar = generated_path("exports", f"{stem} 母版 副本.mp4")
+    for path in (delivery, master, similar):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"placeholder")
+
+    try:
+        media = MediaService(path=tmp_path / "media-library.json")
+        assets = MediaVaultService(media).list_assets()
+        by_path = {asset.path: asset for asset in assets}
+
+        assert by_path[str(delivery)].export_group == ""
+        assert by_path[str(master)].export_group == ""
+        assert by_path[str(similar)].export_group == ""
+    finally:
+        for path in (delivery, master, similar):
+            path.unlink(missing_ok=True)
+
+
+def test_deleted_export_metadata_is_pruned_on_refresh(tmp_path):
+    stem = f"vault-delete-{uuid4().hex[:8]}"
+    delivery = generated_path("exports", f"{stem}.mp4")
+    master = generated_path("exports", f"{stem} 母版.mp4")
+    for path in (delivery, master):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"placeholder")
+
+    library = tmp_path / "media-library.json"
+    media = MediaService(path=library)
+    group = f"export:{uuid4()}"
+    try:
+        media.register_generated_path(delivery, kind="video", metadata={
+            "source": "exports", "role": "export", "export_group": group,
+            "variant": "subtitled", "variant_label": "成片（带字幕）",
+        })
+        media.register_generated_path(master, kind="video", metadata={
+            "source": "exports", "role": "export", "export_group": group,
+            "variant": "master", "variant_label": "母版（无字幕）",
+        })
+
+        master.unlink()
+        media.list_items()
+
+        saved = json.loads(
+            media.generated_metadata_path.read_text(encoding="utf-8")
+        )["items"]
+        assert str(delivery) in saved
+        assert str(master) not in saved
+    finally:
+        delivery.unlink(missing_ok=True)
+        master.unlink(missing_ok=True)
 
 
 def test_an_ordinary_export_carries_no_group():

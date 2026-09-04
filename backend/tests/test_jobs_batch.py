@@ -1,11 +1,27 @@
+import json
 import tempfile
 from pathlib import Path
 
 import pytest
 
-from automated_video_editing_backend.core.models import EditBatchRequest, EditJobRequest
+from automated_video_editing_backend.core.models import (
+    EditBatchRequest,
+    EditJobRequest,
+    EditTimeline,
+    JobRecord,
+    JobStatus,
+    MediaItem,
+    SubtitleCue,
+    SubtitleTrack,
+    TimelineAudioBed,
+    TimelineClip,
+)
 from automated_video_editing_backend.services.jobs import JobService
-from automated_video_editing_backend.services.media import MediaService
+from automated_video_editing_backend.services.media import (
+    GeneratedMetadataPersistenceError,
+    MediaService,
+)
+from automated_video_editing_backend.services.render import RenderService
 
 
 class DummyEvents:
@@ -63,6 +79,154 @@ async def test_job_service_auto_names_exports_and_creates_batch(tmp_path):
     # and one voiceover over three outputs left one with music, one with narration, one mute.
     assert all(job.request.music_media_id == music.id for job in batch)
     assert all(job.request.voiceover_media_id == voice.id for job in batch)
+
+
+@pytest.mark.asyncio
+async def test_single_job_rejects_an_output_name_that_escapes_into_downloads(tmp_path):
+    media = MediaService(path=tmp_path / "media-library.json")
+    video = media.import_path(str(_write(tmp_path / "source.mp4")))
+    service = JobService(DummyEvents(), media, None, None, None)
+
+    with pytest.raises(ValueError, match="cannot contain"):
+        await service.create(EditJobRequest(
+            media_ids=[video.id],
+            output_name="../data/downloads/escaped.mp4",
+        ))
+
+    assert service.list_jobs() == []
+
+
+@pytest.mark.asyncio
+async def test_batch_title_is_only_a_filename_stem_and_cannot_escape_exports(tmp_path):
+    from automated_video_editing_backend.core.paths import GENERATED_DIRS
+
+    media = MediaService(path=tmp_path / "media-library.json")
+    video = media.import_path(str(_write(tmp_path / "source.mp4")))
+    service = JobService(DummyEvents(), media, None, None, None)
+
+    async def noop(_job_id):
+        return None
+
+    service._run = noop
+    jobs = await service.create_batch(EditBatchRequest(
+        title="../../data/downloads/escaped",
+        media_ids=[video.id],
+        output_count=2,
+    ))
+
+    export_root = GENERATED_DIRS["exports"].resolve()
+    assert len(jobs) == 2
+    assert all("/" not in job.request.output_name for job in jobs)
+    assert all("\\" not in job.request.output_name for job in jobs)
+    assert all(
+        (export_root / job.request.output_name).resolve().parent == export_root
+        for job in jobs
+    )
+
+
+@pytest.mark.asyncio
+async def test_manual_timeline_rejects_downloads_output_before_render_or_restart(tmp_path):
+    from automated_video_editing_backend.core.paths import generated_path
+
+    media_path = tmp_path / "media-library.json"
+    media = MediaService(path=media_path)
+    video = media.import_path(str(_write(tmp_path / "source.mp4")))
+    escaped = generated_path("data", "downloads", "escaped-manual-output.mp4")
+    escaped.unlink(missing_ok=True)
+    service = JobService(DummyEvents(), media, None, None, RenderService())
+    timeline = EditTimeline(
+        title="unsafe manual output",
+        output_path=str(escaped),
+        clips=[TimelineClip(
+            media_id=video.id,
+            source_path=video.path,
+            start=0,
+            duration=1,
+            timeline_start=0,
+        )],
+    )
+
+    with pytest.raises(ValueError, match="managed exports"):
+        await service.create_from_timeline(timeline)
+
+    assert not escaped.exists()
+    reopened = MediaService(path=media_path)
+    assert all(item.path != str(escaped) for item in reopened.list_items())
+
+
+@pytest.mark.asyncio
+async def test_manual_timeline_rejects_a_clip_path_unknown_to_the_media_library(tmp_path):
+    media = MediaService(path=tmp_path / "media-library.json")
+    unknown = _write(tmp_path / "unknown.mp4")
+    service = JobService(DummyEvents(), media, None, None, RenderService())
+    timeline = EditTimeline(
+        title="unknown clip",
+        output_path="",
+        clips=[TimelineClip(
+            media_id="forged-or-stale-id",
+            source_path=str(unknown),
+            start=0,
+            duration=1,
+            timeline_start=0,
+        )],
+    )
+
+    with pytest.raises(ValueError, match="不在媒体库"):
+        await service.create_from_timeline(timeline)
+
+    assert service.list_jobs() == []
+
+
+@pytest.mark.asyncio
+async def test_manual_timeline_rejects_an_unknown_retained_audio_bed(tmp_path):
+    media = MediaService(path=tmp_path / "media-library.json")
+    clip = media.import_path(str(_write(tmp_path / "known.mp4")))
+    unknown_bed = _write(tmp_path / "unknown-bed.mp4")
+    service = JobService(DummyEvents(), media, None, None, RenderService())
+    timeline = EditTimeline(
+        title="unknown bed",
+        output_path="",
+        clips=[TimelineClip(
+            media_id=clip.id,
+            source_path=clip.path,
+            start=0,
+            duration=1,
+            timeline_start=0,
+        )],
+        audio_bed=TimelineAudioBed(source_path=str(unknown_bed)),
+    )
+
+    with pytest.raises(ValueError, match="原声不在媒体库"):
+        await service.create_from_timeline(timeline)
+
+    assert service.list_jobs() == []
+
+
+@pytest.mark.asyncio
+async def test_manual_timeline_rejects_client_subtitles_without_a_bed_sidecar(tmp_path):
+    media = MediaService(path=tmp_path / "media-library.json")
+    clip = media.import_path(str(_write(tmp_path / "known-no-sidecar.mp4")))
+    service = JobService(DummyEvents(), media, None, None, RenderService())
+    timeline = EditTimeline(
+        title="unverified client track",
+        output_path="",
+        clips=[TimelineClip(
+            media_id=clip.id,
+            source_path=clip.path,
+            start=0,
+            duration=1,
+            timeline_start=0,
+        )],
+        audio_bed=TimelineAudioBed(source_path=clip.path),
+        subtitles=SubtitleTrack(cues=[
+            SubtitleCue(start=0, end=0.8, text="客户端提交的未知字幕"),
+        ]),
+    )
+
+    with pytest.raises(ValueError, match="没有可验证的字幕数据"):
+        await service.create_from_timeline(timeline)
+
+    assert service.list_jobs() == []
 
 
 @pytest.mark.asyncio
@@ -488,6 +652,527 @@ async def test_job_service_rejects_export_as_source(tmp_path):
         await service.create(EditJobRequest(media_ids=[export.id]))
 
 
+@pytest.mark.asyncio
+async def test_physical_export_path_cannot_be_forged_into_an_automatic_source(
+    tmp_path,
+):
+    from uuid import uuid4
+
+    from automated_video_editing_backend.core.paths import generated_path
+
+    path = generated_path("exports", f"forged-source-{uuid4().hex[:8]}.mp4")
+    path.write_bytes(b"delivery")
+    try:
+        media = MediaService(path=tmp_path / "media-library.json")
+        forged = MediaItem(
+            path=str(path),
+            kind="video",
+            metadata={"source": "local_import", "role": "raw_video"},
+        )
+        media._items[forged.id] = forged
+        service = JobService(DummyEvents(), media, None, None, None)
+
+        with pytest.raises(ValueError, match="Source videos"):
+            await service.create(EditJobRequest(media_ids=[forged.id]))
+
+        with pytest.raises(ValueError, match="Source videos"):
+            await service.create_batch(EditBatchRequest(media_ids=[forged.id]))
+    finally:
+        path.unlink(missing_ok=True)
+
+
+@pytest.mark.asyncio
+async def test_managed_effect_path_cannot_be_forged_into_an_automatic_source(tmp_path):
+    from uuid import uuid4
+
+    from automated_video_editing_backend.core.paths import generated_path
+
+    path = generated_path(
+        "data", "seedance", "effects", f"forged-source-{uuid4().hex[:8]}.mp4"
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"effect")
+    try:
+        media = MediaService(path=tmp_path / "media-library.json")
+        forged = MediaItem(
+            path=str(path),
+            kind="video",
+            metadata={"source": "local_import", "role": "raw_video"},
+        )
+        media._items[forged.id] = forged
+        service = JobService(DummyEvents(), media, None, None, None)
+
+        with pytest.raises(ValueError, match="Source videos"):
+            await service.create(EditJobRequest(media_ids=[forged.id]))
+
+        with pytest.raises(ValueError, match="Source videos"):
+            await service.create_batch(EditBatchRequest(media_ids=[forged.id]))
+    finally:
+        path.unlink(missing_ok=True)
+
+
+@pytest.mark.asyncio
+async def test_failed_delivery_registration_removes_the_new_flat_file_family(
+    tmp_path, monkeypatch
+):
+    from uuid import uuid4
+
+    from automated_video_editing_backend.core.paths import generated_path
+
+    output = generated_path("exports", f"failed-delivery-{uuid4().hex[:8]}.mp4")
+    renderer = RenderService()
+    media = MediaService(path=tmp_path / "media-library.json")
+    service = JobService(DummyEvents(), media, None, None, renderer)
+    timeline = EditTimeline(
+        title="failure",
+        output_path=str(output),
+        clips=[TimelineClip(
+            media_id="source", source_path=str(tmp_path / "source.mp4"),
+            start=0, duration=1, timeline_start=0,
+        )],
+        subtitles=None,
+    )
+    job = JobRecord(
+        request=EditJobRequest(title="failure", media_ids=["source"]),
+        timeline=timeline,
+    )
+    service._jobs[job.id] = job
+
+    async def fake_render(_timeline):
+        output.write_bytes(b"delivery")
+        output.with_suffix(".ass").write_text("subtitle", encoding="utf-8")
+        output.with_suffix(".subtitles.json").write_text("{}", encoding="utf-8")
+        return str(output)
+
+    monkeypatch.setattr(renderer, "render", fake_render)
+    monkeypatch.setattr(
+        media,
+        "register_generated_paths",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            GeneratedMetadataPersistenceError("simulated registration failure")
+        ),
+    )
+
+    await service._run_job(job.id)
+
+    assert job.status == JobStatus.FAILED
+    assert "simulated registration failure" in job.error
+    assert not output.exists()
+    assert not output.with_suffix(".ass").exists()
+    assert not output.with_suffix(".subtitles.json").exists()
+
+
+@pytest.mark.asyncio
+async def test_failed_group_registration_removes_delivery_and_master_without_publishing(
+    tmp_path, monkeypatch
+):
+    from uuid import uuid4
+
+    from automated_video_editing_backend.core.paths import generated_path
+
+    output = generated_path("exports", f"failed-master-{uuid4().hex[:8]}.mp4")
+    master = output.with_name(f"{output.stem} 母版{output.suffix}")
+    renderer = RenderService()
+    media = MediaService(path=tmp_path / "media-library.json")
+    service = JobService(DummyEvents(), media, None, None, renderer)
+    timeline = EditTimeline(
+        title="master failure",
+        output_path=str(output),
+        clips=[TimelineClip(
+            media_id="source", source_path=str(tmp_path / "source.mp4"),
+            start=0, duration=1, timeline_start=0,
+        )],
+        subtitles=SubtitleTrack(cues=[SubtitleCue(start=0, end=0.8, text="一句")]),
+    )
+    job = JobRecord(
+        request=EditJobRequest(title="master failure", media_ids=["source"]),
+        timeline=timeline,
+    )
+    service._jobs[job.id] = job
+
+    async def fake_render(_timeline):
+        output.write_bytes(b"delivery")
+        output.with_suffix(".ass").write_text("subtitle", encoding="utf-8")
+        output.with_suffix(".subtitles.json").write_text("{}", encoding="utf-8")
+        return str(output)
+
+    async def fake_master(_timeline):
+        master.write_bytes(b"master")
+        master.with_suffix(".subtitles.json").write_text("{}", encoding="utf-8")
+        return str(master)
+
+    monkeypatch.setattr(renderer, "render", fake_render)
+    monkeypatch.setattr(renderer, "render_master", fake_master)
+    monkeypatch.setattr(
+        media,
+        "register_generated_paths",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            GeneratedMetadataPersistenceError("simulated group registration failure")
+        ),
+    )
+    try:
+        await service._run_job(job.id)
+
+        assert job.status == JobStatus.FAILED
+        assert "simulated group registration failure" in job.error
+        assert not output.exists()
+        assert not output.with_suffix(".ass").exists()
+        assert not output.with_suffix(".subtitles.json").exists()
+        assert not master.exists()
+        assert not master.with_suffix(".subtitles.json").exists()
+        assert all(
+            item.path not in {str(output), str(master)} for item in media.list_items()
+        )
+        if media.generated_metadata_path.exists():
+            manifest = json.loads(
+                media.generated_metadata_path.read_text(encoding="utf-8")
+            )
+            assert str(output) not in manifest["items"]
+            assert str(master) not in manifest["items"]
+    finally:
+        for path in (
+            output,
+            output.with_suffix(".ass"),
+            output.with_suffix(".subtitles.json"),
+            master,
+            master.with_suffix(".subtitles.json"),
+        ):
+            path.unlink(missing_ok=True)
+
+
+@pytest.mark.asyncio
+async def test_master_render_failure_removes_the_entire_new_export_group(
+    tmp_path, monkeypatch
+):
+    from uuid import uuid4
+
+    from automated_video_editing_backend.core.paths import generated_path
+
+    output = generated_path("exports", f"master-render-failure-{uuid4().hex[:8]}.mp4")
+    master = output.with_name(f"{output.stem} 母版{output.suffix}")
+    renderer = RenderService()
+    media = MediaService(path=tmp_path / "media-library.json")
+    service = JobService(DummyEvents(), media, None, None, renderer)
+    timeline = EditTimeline(
+        title="master render failure",
+        output_path=str(output),
+        clips=[TimelineClip(
+            media_id="source", source_path=str(tmp_path / "source.mp4"),
+            start=0, duration=1, timeline_start=0,
+        )],
+        subtitles=SubtitleTrack(cues=[SubtitleCue(start=0, end=0.8, text="一句")]),
+    )
+    job = JobRecord(
+        request=EditJobRequest(title="master render failure", media_ids=["source"]),
+        timeline=timeline,
+    )
+    service._jobs[job.id] = job
+
+    async def fake_render(_timeline):
+        output.write_bytes(b"delivery")
+        output.with_suffix(".ass").write_text("subtitle", encoding="utf-8")
+        output.with_suffix(".subtitles.json").write_text("{}", encoding="utf-8")
+        return str(output)
+
+    async def fail_master(_timeline):
+        master.write_bytes(b"partial master")
+        master.with_suffix(".subtitles.json").write_text("{}", encoding="utf-8")
+        raise RuntimeError("simulated master render failure")
+
+    monkeypatch.setattr(renderer, "render", fake_render)
+    monkeypatch.setattr(renderer, "render_master", fail_master)
+    try:
+        await service._run_job(job.id)
+
+        assert job.status == JobStatus.FAILED
+        assert "simulated master render failure" in job.error
+        for path in (
+            output,
+            output.with_suffix(".ass"),
+            output.with_suffix(".subtitles.json"),
+            master,
+            master.with_suffix(".ass"),
+            master.with_suffix(".subtitles.json"),
+        ):
+            assert not path.exists()
+        assert all(
+            item.path not in {str(output), str(master)} for item in media.list_items()
+        )
+    finally:
+        for path in (
+            output,
+            output.with_suffix(".ass"),
+            output.with_suffix(".subtitles.json"),
+            master,
+            master.with_suffix(".ass"),
+            master.with_suffix(".subtitles.json"),
+        ):
+            path.unlink(missing_ok=True)
+
+
+@pytest.mark.asyncio
+async def test_out_of_range_carried_cues_publish_one_unsubtitled_output(
+    tmp_path, monkeypatch
+):
+    """Rendering, registration and master creation share the same output-clock boundary."""
+    from uuid import uuid4
+
+    from automated_video_editing_backend.core.paths import generated_path
+
+    output = generated_path("exports", f"outside-cues-{uuid4().hex[:8]}.mp4")
+    master = output.with_name(f"{output.stem} 母版{output.suffix}")
+    source_path = _write(tmp_path / "source.mp4")
+    media = MediaService(path=tmp_path / "media-library.json")
+    source = media.import_path(str(source_path))
+    renderer = RenderService()
+    service = JobService(DummyEvents(), media, None, None, renderer)
+    timeline = EditTimeline(
+        title="outside cues",
+        output_path=str(output),
+        clips=[TimelineClip(
+            media_id=source.id, source_path=source.path,
+            start=0, duration=2, timeline_start=0,
+        )],
+        audio_bed=TimelineAudioBed(
+            source_path=source.path,
+            source_start=10,
+            timeline_start=0,
+            has_voiceover=True,
+        ),
+        subtitles=SubtitleTrack(cues=[
+            SubtitleCue(start=1, end=2, text="no longer in this cut"),
+        ]),
+    )
+    job = JobRecord(
+        request=EditJobRequest(title="outside cues", media_ids=[source.id]),
+        timeline=timeline,
+    )
+    service._jobs[job.id] = job
+
+    async def fake_ffmpeg(args):
+        Path(args[-1]).write_bytes(b"single output")
+
+    monkeypatch.setattr(renderer, "_run", fake_ffmpeg)
+    try:
+        await service._run_job(job.id)
+
+        assert job.status == JobStatus.SUCCEEDED
+        assert job.result_path == str(output)
+        published = next(item for item in media.list_items() if item.path == str(output))
+        assert published.metadata["variant"] == "single"
+        assert published.metadata["variant_label"] == "成片"
+        assert published.metadata["subtitles_path"] == ""
+        assert published.metadata["has_burned_subtitles"] is False
+        assert output.exists()
+        assert not output.with_suffix(".ass").exists()
+        assert not output.with_suffix(".subtitles.json").exists()
+        assert not master.exists()
+        assert not master.with_suffix(".subtitles.json").exists()
+    finally:
+        for path in (
+            output,
+            output.with_suffix(".ass"),
+            output.with_suffix(".subtitles.json"),
+            master,
+            master.with_suffix(".subtitles.json"),
+        ):
+            path.unlink(missing_ok=True)
+
+
+@pytest.mark.asyncio
+async def test_manual_tune_rejects_a_burned_export_even_when_it_is_not_the_first_clip(
+    tmp_path,
+):
+    """Exports remain selectable for inspection, but cannot be submitted as re-cut picture."""
+    from uuid import uuid4
+
+    from automated_video_editing_backend.core.paths import generated_path
+
+    token = uuid4().hex[:8]
+    original = generated_path("exports", f"burned-original-{token}.mp4")
+    try:
+        original.write_bytes(b"subtitle pixels")
+        media = MediaService(path=tmp_path / "media-library.json")
+        original_item = media.register_generated_path(
+            original,
+            kind="video",
+            metadata={
+                "source": "exports",
+                "role": "export",
+                "variant": "subtitled",
+                "has_burned_subtitles": True,
+            },
+        )
+        safe_path = _write(tmp_path / "safe-source.mp4")
+        safe = media.import_path(str(safe_path))
+        timeline = EditTimeline(
+            title="unsafe recut",
+            output_path="",
+            clips=[
+                TimelineClip(
+                    media_id=safe.id,
+                    source_path=safe.path,
+                    start=0,
+                    duration=1,
+                    timeline_start=0,
+                ),
+                TimelineClip(
+                    # Simulate a stale/direct client trying to make a burned path look unrelated.
+                    # The backend must bind provenance to the path FFmpeg will actually open.
+                    media_id="stale-or-forged-export-id",
+                    source_path=original_item.path,
+                    start=0,
+                    duration=1,
+                    timeline_start=1,
+                ),
+            ],
+        )
+        service = JobService(DummyEvents(), media, None, None, RenderService())
+
+        with pytest.raises(ValueError, match="字幕已烧录"):
+            await service.create_from_timeline(timeline)
+
+        assert service.list_jobs() == []
+        assert not Path(timeline.output_path).exists()
+    finally:
+        original.unlink(missing_ok=True)
+
+
+@pytest.mark.asyncio
+async def test_manual_tune_restores_its_authoritative_track_when_an_old_client_omits_it(
+    tmp_path,
+):
+    """The backend closes the old-client/loading-race path without silently dropping words."""
+    from uuid import uuid4
+
+    from automated_video_editing_backend.core.paths import generated_path
+
+    master = generated_path("exports", f"clean-master-{uuid4().hex[:8]}.mp4")
+    sidecar = master.with_suffix(".subtitles.json")
+    try:
+        master.write_bytes(b"clean picture and mixed sound")
+        sidecar.write_text(
+            '{"cues":[{"start":0,"end":1,"text":"六和桥"}]}',
+            encoding="utf-8",
+        )
+        media = MediaService(path=tmp_path / "media-library.json")
+        master_item = media.register_generated_path(
+            master,
+            kind="video",
+            metadata={
+                "source": "exports",
+                "role": "export",
+                "variant": "master",
+                "subtitles_path": str(sidecar),
+                "has_burned_subtitles": False,
+                "has_voiceover": True,
+            },
+        )
+        timeline = EditTimeline(
+            title="missing carried track",
+            output_path="",
+            clips=[TimelineClip(
+                media_id=master_item.id,
+                source_path=master_item.path,
+                start=0,
+                duration=1,
+                timeline_start=0,
+            )],
+            audio_bed=TimelineAudioBed(
+                source_path=master_item.path,
+                source_start=0,
+                timeline_start=0,
+                has_voiceover=True,
+            ),
+            subtitles=None,
+        )
+        service = JobService(DummyEvents(), media, None, None, RenderService())
+
+        async def noop(_job_id):
+            return None
+
+        service._run = noop
+        job = await service.create_from_timeline(timeline)
+
+        assert job.timeline.subtitles is not None
+        assert [cue.text for cue in job.timeline.subtitles.cues] == ["六和桥"]
+        assert job.request.subtitles is True
+        assert not Path(timeline.output_path).exists()
+    finally:
+        master.unlink(missing_ok=True)
+        sidecar.unlink(missing_ok=True)
+
+
+@pytest.mark.asyncio
+async def test_manual_tune_replaces_another_exports_subtitles_with_the_beds_own_track(
+    tmp_path,
+):
+    """A direct client cannot pair export A's soundtrack with export B's submitted words."""
+    from uuid import uuid4
+
+    from automated_video_editing_backend.core.paths import generated_path
+
+    master = generated_path("exports", f"bound-master-{uuid4().hex[:8]}.mp4")
+    sidecar = master.with_suffix(".subtitles.json")
+    try:
+        master.write_bytes(b"clean picture and mixed sound")
+        sidecar.write_text(
+            json.dumps({
+                "video": master.name,
+                "cues": [{"start": 0, "end": 1, "text": "六和桥"}],
+            }, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        media = MediaService(path=tmp_path / "media-library.json")
+        master_item = media.register_generated_path(
+            master,
+            kind="video",
+            metadata={
+                "source": "exports",
+                "role": "export",
+                "variant": "master",
+                "subtitles_path": str(sidecar),
+                "has_burned_subtitles": False,
+                "has_voiceover": True,
+            },
+        )
+        timeline = EditTimeline(
+            title="mismatched client track",
+            output_path="",
+            clips=[TimelineClip(
+                media_id=master_item.id,
+                source_path=master_item.path,
+                start=0,
+                duration=1,
+                timeline_start=0,
+            )],
+            audio_bed=TimelineAudioBed(
+                source_path=master_item.path,
+                source_start=0,
+                timeline_start=0,
+                has_voiceover=True,
+            ),
+            subtitles=SubtitleTrack(
+                cues=[SubtitleCue(start=0, end=1, text="错误的六合桥")]
+            ),
+        )
+        service = JobService(DummyEvents(), media, None, None, RenderService())
+
+        async def noop(_job_id):
+            return None
+
+        service._run = noop
+        job = await service.create_from_timeline(timeline)
+
+        assert job.timeline.subtitles is not None
+        assert [cue.text for cue in job.timeline.subtitles.cues] == ["六和桥"]
+        assert all(cue.text != "错误的六合桥" for cue in job.timeline.subtitles.cues)
+        assert not Path(timeline.output_path).exists()
+    finally:
+        master.unlink(missing_ok=True)
+        sidecar.unlink(missing_ok=True)
+
+
 def _write(path):
     path.write_bytes(b"placeholder")
     return path
@@ -547,6 +1232,51 @@ def test_two_exports_in_the_same_minute_do_not_collide(tmp_path):
     assert len(names) == 3, names
 
 
+@pytest.mark.parametrize(
+    "blocked_member",
+    [
+        "delivery",
+        "master",
+        "delivery_ass",
+        "delivery_subtitles",
+        "master_ass",
+        "master_subtitles",
+    ],
+)
+def test_output_name_reserves_the_whole_export_file_family(
+    tmp_path, monkeypatch, blocked_member
+):
+    """An orphaned hidden companion must not be overwritten by a later render."""
+    from datetime import datetime as real_datetime
+
+    import automated_video_editing_backend.services.jobs as jobs_module
+
+    media = MediaService(path=tmp_path / "media-library.json")
+    jobs = JobService(DummyEvents(), media, None, None, None)
+
+    class FrozenDatetime:
+        @classmethod
+        def now(cls):
+            return real_datetime(2026, 9, 4, 14, 23).astimezone()
+
+    monkeypatch.setattr(jobs_module, "datetime", FrozenDatetime)
+    monkeypatch.setitem(jobs_module.GENERATED_DIRS, "exports", tmp_path)
+
+    delivery = tmp_path / "客户成片 09-04 14-23.mp4"
+    master = tmp_path / "客户成片 09-04 14-23 母版.mp4"
+    family = {
+        "delivery": delivery,
+        "master": master,
+        "delivery_ass": delivery.with_suffix(".ass"),
+        "delivery_subtitles": delivery.with_suffix(".subtitles.json"),
+        "master_ass": master.with_suffix(".ass"),
+        "master_subtitles": master.with_suffix(".subtitles.json"),
+    }
+    family[blocked_member].write_bytes(b"existing")
+
+    assert jobs._next_output_name("客户成片") == "客户成片 09-04 14-23_01.mp4"
+
+
 @pytest.mark.asyncio
 async def test_manual_tune_render_also_honours_the_original_audio_toggle(tmp_path):
     """手动微调 renders a client-built timeline, which skipped the audio resolution entirely.
@@ -574,6 +1304,8 @@ async def test_manual_tune_render_also_honours_the_original_audio_toggle(tmp_pat
     )
 
     media = MediaService(path=Path(tempfile.mkdtemp()) / "media-library.json")
+    clip_item = media.import_path(str(clip_path))
+    silent_item = media.import_path(str(silent_path))
     service = JobService(DummyEvents(), media, None, None, RenderService())
 
     async def noop(_job_id):
@@ -583,29 +1315,35 @@ async def test_manual_tune_render_also_honours_the_original_audio_toggle(tmp_pat
 
     def timeline_for(source, mute):
         return EditTimeline(
-            title="tune", output_path=str(tmp_path / "out.mp4"), mute_original_audio=mute,
-            clips=[TimelineClip(media_id="c1", source_path=str(source), start=0, duration=1, timeline_start=0)],
+            title="tune", output_path="", mute_original_audio=mute,
+            clips=[TimelineClip(
+                media_id=source.id,
+                source_path=source.path,
+                start=0,
+                duration=1,
+                timeline_start=0,
+            )],
         )
 
-    kept = await service.create_from_timeline(timeline_for(clip_path, mute=False))
+    kept = await service.create_from_timeline(timeline_for(clip_item, mute=False))
     assert kept.timeline.include_original_audio is True
 
-    muted = await service.create_from_timeline(timeline_for(clip_path, mute=True))
+    muted = await service.create_from_timeline(timeline_for(clip_item, mute=True))
     assert muted.timeline.include_original_audio is False
 
     # A source with no audio track downgrades instead of failing the whole render.
-    downgraded = await service.create_from_timeline(timeline_for(silent_path, mute=False))
+    downgraded = await service.create_from_timeline(timeline_for(silent_item, mute=False))
     assert downgraded.timeline.include_original_audio is False
     assert any("没有声音轨" in warning for warning in downgraded.timeline.warnings)
 
-    effect_timeline = timeline_for(clip_path, mute=True)
+    effect_timeline = timeline_for(clip_item, mute=True)
     effect_timeline.clips[0].include_audio = True
     effect_timeline.clips[0].audio_volume = 0.3
     effect = await service.create_from_timeline(effect_timeline)
     assert effect.timeline.clips[0].include_audio is True
     assert effect.timeline.clips[0].audio_volume == 0.3
 
-    silent_effect_timeline = timeline_for(silent_path, mute=True)
+    silent_effect_timeline = timeline_for(silent_item, mute=True)
     silent_effect_timeline.clips[0].include_audio = True
     silent_effect = await service.create_from_timeline(silent_effect_timeline)
     assert silent_effect.timeline.clips[0].include_audio is False

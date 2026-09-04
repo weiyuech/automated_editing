@@ -318,13 +318,13 @@
             </div>
             <p class="form-hint">每到达一个点位随机停留 {{ cruiseDwellMin }}–{{ cruiseDwellMax }} 秒，避免刚到就转身、拍不到可用画面。</p>
 
-            <label class="toggle-row"><input v-model="cruiseAutoCamerawork" type="checkbox" />自动运镜（使用「镜头设置」中的配置；默认关闭）</label>
+            <label class="toggle-row"><input v-model="cruiseAutoCamerawork" type="checkbox" />自动运镜（使用「镜头设置」中的配置）</label>
             <template v-if="cruiseAutoCamerawork">
               <p class="form-hint">巡游移动时缓慢调整水平和俯仰；到达点位并停稳后执行变焦，运镜结束后回到锚点。请先在「镜头设置」中完成配置。</p>
               <div class="button-row"><button @click="goToCameraworkSettings">前往镜头设置</button></div>
               <p v-if="!cameraworkConfigured" class="inline-status danger">尚未配置自动运镜，请先前往「镜头设置」。</p>
             </template>
-            <label class="toggle-row"><input v-model="cruiseScanEnabled" type="checkbox" :disabled="cruiseAutoCamerawork" />停留时云台缓慢扫视（可选，默认关闭）</label>
+            <label class="toggle-row"><input v-model="cruiseScanEnabled" type="checkbox" :disabled="cruiseAutoCamerawork" />停留时云台缓慢扫视</label>
             <template v-if="cruiseScanEnabled && !cruiseAutoCamerawork">
               <div class="settings-pair">
                 <select v-model="cruiseScanDirection" class="field">
@@ -476,28 +476,64 @@
               <div class="day-detail">
                 <div class="day-header compact">
                   <span>{{ selectedCalendarDate }}</span>
-                  <span>{{ selectedCalendarAssets.length }} 个素材</span>
+                  <span>{{ selectedCalendarSummary }}</span>
                 </div>
                 <div v-if="selectedCalendarAssets.length === 0" class="empty">这一天暂无媒体。</div>
-                <div v-else class="asset-list scroll-list">
-                  <div v-for="asset in selectedCalendarAssets" :key="asset.id" class="asset-row compact">
-                    <span class="role-pill" :class="asset.role">{{ roleLabel(asset.role) }}</span>
-                    <span class="asset-name">{{ asset.name }}</span>
-                    <span>{{ formatBytes(asset.size_bytes) }}</span>
-                    <span v-if="renameTarget === asset.path" class="asset-actions">
-                      <input v-model="renameValue" class="field compact-field rename-input" placeholder="新名称"
-                             @keyup.enter="confirmRename" @keyup.esc="cancelRename" />
-                      <button class="primary" :disabled="!renameValue.trim() || isRenaming" @click="confirmRename">确认</button>
-                      <button @click="cancelRename">取消</button>
-                    </span>
-                    <span v-else class="asset-actions">
-                      <button v-if="asset.can_rename" @click="startRename(asset.path, asset.name)">重命名</button>
-                      <button :disabled="!asset.can_preview" @click="openAsset(asset)">打开</button>
-                      <button @click="revealAsset(asset)">定位</button>
-                      <button v-if="asset.can_forget" @click="forgetAsset(asset)">移出</button>
-                      <button v-else class="danger" :disabled="!asset.can_delete" @click="trashAsset(asset)">删除</button>
-                    </span>
-                  </div>
+                <div v-else class="asset-list">
+                  <template v-for="row in selectedCalendarRows" :key="row.key">
+                    <div v-if="row.type === 'group'" class="asset-row compact group-row" @click="toggleVaultGroup(row.key)">
+                      <span><span class="role-pill export">{{ roleLabel('export') }}</span></span>
+                      <span class="group-name">
+                        <span class="group-caret" :class="{ open: expandedVaultGroups[row.key] }">▸</span>
+                        {{ row.name }}
+                      </span>
+                      <span>{{ formatBytes(row.size_bytes) }}</span>
+                      <span class="asset-actions">
+                        <span class="group-count">{{ row.members.length }} 个视频</span>
+                        <button class="danger" @click.stop="trashVaultGroup(row)">全部删除</button>
+                      </span>
+                    </div>
+                    <template v-if="row.type === 'group' && expandedVaultGroups[row.key]">
+                      <div v-for="member in row.members" :key="member.id" class="asset-row compact group-child calendar-group-child">
+                        <span></span>
+                        <span class="calendar-group-child-name">
+                          <strong>{{ member.variant_label || member.name }}</strong>
+                          <small>{{ member.name }}</small>
+                        </span>
+                        <span>{{ formatBytes(member.size_bytes) }}</span>
+                        <span v-if="renameTarget === member.path" class="asset-actions">
+                          <input v-model="renameValue" class="field compact-field rename-input" placeholder="新名称"
+                                 @keyup.enter="confirmRename" @keyup.esc="cancelRename" />
+                          <button class="primary" :disabled="!renameValue.trim() || isRenaming" @click="confirmRename">确认</button>
+                          <button @click="cancelRename">取消</button>
+                        </span>
+                        <span v-else class="asset-actions">
+                          <button v-if="member.can_rename" @click="startRename(member.path, member.name)">重命名</button>
+                          <button :disabled="!member.can_preview" @click="openAsset(member)">打开</button>
+                          <button @click="revealAsset(member)">定位</button>
+                          <button class="danger" :disabled="!member.can_delete" @click="trashAsset(member)">删除</button>
+                        </span>
+                      </div>
+                    </template>
+                    <div v-else-if="row.type === 'asset'" class="asset-row compact">
+                      <span class="role-pill" :class="row.asset.role">{{ roleLabel(row.asset.role) }}</span>
+                      <span class="asset-name">{{ row.asset.name }}</span>
+                      <span>{{ formatBytes(row.asset.size_bytes) }}</span>
+                      <span v-if="renameTarget === row.asset.path" class="asset-actions">
+                        <input v-model="renameValue" class="field compact-field rename-input" placeholder="新名称"
+                               @keyup.enter="confirmRename" @keyup.esc="cancelRename" />
+                        <button class="primary" :disabled="!renameValue.trim() || isRenaming" @click="confirmRename">确认</button>
+                        <button @click="cancelRename">取消</button>
+                      </span>
+                      <span v-else class="asset-actions">
+                        <button v-if="row.asset.can_rename" @click="startRename(row.asset.path, row.asset.name)">重命名</button>
+                        <button :disabled="!row.asset.can_preview" @click="openAsset(row.asset)">打开</button>
+                        <button @click="revealAsset(row.asset)">定位</button>
+                        <button v-if="row.asset.can_forget" @click="forgetAsset(row.asset)">移出</button>
+                        <button v-else class="danger" :disabled="!row.asset.can_delete" @click="trashAsset(row.asset)">删除</button>
+                      </span>
+                    </div>
+                  </template>
                 </div>
               </div>
             </div>
@@ -529,10 +565,20 @@
               <template v-if="row.type === 'group' && expandedVaultGroups[row.key]">
                 <div v-for="member in row.members" :key="member.id" class="table-row group-child">
                   <span></span>
-                  <span class="group-child-name">{{ member.variant_label || member.name }}</span>
+                  <span class="group-child-name">
+                    <strong>{{ member.variant_label || member.name }}</strong>
+                    <small class="group-child-file">{{ member.name }}</small>
+                  </span>
                   <span>{{ formatBytes(member.size_bytes) }}</span>
-                  <span class="group-child-file">{{ member.name }}</span>
-                  <span class="asset-actions">
+                  <span>{{ formatDate(member.modified_at) }}</span>
+                  <span v-if="renameTarget === member.path" class="asset-actions">
+                    <input v-model="renameValue" class="field compact-field rename-input" placeholder="新名称"
+                           @keyup.enter="confirmRename" @keyup.esc="cancelRename" />
+                    <button class="primary" :disabled="!renameValue.trim() || isRenaming" @click="confirmRename">确认</button>
+                    <button @click="cancelRename">取消</button>
+                  </span>
+                  <span v-else class="asset-actions">
+                    <button v-if="member.can_rename" @click="startRename(member.path, member.name)">重命名</button>
                     <button :disabled="!member.can_preview" @click="openAsset(member)">打开</button>
                     <button @click="revealAsset(member)">定位</button>
                     <button class="danger" :disabled="!member.can_delete" @click="trashAsset(member)">删除</button>
@@ -592,51 +638,153 @@
       </section>
 
       <section v-else-if="active === 'studio' || active === 'assets'" class="grid two">
-        <Panel v-if="active === 'studio'" title="源视频素材">
-          <div class="source-toolbar">
-            <span>已选择 {{ selectedSourceIds.length }} / {{ MAX_SOURCE_VIDEOS }} 个</span>
-            <button @click="selectAllSources">选择导入视频</button>
-            <button @click="selectedSourceIds = []">清空</button>
-          </div>
-          <div v-if="sourceVideoItems.length > 8" class="list-filter">
-            <input v-model="sourceFilter" class="field compact-field" placeholder="筛选文件名" />
-            <small>{{ filteredSourceVideos.length }} / {{ sourceVideoItems.length }}</small>
-          </div>
-          <div v-if="sourceVideoItems.length === 0" class="empty">暂无导入视频。请先导入本地视频或视频直链。</div>
-          <div v-else-if="filteredSourceVideos.length === 0" class="empty">没有匹配「{{ sourceFilter }}」的视频。</div>
-          <div v-else class="scroll-list">
-          <div v-for="item in filteredSourceVideos" :key="item.id" class="source-row">
-            <template v-if="renameTarget === item.path">
-              <input v-model="renameValue" class="field compact-field rename-input" placeholder="新名称"
-                     @keyup.enter="confirmRename" @keyup.esc="cancelRename" />
-              <span class="asset-actions">
-                <button class="primary" :disabled="!renameValue.trim() || isRenaming" @click="confirmRename">确认</button>
-                <button @click="cancelRename">取消</button>
-              </span>
-            </template>
-            <template v-else>
-              <label class="source-pick">
-                <input
-                  type="checkbox"
-                  :checked="selectedSourceIds.includes(item.id)"
-                  :disabled="!selectedSourceIds.includes(item.id) && selectedSourceIds.length >= MAX_SOURCE_VIDEOS"
-                  @change="toggleSourceSelection(item.id, $event.target.checked)"
-                />
-                <span>{{ shortPath(item.path) }}</span>
-              </label>
-              <span class="asset-actions hover-actions">
-                <button @click="startRename(item.path, item.path.split('/').pop())">重命名</button>
-                <button @click="openPath(item.path)">打开</button>
-                <button @click="revealPath(item.path)">定位</button>
-                <button @click="forgetSourceItem(item)">移出</button>
-              </span>
-            </template>
-          </div>
-          </div>
-        </Panel>
-
-        <Panel v-if="active === 'studio'" title="自动剪辑工作台">
-          <div class="form-stack">
+        <div v-if="active === 'studio'" class="panel wide studio-composer">
+          <section class="studio-pane media-pool-pane">
+            <div class="panel-title studio-pane-title">媒体池</div>
+            <p v-if="mediaPoolStatus" class="inline-status media-pool-status" :class="mediaPoolStatusKind">{{ mediaPoolStatus }}</p>
+            <div class="media-pool-scroll">
+              <div class="media-pool-stack">
+            <div class="pool-block source-video-pool">
+              <div class="pool-title pool-title-rich">
+                <div class="pool-heading">
+                  <strong>源视频素材池</strong>
+                </div>
+                <div class="pool-title-actions">
+                  <button @click="openMediaLibrary('source')">从媒体库添加</button>
+                  <button @click="selectAllSources">全选</button>
+                  <button :disabled="!selectedSourceIds.length" @click="selectedSourceIds = []">取消全选</button>
+                  <button :disabled="mediaPoolSaving || !sourcePoolItems.length" @click="clearMediaPool('source')">清空媒体池</button>
+                </div>
+              </div>
+              <div class="source-pool-body">
+                <div v-if="sourcePoolItems.length > 8" class="list-filter">
+                  <input v-model="sourceFilter" class="field compact-field" placeholder="筛选文件名" />
+                  <small>{{ filteredSourceVideos.length }} / {{ sourcePoolItems.length }}</small>
+                </div>
+                <div v-if="sourcePoolItems.length === 0" class="empty">媒体池为空，可从媒体库添加源视频。</div>
+                <div v-else-if="filteredSourceVideos.length === 0" class="empty">没有匹配「{{ sourceFilter }}」的视频。</div>
+                <div v-else class="scroll-list">
+                  <div v-for="item in filteredSourceVideos" :key="item.id" class="source-row">
+                    <label class="source-pick" :title="selectionLimitTitle('source', item.id)">
+                      <input
+                        type="checkbox"
+                        :checked="selectedSourceIds.includes(item.id)"
+                        :disabled="selectionAtLimit('source', item.id)"
+                        @change="toggleSourceSelection(item.id, $event.target.checked)"
+                      />
+                      <span>{{ shortPath(item.path) }}</span>
+                    </label>
+                    <span class="asset-actions hover-actions">
+                      <button @click="previewPoolItem(item)">预览</button>
+                      <button :disabled="mediaPoolSaving" @click="removeFromMediaPool('source', item.id)">移出</button>
+                    </span>
+                  </div>
+                </div>
+              </div>
+            </div>
+            <div class="pool-block">
+              <div class="pool-title pool-title-rich">
+                <div class="pool-heading">
+                  <strong>音乐池</strong>
+                  <small>已入池 {{ musicPoolItems.length }} · 已选用 {{ selectedAutomationMusicIds.length }}</small>
+                </div>
+                <div class="pool-title-actions">
+                  <button @click="openMediaLibrary('music')">从媒体库添加</button>
+                  <button @click="selectAllMusicPool">全选</button>
+                  <button :disabled="!selectedAutomationMusicIds.length" @click="selectedAutomationMusicIds = []">取消全选</button>
+                  <button :disabled="mediaPoolSaving || !musicPoolItems.length" @click="clearMediaPool('music')">清空媒体池</button>
+                </div>
+              </div>
+              <div v-if="musicPoolItems.length === 0" class="empty compact-empty">媒体池为空，可从媒体库添加音乐。</div>
+              <div v-else class="pool-list">
+                <div v-for="item in musicPoolItems" :key="item.id" class="pool-row pool-asset-row">
+                  <label :title="selectionLimitTitle('music', item.id)">
+                    <input type="checkbox" :checked="selectedAutomationMusicIds.includes(item.id)"
+                      :disabled="selectionAtLimit('music', item.id)"
+                      @change="toggleAutomationMusic(item.id, $event.target.checked)" />
+                    <span>{{ shortPath(item.path) }}</span>
+                  </label>
+                  <span class="asset-actions"><button @click="previewPoolItem(item)">试听</button><button :disabled="mediaPoolSaving" @click="removeFromMediaPool('music', item.id)">移出</button></span>
+                </div>
+              </div>
+            </div>
+            <div class="pool-block">
+              <div class="pool-title pool-title-rich">
+                <div class="pool-heading">
+                  <strong>旁白池</strong>
+                  <small>已入池 {{ voiceoverPoolItems.length }} · 已选用 {{ selectedAutomationVoiceoverIds.length }}</small>
+                </div>
+                <div class="pool-title-actions">
+                  <button @click="openMediaLibrary('voiceover')">从媒体库添加</button>
+                  <button @click="selectAllVoiceoverPool">全选</button>
+                  <button :disabled="!selectedAutomationVoiceoverIds.length" @click="selectedAutomationVoiceoverIds = []">取消全选</button>
+                  <button :disabled="mediaPoolSaving || !voiceoverPoolItems.length" @click="clearMediaPool('voiceover')">清空媒体池</button>
+                </div>
+              </div>
+              <div v-if="voiceoverPoolItems.length === 0" class="empty compact-empty">媒体池为空，可从媒体库添加旁白。</div>
+              <div v-else class="pool-list">
+                <div v-for="item in voiceoverPoolItems" :key="item.id" class="pool-row pool-asset-row">
+                  <label :title="selectionLimitTitle('voiceover', item.id)">
+                    <input type="checkbox" :checked="selectedAutomationVoiceoverIds.includes(item.id)"
+                      :disabled="selectionAtLimit('voiceover', item.id)"
+                      @change="toggleAutomationVoiceover(item.id, $event.target.checked)" />
+                    <span>{{ shortPath(item.path) }}</span>
+                  </label>
+                  <span class="asset-actions"><button @click="previewPoolItem(item)">试听</button><button :disabled="mediaPoolSaving" @click="removeFromMediaPool('voiceover', item.id)">移出</button></span>
+                </div>
+              </div>
+            </div>
+            <div class="effect-pool">
+              <div class="pool-title pool-title-rich effect-pool-head">
+                <div class="pool-heading"><strong>特效池</strong><small>已入池 {{ effectPoolItems.length }} · 已选用 {{ selectedEffectCount }}</small></div>
+                <div class="pool-title-actions">
+                  <button @click="openMediaLibrary('effect')">从媒体库添加</button>
+                  <button :disabled="mediaPoolSaving || !effectPoolItems.length" @click="clearMediaPool('effect')">清空媒体池</button>
+                </div>
+              </div>
+              <div class="effect-zones">
+                <div class="effect-zone intro">
+                  <div class="effect-zone-head"><span>片头特效</span><button @click="selectAllIntroEffects">全选</button><button @click="selectedIntroEffectIds = []">取消全选</button></div>
+                  <div v-if="effectPoolItems.length === 0" class="empty compact-empty">暂无入池特效。</div>
+                  <div v-else class="pool-list">
+                    <div v-for="item in effectPoolItems" :key="'in-' + item.id" class="pool-row effect-asset-row">
+                      <label :title="selectionLimitTitle('introEffect', item.id)"><input type="checkbox"
+                        :checked="selectedIntroEffectIds.includes(item.id)" :disabled="selectionAtLimit('introEffect', item.id)"
+                        @change="toggleIntroEffect(item.id, $event.target.checked)" /><span>{{ shortPath(item.path) }}</span></label>
+                      <span class="asset-actions"><button @click="previewPoolItem(item)">预览</button><button :disabled="mediaPoolSaving" @click="removeFromMediaPool('effect', item.id)">移出</button></span>
+                    </div>
+                  </div>
+                </div>
+                <div class="effect-zone outro">
+                  <div class="effect-zone-head"><span>片尾特效</span><button @click="selectAllOutroEffects">全选</button><button @click="selectedOutroEffectIds = []">取消全选</button></div>
+                  <div v-if="effectPoolItems.length === 0" class="empty compact-empty">暂无入池特效。</div>
+                  <div v-else class="pool-list">
+                    <div v-for="item in effectPoolItems" :key="'out-' + item.id" class="pool-row effect-asset-row">
+                      <label :title="selectionLimitTitle('outroEffect', item.id)"><input type="checkbox"
+                        :checked="selectedOutroEffectIds.includes(item.id)" :disabled="selectionAtLimit('outroEffect', item.id)"
+                        @change="toggleOutroEffect(item.id, $event.target.checked)" /><span>{{ shortPath(item.path) }}</span></label>
+                      <span class="asset-actions"><button @click="previewPoolItem(item)">预览</button><button :disabled="mediaPoolSaving" @click="removeFromMediaPool('effect', item.id)">移出</button></span>
+                    </div>
+                  </div>
+                </div>
+              </div>
+              <div class="effect-controls">
+                <div class="effect-scope"><span>应用范围</span>
+                  <div class="segmented effect-scope-seg">
+                    <button type="button" :class="{ active: effectScope === 'auto' }" @click="effectScope = 'auto'">由系统挑选</button>
+                    <button type="button" :class="{ active: effectScope === 'all' }" @click="effectScope = 'all'">应用到全部</button>
+                  </div>
+                </div>
+                <label class="effect-cover"><input v-model="effectCoverAudio" type="checkbox" /><span>旁白/音乐盖住特效</span></label>
+              </div>
+            </div>
+              </div>
+            </div>
+          </section>
+          <div class="studio-divider" aria-hidden="true"></div>
+          <section class="studio-pane workbench-pane">
+            <div class="panel-title studio-pane-title">自动剪辑工作台</div>
+            <div class="form-stack workbench-form">
             <!-- Everything up to the button scrolls; the button itself does not, so the action
                  is always reachable without scrolling back down to find it. -->
             <div class="workbench-scroll">
@@ -656,91 +804,10 @@
                 <input class="field" :value="automationPairingSummary" disabled />
               </div>
               <div class="automation-summary">
-                <div><span>源视频素材</span><strong>{{ selectedSourceIds.length }} / {{ MAX_SOURCE_VIDEOS }}</strong></div>
-                <div><span>音乐</span><strong>{{ selectedAutomationMusicIds.length }} / {{ MAX_AUTOMATION_ITEMS }}</strong></div>
-                <div><span>旁白</span><strong>{{ selectedAutomationVoiceoverIds.length }} / {{ MAX_AUTOMATION_ITEMS }}</strong></div>
-              </div>
-              <div class="pool-block">
-                <div class="pool-title">
-                  <span>音乐池</span>
-                  <button @click="selectAllMusicPool">选择全部音乐</button>
-                  <button @click="selectedAutomationMusicIds = []">清空</button>
-                </div>
-                <div v-if="audioItems.length === 0" class="empty compact-empty">暂无音乐素材。</div>
-                <div v-else class="pool-list">
-                  <label v-for="item in audioItems" :key="item.id" class="pool-row">
-                    <input
-                      type="checkbox"
-                      :checked="selectedAutomationMusicIds.includes(item.id)"
-                      :disabled="!selectedAutomationMusicIds.includes(item.id) && selectedAutomationMusicIds.length >= MAX_AUTOMATION_ITEMS"
-                      @change="toggleAutomationMusic(item.id, $event.target.checked)"
-                    />
-                    <span>{{ shortPath(item.path) }}</span>
-                  </label>
-                </div>
-              </div>
-              <div class="pool-block">
-                <div class="pool-title">
-                  <span>旁白池</span>
-                  <button @click="selectAllVoiceoverPool">选择全部旁白</button>
-                  <button @click="selectedAutomationVoiceoverIds = []">清空</button>
-                </div>
-                <div v-if="voiceoverItems.length === 0" class="empty compact-empty">暂无旁白素材。</div>
-                <div v-else class="pool-list">
-                  <label v-for="item in voiceoverItems" :key="item.id" class="pool-row">
-                    <input
-                      type="checkbox"
-                      :checked="selectedAutomationVoiceoverIds.includes(item.id)"
-                      :disabled="!selectedAutomationVoiceoverIds.includes(item.id) && selectedAutomationVoiceoverIds.length >= MAX_AUTOMATION_ITEMS"
-                      @change="toggleAutomationVoiceover(item.id, $event.target.checked)"
-                    />
-                    <span>{{ shortPath(item.path) }}</span>
-                  </label>
-                </div>
-              </div>
-              <div class="effect-pool">
-                <div class="effect-pool-head">特效池</div>
-                <div class="effect-zones">
-                  <div class="effect-zone intro">
-                    <div class="effect-zone-head"><span>片头特效</span><button @click="selectedIntroEffectIds = []">清空</button></div>
-                    <div v-if="effectItems.length === 0" class="empty compact-empty">暂无特效素材。</div>
-                    <div v-else class="pool-list">
-                      <label v-for="item in effectItems" :key="'in-' + item.id" class="pool-row">
-                        <input
-                          type="checkbox"
-                          :checked="selectedIntroEffectIds.includes(item.id)"
-                          :disabled="!selectedIntroEffectIds.includes(item.id) && selectedIntroEffectIds.length >= MAX_AUTOMATION_ITEMS"
-                          @change="toggleIntroEffect(item.id, $event.target.checked)"
-                        />
-                        <span>{{ shortPath(item.path) }}</span>
-                      </label>
-                    </div>
-                  </div>
-                  <div class="effect-zone outro">
-                    <div class="effect-zone-head"><span>片尾特效</span><button @click="selectedOutroEffectIds = []">清空</button></div>
-                    <div v-if="effectItems.length === 0" class="empty compact-empty">暂无特效素材。</div>
-                    <div v-else class="pool-list">
-                      <label v-for="item in effectItems" :key="'out-' + item.id" class="pool-row">
-                        <input
-                          type="checkbox"
-                          :checked="selectedOutroEffectIds.includes(item.id)"
-                          :disabled="!selectedOutroEffectIds.includes(item.id) && selectedOutroEffectIds.length >= MAX_AUTOMATION_ITEMS"
-                          @change="toggleOutroEffect(item.id, $event.target.checked)"
-                        />
-                        <span>{{ shortPath(item.path) }}</span>
-                      </label>
-                    </div>
-                  </div>
-                </div>
-                <div class="effect-controls">
-                  <div class="effect-scope"><span>应用范围</span>
-                    <div class="segmented effect-scope-seg">
-                      <button type="button" :class="{ active: effectScope === 'auto' }" @click="effectScope = 'auto'">由系统挑选</button>
-                      <button type="button" :class="{ active: effectScope === 'all' }" @click="effectScope = 'all'">应用到全部</button>
-                    </div>
-                  </div>
-                  <label class="effect-cover"><input v-model="effectCoverAudio" type="checkbox" /><span>旁白/音乐盖住特效</span></label>
-                </div>
+                <div><span>源视频素材池</span><strong>{{ selectedSourceIds.length }} / {{ MAX_SOURCE_VIDEOS }}</strong></div>
+                <div><span>音乐池</span><strong>{{ selectedAutomationMusicIds.length }} / {{ MAX_AUTOMATION_ITEMS }}</strong></div>
+                <div><span>旁白池</span><strong>{{ selectedAutomationVoiceoverIds.length }} / {{ MAX_AUTOMATION_ITEMS }}</strong></div>
+                <div><span>特效池</span><strong>片头 {{ selectedIntroEffectIds.length }} · 片尾 {{ selectedOutroEffectIds.length }}</strong></div>
               </div>
             </div>
             <div class="editing-mode-switch" role="tablist" aria-label="剪辑方式">
@@ -893,24 +960,57 @@
               {{ isCreatingJob ? '创建中...' : '创建剪辑任务' }}
             </button>
             <p v-if="jobStatus" class="inline-status" :class="jobStatusKind">{{ jobStatus }}</p>
-          </div>
-        </Panel>
+            </div>
+          </section>
+        </div>
         <Panel v-if="active === 'assets'" title="旁白制作" class="wide">
           <div class="voiceover-layout">
             <div class="form-stack">
               <input v-model="voiceoverTitle" class="field" placeholder="旁白素材名称" />
-              <textarea v-model="voiceoverText" class="field text voice-text" placeholder="脚本文本或大模型提示词"></textarea>
+              <label class="field-row voice-script-field"><span>原始文案 / 改写要求</span>
+                <textarea v-model="voiceoverText" class="field text voice-text" placeholder="输入要直接配音的文案，或交给大模型整理的要求"></textarea>
+              </label>
               <div class="voice-options">
-                <label class="check-row"><input v-model="voiceoverUseLlm" type="checkbox" /> 大模型辅助</label>
+                <label class="check-row"><input v-model="voiceoverUseLlm" type="checkbox" /> 大模型改写（先审阅）</label>
                 <label class="check-row"><span>预计时长（秒）</span>
                   <input v-model.number="voiceoverSeconds" class="field compact-field" type="number" min="1" max="600" step="1" placeholder="可留空" :disabled="!voiceoverUseLlm" />
                 </label>
               </div>
               <p v-if="voiceoverSeconds > 0 && !voiceoverUseLlm" class="form-hint">预计时长需配合「大模型辅助」使用。</p>
               <div class="voice-actions">
-                <button class="primary" :disabled="!canGenerateVoiceover || isGeneratingVoiceover" @click="generateVoiceover">{{ isGeneratingVoiceover ? '生成中...' : '生成旁白' }}</button>
+                <button
+                  v-if="voiceoverUseLlm"
+                  class="primary"
+                  :disabled="!canDraftVoiceover || isDraftingVoiceover || isGeneratingVoiceover"
+                  @click="draftVoiceover"
+                >{{ isDraftingVoiceover ? '改写中...' : (hasVoiceoverDraft ? '重新生成改写稿' : '生成改写稿') }}</button>
+                <button
+                  v-else
+                  class="primary"
+                  :disabled="!canGenerateVoiceover || isGeneratingVoiceover"
+                  @click="generateVoiceover"
+                >{{ isGeneratingVoiceover ? '生成中...' : '生成旁白' }}</button>
                 <span class="quota-hint">{{ ttsQuotaText }}</span>
               </div>
+              <section v-if="hasVoiceoverDraft" class="voice-review">
+                <header class="voice-review-header">
+                  <div>
+                    <strong>大模型改写审阅</strong>
+                    <small>可在生成旁白前继续修改改写稿。</small>
+                  </div>
+                  <span class="review-state" :class="{ decided: voiceoverReviewChoice }">{{ voiceoverReviewState }}</span>
+                </header>
+                <div class="voice-review-grid">
+                  <label><span>改写结果 · {{ voiceoverCharCount(voiceoverDraftText) }} 字</span>
+                    <textarea v-model="voiceoverDraftText" class="field text review-text" placeholder="可在确认前继续修改"></textarea>
+                  </label>
+                </div>
+                <div class="voice-review-actions">
+                  <button :class="{ active: voiceoverReviewChoice === 'source' }" @click="chooseVoiceoverVersion('source')">保留原文</button>
+                  <button :class="{ active: voiceoverReviewChoice === 'draft' }" :disabled="!voiceoverDraftText.trim()" @click="chooseVoiceoverVersion('draft')">采用改写稿</button>
+                  <button class="primary" :disabled="!canGenerateVoiceover || isGeneratingVoiceover" @click="generateVoiceover">{{ isGeneratingVoiceover ? '生成中...' : '用已选版本生成旁白' }}</button>
+                </div>
+              </section>
               <p v-if="voiceoverStatus" class="inline-status" :class="voiceoverStatusKind">{{ voiceoverStatus }}</p>
             </div>
             <div class="voice-asset-list">
@@ -1035,8 +1135,8 @@
                 <optgroup label="导入素材">
                   <option v-for="item in tuneImportedSources" :key="item.id" :value="item.id">{{ shortPath(item.path) }}</option>
                 </optgroup>
-                <optgroup label="已导出成片">
-                  <option v-for="item in tuneExportSources" :key="item.id" :value="item.id">{{ shortPath(item.path) }}</option>
+                <optgroup label="已导出成片（仅手动微调）">
+                  <option v-for="item in tuneExportSources" :key="item.id" :value="item.id">{{ tuneExportOptionLabel(item) }}</option>
                 </optgroup>
                 <optgroup label="特效">
                   <option v-for="item in tuneEffectSources" :key="item.id" :value="item.id">{{ shortPath(item.path) }}</option>
@@ -1146,13 +1246,16 @@
             <p v-if="tuneSubtitleNote" class="inline-status tune-subtitle-note" :class="tuneSubtitleNoteKind">
               {{ tuneSubtitleNote }}
             </p>
+            <p v-if="tuneHasBurnedSource" class="inline-status warn tune-subtitle-note">
+              时间线包含已压入画面的字幕成片，不能再次剪切。请改用同一组里的「母版（无字幕）」。
+            </p>
             <p v-if="tuneSubtitles && !tuneKeepSound" class="inline-status warn tune-subtitle-note">
               关掉原声后字幕也会一起去掉——字幕是跟着声音走的，没有声音就没有对齐的依据。
             </p>
             <div class="tune-row">
               <button :disabled="!tuneClips.length" @click="playResult">▶ 预览成片</button>
               <button :disabled="tuneMode !== 'result'" @click="backToSource">回到原片</button>
-              <button class="primary" :disabled="!tuneClips.length || isRenderingTimeline" @click="renderTune">{{ isRenderingTimeline ? '提交中...' : '渲染成 MP4' }}</button>
+              <button class="primary" :disabled="!tuneClips.length || isRenderingTimeline || tuneHasBurnedSource || (tuneKeepSound && (tuneSubtitleLoading || tuneSubtitleBlocked))" @click="renderTune">{{ isRenderingTimeline ? '提交中...' : '渲染成 MP4' }}</button>
               <button :disabled="!tuneUndoStack.length" @click="undoTune">撤销</button>
               <button :disabled="!tuneClips.length" @click="clearTune">清空</button>
             </div>
@@ -1405,6 +1508,49 @@
         </div>
       </section>
     </main>
+    <div v-if="mediaLibraryOpen" class="modal-backdrop" @click.self="closeMediaLibrary">
+      <div class="modal-card media-library-picker">
+        <div class="library-picker-head">
+          <div><strong>从媒体库添加</strong><small>加入媒体池不会自动选用，也不会移动原文件。</small></div>
+          <button @click="closeMediaLibrary">关闭</button>
+        </div>
+        <div class="segmented library-tabs" role="tablist" aria-label="媒体类型">
+          <button v-for="tab in MEDIA_LIBRARY_TABS" :key="tab.key" role="tab"
+            :aria-selected="mediaLibraryTab === tab.key" :class="{ active: mediaLibraryTab === tab.key }"
+            @click="switchMediaLibraryTab(tab.key)">{{ tab.label }}</button>
+        </div>
+        <div class="list-filter library-filter">
+          <input v-model="mediaLibraryFilter" class="field compact-field" placeholder="搜索素材名称" />
+          <small>{{ filteredMediaLibraryItems.length }} 个</small>
+        </div>
+        <div v-if="filteredMediaLibraryItems.length === 0" class="empty library-empty">该分类暂无可用素材。</div>
+        <div v-else class="library-picker-list">
+          <div v-for="item in filteredMediaLibraryItems" :key="item.id" class="library-picker-row"
+            :class="{ pooled: isItemInPool(mediaLibraryTab, item.id) }">
+            <label>
+              <input type="checkbox" :checked="isItemInPool(mediaLibraryTab, item.id) || pendingPoolIds.includes(item.id)"
+                :disabled="isItemInPool(mediaLibraryTab, item.id)" @change="togglePendingPoolItem(item.id, $event.target.checked)" />
+              <span><strong>{{ shortPath(item.path) }}</strong><small>{{ isItemInPool(mediaLibraryTab, item.id) ? '已在媒体池' : roleLabel(itemRole(item)) }}</small></span>
+            </label>
+            <button type="button" @click="previewPoolItem(item)">{{ item.kind === 'audio' ? '试听' : '预览' }}</button>
+          </div>
+        </div>
+        <div class="library-picker-footer">
+          <span>已选择 {{ pendingPoolIds.length }} 个待加入素材</span>
+          <button @click="closeMediaLibrary">取消</button>
+          <button class="primary" :disabled="!pendingPoolIds.length || mediaPoolSaving" @click="addPendingItemsToPool">
+            {{ mediaPoolSaving ? '正在加入…' : `加入媒体池（${pendingPoolIds.length}）` }}
+          </button>
+        </div>
+      </div>
+    </div>
+    <div v-if="previewItem" class="modal-backdrop preview-backdrop" @click.self="closePoolPreview">
+      <div class="modal-card pool-preview-modal">
+        <div class="library-picker-head"><div><strong>{{ shortPath(previewItem.path) }}</strong><small>{{ roleLabel(itemRole(previewItem)) }}</small></div><button @click="closePoolPreview">关闭</button></div>
+        <audio v-if="previewItem.kind === 'audio'" :src="mediaFileUrl(previewItem.path)" controls autoplay></audio>
+        <video v-else :src="mediaFileUrl(previewItem.path)" controls autoplay playsinline></video>
+      </div>
+    </div>
     <div v-if="showFramingSetupPrompt" class="modal-backdrop" @click.self="showFramingSetupPrompt = false">
       <div class="modal-card framing-setup-modal">
         <strong>尚未选择固定画幅</strong>
@@ -1425,6 +1571,11 @@ import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import StatusCard from './components/StatusCard.vue'
 import Panel from './components/Panel.vue'
 import LogList from './components/LogList.vue'
+import {
+  alignAudioBedToTimeline,
+  hasBurnedSubtitleSource,
+  renderableAudioBed
+} from './tune-policy.js'
 
 const nav = [
   { key: 'dashboard', label: '总览', icon: '01', description: '查看系统状态和最近活动。' },
@@ -1433,13 +1584,28 @@ const nav = [
   { key: 'media', label: '媒体库', icon: '04', description: '查看日历、存储、导入、导出和清理。' },
   { key: 'assets', label: '资产制作', icon: '05', description: '制作旁白和图片、视频特效。' },
   { key: 'studio', label: '剪辑台', icon: '06', description: '选择素材，创建自动剪辑或进行手动微调。' },
-  { key: 'queue', label: '渲染队列', icon: '07', description: '跟踪导出任务和 FFmpeg 进度。' },
+  { key: 'queue', label: '渲染队列', icon: '07', description: '跟踪导出任务和进度。' },
   { key: 'settings', label: '设置', icon: '08', description: '配置服务、剪辑能力和机器人硬件连接。' }
 ]
 
 const MAX_SOURCE_VIDEOS = 20
 const MAX_AUTOMATION_ITEMS = 100
 const CRUISE_ARRIVAL_TIMEOUT_SECONDS = 60
+const MEDIA_LIBRARY_TABS = [
+  { key: 'source', label: '源视频' },
+  { key: 'music', label: '音乐' },
+  { key: 'voiceover', label: '旁白' },
+  { key: 'effect', label: '特效' }
+]
+const MEDIA_POOL_FIELDS = {
+  source: 'source_media_ids',
+  music: 'music_media_ids',
+  voiceover: 'voiceover_media_ids',
+  effect: 'effect_media_ids'
+}
+const EMPTY_MEDIA_POOL = {
+  source_media_ids: [], music_media_ids: [], voiceover_media_ids: [], effect_media_ids: []
+}
 
 const active = ref('dashboard')
 const current = computed(() => nav.find((item) => item.key === active.value) || nav[0])
@@ -1579,6 +1745,16 @@ const selectedAutomationMusicIds = ref([])
 const selectedAutomationVoiceoverIds = ref([])
 const selectedIntroEffectIds = ref([])
 const selectedOutroEffectIds = ref([])
+const mediaPool = ref({ ...EMPTY_MEDIA_POOL })
+const mediaPoolSaving = ref(false)
+const mediaPoolStatus = ref('')
+const mediaPoolStatusKind = ref('muted')
+let mediaPoolWriteVersion = 0
+const mediaLibraryOpen = ref(false)
+const mediaLibraryTab = ref('source')
+const mediaLibraryFilter = ref('')
+const pendingPoolIds = ref([])
+const previewItem = ref(null)
 const effectScope = ref('auto')
 const effectCoverAudio = ref(false)
 const isCreatingJob = ref(false)
@@ -1993,7 +2169,36 @@ const voiceoverTitle = ref('')
 const voiceoverText = ref('')
 const voiceoverUseLlm = ref(false)
 const voiceoverSeconds = ref(null)
-const canGenerateVoiceover = computed(() => Boolean(voiceoverText.value.trim()))
+const voiceoverDraftSource = ref('')
+const voiceoverDraftText = ref('')
+const voiceoverDraftTargetSeconds = ref(null)
+const voiceoverReviewChoice = ref('')
+let voiceoverDraftRequestId = 0
+
+function normalizedVoiceoverTargetSeconds(value = voiceoverSeconds.value) {
+  return Number(value) > 0 ? Number(value) : null
+}
+
+const hasVoiceoverDraft = computed(() => (
+  Boolean(voiceoverDraftSource.value)
+  && voiceoverUseLlm.value
+  && voiceoverDraftSource.value === voiceoverText.value
+  && voiceoverDraftTargetSeconds.value === normalizedVoiceoverTargetSeconds()
+))
+const reviewedVoiceoverText = computed(() => {
+  if (!voiceoverUseLlm.value) return voiceoverText.value.trim()
+  if (!hasVoiceoverDraft.value) return ''
+  if (voiceoverReviewChoice.value === 'source') return voiceoverDraftSource.value.trim()
+  if (voiceoverReviewChoice.value === 'draft') return voiceoverDraftText.value.trim()
+  return ''
+})
+const canDraftVoiceover = computed(() => Boolean(voiceoverText.value.trim()))
+const canGenerateVoiceover = computed(() => Boolean(reviewedVoiceoverText.value))
+const voiceoverReviewState = computed(() => ({
+  source: '已选择原文',
+  draft: '已选择改写稿'
+}[voiceoverReviewChoice.value] || '等待选择'))
+const isDraftingVoiceover = ref(false)
 const isGeneratingVoiceover = ref(false)
 const voiceoverStatus = ref('')
 const voiceoverStatusKind = ref('muted')
@@ -2001,6 +2206,16 @@ const ttsQuotaText = computed(() => {
   if (!ttsQuota.value) return '今日旁白额度：--'
   return `今日剩余 ${ttsQuota.value.remaining} / ${ttsQuota.value.limit} 次`
 })
+
+watch([voiceoverText, voiceoverSeconds, voiceoverUseLlm], () => {
+  // Changing any input invalidates both the visible review and any request that is
+  // still in flight. Its eventual response must not replace the new input's state.
+  voiceoverDraftRequestId += 1
+  isDraftingVoiceover.value = false
+  resetVoiceoverReview()
+  voiceoverStatus.value = ''
+  voiceoverStatusKind.value = 'muted'
+}, { flush: 'sync' })
 const seedanceTitle = ref('')
 const seedancePrompt = ref('')
 const seedanceSourceMode = ref('image')
@@ -2056,14 +2271,37 @@ const isGeneratingSeedance = ref(false)
 // Filtering beats scrolling once a list grows; scrolling is the fallback, not the tool.
 const filteredSourceVideos = computed(() => {
   const needle = sourceFilter.value.trim().toLowerCase()
-  if (!needle) return sourceVideoItems.value
-  return sourceVideoItems.value.filter((item) => item.path.toLowerCase().includes(needle))
+  if (!needle) return sourcePoolItems.value
+  return sourcePoolItems.value.filter((item) => item.path.toLowerCase().includes(needle))
 })
 const sourceVideoItems = computed(() => media.value.filter((item) => item.kind === 'video' && itemRole(item) === 'raw_video'))
 const audioItems = computed(() => media.value.filter((item) => item.kind === 'audio' && itemRole(item) === 'music'))
 const voiceoverItems = computed(() => media.value.filter((item) => item.kind === 'audio' && itemRole(item) === 'tts_voice'))
 const imageItems = computed(() => media.value.filter((item) => item.kind === 'image' && itemRole(item) === 'image'))
 const effectItems = computed(() => media.value.filter((item) => item.kind === 'video' && itemRole(item) === 'seedance_effect'))
+const sourcePoolItems = computed(() => poolItems(sourceVideoItems.value, 'source'))
+const musicPoolItems = computed(() => poolItems(audioItems.value, 'music'))
+const voiceoverPoolItems = computed(() => poolItems(voiceoverItems.value, 'voiceover'))
+const effectPoolItems = computed(() => poolItems(effectItems.value, 'effect'))
+const selectedEffectCount = computed(() => new Set([
+  ...selectedIntroEffectIds.value, ...selectedOutroEffectIds.value
+]).size)
+const mediaLibraryItems = computed(() => ({
+  source: sourceVideoItems.value,
+  music: audioItems.value,
+  voiceover: voiceoverItems.value,
+  effect: effectItems.value
+})[mediaLibraryTab.value] || [])
+const filteredMediaLibraryItems = computed(() => {
+  const needle = mediaLibraryFilter.value.trim().toLowerCase()
+  if (!needle) return mediaLibraryItems.value
+  return mediaLibraryItems.value.filter((item) => item.path.toLowerCase().includes(needle))
+})
+
+function poolItems(items, poolKind) {
+  const ids = new Set(mediaPool.value[MEDIA_POOL_FIELDS[poolKind]] || [])
+  return items.filter((item) => ids.has(item.id))
+}
 const frameVideoSrc = computed(() => {
   const item = sourceVideoItems.value.find((entry) => entry.id === selectedSeedanceVideoId.value)
   return item ? mediaFileUrl(item.path) : ''
@@ -2137,10 +2375,10 @@ function toggleVaultGroup(key) {
 // so the pair collapses into one line and only opens when asked. The delivered file leads,
 // because that is the one people are usually looking for.
 const VARIANT_ORDER = { subtitled: 0, single: 0, master: 1 }
-const vaultRows = computed(() => {
+function groupVaultAssets(assets) {
   const groups = new Map()
   const rows = []
-  for (const asset of filteredVaultAssets.value) {
+  for (const asset of assets) {
     const key = asset.export_group
     if (!key) {
       rows.push({ type: 'asset', key: asset.id, asset })
@@ -2168,7 +2406,8 @@ const vaultRows = computed(() => {
       ? { type: 'asset', key: row.members[0].id, asset: row.members[0] }
       : row
   )
-})
+}
+const vaultRows = computed(() => groupVaultAssets(filteredVaultAssets.value))
 
 const weekdayNames = ['日', '一', '二', '三', '四', '五', '六']
 const calendarAssetMap = computed(() => {
@@ -2177,6 +2416,12 @@ const calendarAssetMap = computed(() => {
   return map
 })
 const selectedCalendarAssets = computed(() => calendarAssetMap.value.get(selectedCalendarDate.value) || [])
+const selectedCalendarRows = computed(() => groupVaultAssets(selectedCalendarAssets.value))
+const selectedCalendarSummary = computed(() => {
+  const files = selectedCalendarAssets.value.length
+  const rows = selectedCalendarRows.value.length
+  return rows === files ? `${files} 个素材` : `${rows} 项 · ${files} 个文件`
+})
 const calendarMonthTitle = computed(() => calendarCursor.value.toLocaleDateString('zh-CN', { year: 'numeric', month: 'long' }))
 const calendarStartLabel = computed(() => formatDateKey(calendarStartDate))
 const calendarMaxLabel = computed(() => formatDateKey(calendarMaxDate))
@@ -2392,14 +2637,21 @@ function sendWs(type, data = {}) {
 async function refreshRobot() { robot.value = await api('/robot/status') }
 async function refreshJobs() { jobs.value = await api('/jobs') }
 async function refreshMedia() {
-  media.value = await api('/media')
-  const validIds = new Set(sourceVideoItems.value.map((item) => item.id))
+  const poolVersion = mediaPoolWriteVersion
+  const [items, pool] = await Promise.all([api('/media'), api('/media/pool')])
+  media.value = items
+  // A GET launched before a pool save can finish afterwards. Never let that stale snapshot
+  // roll back the just-saved working set and become the body of the next full-pool PUT.
+  if (poolVersion === mediaPoolWriteVersion && !mediaPoolSaving.value) {
+    mediaPool.value = { ...EMPTY_MEDIA_POOL, ...pool }
+  }
+  const validIds = new Set(sourcePoolItems.value.map((item) => item.id))
   selectedSourceIds.value = selectedSourceIds.value.filter((id) => validIds.has(id))
-  const validMusicIds = new Set(audioItems.value.map((item) => item.id))
-  const validVoiceoverIds = new Set(voiceoverItems.value.map((item) => item.id))
+  const validMusicIds = new Set(musicPoolItems.value.map((item) => item.id))
+  const validVoiceoverIds = new Set(voiceoverPoolItems.value.map((item) => item.id))
   selectedAutomationMusicIds.value = selectedAutomationMusicIds.value.filter((id) => validMusicIds.has(id))
   selectedAutomationVoiceoverIds.value = selectedAutomationVoiceoverIds.value.filter((id) => validVoiceoverIds.has(id))
-  const validEffectIds = new Set(effectItems.value.map((item) => item.id))
+  const validEffectIds = new Set(effectPoolItems.value.map((item) => item.id))
   selectedIntroEffectIds.value = selectedIntroEffectIds.value.filter((id) => validEffectIds.has(id))
   selectedOutroEffectIds.value = selectedOutroEffectIds.value.filter((id) => validEffectIds.has(id))
   if (selectedSeedanceImageId.value && !imageItems.value.some((item) => item.id === selectedSeedanceImageId.value)) selectedSeedanceImageId.value = ''
@@ -3200,42 +3452,188 @@ async function createAutomationJobs(forceWithoutPreference = false) {
 }
 
 function selectAllSources() {
-  selectedSourceIds.value = sourceVideoItems.value.slice(0, MAX_SOURCE_VIDEOS).map((item) => item.id)
+  selectAllLimited(selectedSourceIds, sourcePoolItems.value, MAX_SOURCE_VIDEOS, '源视频')
 }
 
 function selectAllMusicPool() {
-  selectedAutomationMusicIds.value = audioItems.value.slice(0, MAX_AUTOMATION_ITEMS).map((item) => item.id)
+  selectAllLimited(selectedAutomationMusicIds, musicPoolItems.value, MAX_AUTOMATION_ITEMS, '音乐')
 }
 
 function selectAllVoiceoverPool() {
-  selectedAutomationVoiceoverIds.value = voiceoverItems.value.slice(0, MAX_AUTOMATION_ITEMS).map((item) => item.id)
+  selectAllLimited(selectedAutomationVoiceoverIds, voiceoverPoolItems.value, MAX_AUTOMATION_ITEMS, '旁白')
+}
+
+function selectAllIntroEffects() {
+  selectAllLimited(selectedIntroEffectIds, effectPoolItems.value, MAX_AUTOMATION_ITEMS, '片头特效')
+}
+
+function selectAllOutroEffects() {
+  selectAllLimited(selectedOutroEffectIds, effectPoolItems.value, MAX_AUTOMATION_ITEMS, '片尾特效')
+}
+
+function selectAllLimited(targetRef, items, limit, label) {
+  targetRef.value = items.slice(0, limit).map((item) => item.id)
+  if (items.length > limit) {
+    mediaPoolStatusKind.value = 'warn'
+    mediaPoolStatus.value = `${label}最多可选用 ${limit} 个，已选至上限。`
+  }
 }
 
 function toggleSourceSelection(id, checked) {
-  toggleLimitedSelection(selectedSourceIds, id, checked, MAX_SOURCE_VIDEOS)
+  toggleLimitedSelection(selectedSourceIds, id, checked, MAX_SOURCE_VIDEOS, '源视频')
 }
 
 function toggleAutomationMusic(id, checked) {
-  toggleLimitedSelection(selectedAutomationMusicIds, id, checked, MAX_AUTOMATION_ITEMS)
+  toggleLimitedSelection(selectedAutomationMusicIds, id, checked, MAX_AUTOMATION_ITEMS, '音乐')
 }
 
 function toggleAutomationVoiceover(id, checked) {
-  toggleLimitedSelection(selectedAutomationVoiceoverIds, id, checked, MAX_AUTOMATION_ITEMS)
+  toggleLimitedSelection(selectedAutomationVoiceoverIds, id, checked, MAX_AUTOMATION_ITEMS, '旁白')
 }
 function toggleIntroEffect(id, checked) {
-  toggleLimitedSelection(selectedIntroEffectIds, id, checked, MAX_AUTOMATION_ITEMS)
+  toggleLimitedSelection(selectedIntroEffectIds, id, checked, MAX_AUTOMATION_ITEMS, '片头特效')
 }
 function toggleOutroEffect(id, checked) {
-  toggleLimitedSelection(selectedOutroEffectIds, id, checked, MAX_AUTOMATION_ITEMS)
+  toggleLimitedSelection(selectedOutroEffectIds, id, checked, MAX_AUTOMATION_ITEMS, '片尾特效')
 }
 
-function toggleLimitedSelection(targetRef, id, checked, limit) {
+function toggleLimitedSelection(targetRef, id, checked, limit, label) {
   const current = targetRef.value
   if (checked) {
-    if (!current.includes(id) && current.length < limit) targetRef.value = [...current, id]
+    if (!current.includes(id) && current.length < limit) {
+      targetRef.value = [...current, id]
+    } else if (!current.includes(id)) {
+      mediaPoolStatusKind.value = 'warn'
+      mediaPoolStatus.value = `${label}最多可选用 ${limit} 个。`
+    }
     return
   }
   targetRef.value = current.filter((item) => item !== id)
+}
+
+function selectionConfig(kind) {
+  if (kind === 'source') return { selected: selectedSourceIds.value, limit: MAX_SOURCE_VIDEOS, label: '源视频' }
+  if (kind === 'music') return { selected: selectedAutomationMusicIds.value, limit: MAX_AUTOMATION_ITEMS, label: '音乐' }
+  if (kind === 'voiceover') return { selected: selectedAutomationVoiceoverIds.value, limit: MAX_AUTOMATION_ITEMS, label: '旁白' }
+  if (kind === 'introEffect') return { selected: selectedIntroEffectIds.value, limit: MAX_AUTOMATION_ITEMS, label: '片头特效' }
+  return { selected: selectedOutroEffectIds.value, limit: MAX_AUTOMATION_ITEMS, label: '片尾特效' }
+}
+
+function selectionAtLimit(kind, id) {
+  const config = selectionConfig(kind)
+  return !config.selected.includes(id) && config.selected.length >= config.limit
+}
+
+function selectionLimitTitle(kind, id) {
+  if (!selectionAtLimit(kind, id)) return ''
+  const config = selectionConfig(kind)
+  return `${config.label}最多可选用 ${config.limit} 个`
+}
+
+function openMediaLibrary(kind) {
+  mediaLibraryTab.value = kind
+  mediaLibraryFilter.value = ''
+  pendingPoolIds.value = []
+  mediaLibraryOpen.value = true
+}
+
+function closeMediaLibrary() {
+  mediaLibraryOpen.value = false
+  pendingPoolIds.value = []
+  mediaLibraryFilter.value = ''
+}
+
+function switchMediaLibraryTab(kind) {
+  mediaLibraryTab.value = kind
+  mediaLibraryFilter.value = ''
+  pendingPoolIds.value = []
+}
+
+function isItemInPool(kind, id) {
+  const field = MEDIA_POOL_FIELDS[kind]
+  return Boolean(field && mediaPool.value[field]?.includes(id))
+}
+
+function togglePendingPoolItem(id, checked) {
+  if (checked) {
+    if (!pendingPoolIds.value.includes(id)) pendingPoolIds.value = [...pendingPoolIds.value, id]
+    return
+  }
+  pendingPoolIds.value = pendingPoolIds.value.filter((item) => item !== id)
+}
+
+async function saveMediaPool(nextPool, successMessage = '') {
+  if (mediaPoolSaving.value) return false
+  mediaPoolSaving.value = true
+  mediaPoolWriteVersion += 1
+  mediaPoolStatus.value = ''
+  mediaPoolStatusKind.value = 'muted'
+  try {
+    mediaPool.value = await api('/media/pool', {
+      method: 'PUT', body: JSON.stringify({ ...EMPTY_MEDIA_POOL, ...nextPool })
+    })
+    pruneSelectionsToPool()
+    if (successMessage) {
+      mediaPoolStatusKind.value = 'success'
+      mediaPoolStatus.value = successMessage
+    }
+    return true
+  } catch (err) {
+    mediaPoolStatusKind.value = 'danger'
+    mediaPoolStatus.value = `媒体池更新失败：${humanError(err.message)}`
+    return false
+  } finally {
+    mediaPoolSaving.value = false
+    mediaPoolWriteVersion += 1
+  }
+}
+
+function pruneSelectionsToPool() {
+  const sourceIds = new Set(mediaPool.value.source_media_ids)
+  const musicIds = new Set(mediaPool.value.music_media_ids)
+  const voiceoverIds = new Set(mediaPool.value.voiceover_media_ids)
+  const effectIds = new Set(mediaPool.value.effect_media_ids)
+  selectedSourceIds.value = selectedSourceIds.value.filter((id) => sourceIds.has(id)).slice(0, MAX_SOURCE_VIDEOS)
+  selectedAutomationMusicIds.value = selectedAutomationMusicIds.value.filter((id) => musicIds.has(id)).slice(0, MAX_AUTOMATION_ITEMS)
+  selectedAutomationVoiceoverIds.value = selectedAutomationVoiceoverIds.value.filter((id) => voiceoverIds.has(id)).slice(0, MAX_AUTOMATION_ITEMS)
+  selectedIntroEffectIds.value = selectedIntroEffectIds.value.filter((id) => effectIds.has(id)).slice(0, MAX_AUTOMATION_ITEMS)
+  selectedOutroEffectIds.value = selectedOutroEffectIds.value.filter((id) => effectIds.has(id)).slice(0, MAX_AUTOMATION_ITEMS)
+}
+
+async function addPendingItemsToPool() {
+  const field = MEDIA_POOL_FIELDS[mediaLibraryTab.value]
+  const ids = [...new Set([...(mediaPool.value[field] || []), ...pendingPoolIds.value])]
+  const added = pendingPoolIds.value.length
+  if (await saveMediaPool({ ...mediaPool.value, [field]: ids }, `已加入媒体池 ${added} 个素材。`)) closeMediaLibrary()
+}
+
+async function addItemToMediaPool(kind, id) {
+  const field = MEDIA_POOL_FIELDS[kind]
+  if (!field || mediaPool.value[field].includes(id)) return true
+  return saveMediaPool({ ...mediaPool.value, [field]: [...mediaPool.value[field], id] })
+}
+
+async function removeFromMediaPool(kind, id) {
+  const field = MEDIA_POOL_FIELDS[kind]
+  if (!field) return
+  await saveMediaPool({
+    ...mediaPool.value,
+    [field]: mediaPool.value[field].filter((item) => item !== id)
+  })
+}
+
+async function clearMediaPool(kind) {
+  const field = MEDIA_POOL_FIELDS[kind]
+  if (!field) return
+  await saveMediaPool({ ...mediaPool.value, [field]: [] })
+}
+
+function previewPoolItem(item) {
+  previewItem.value = item
+}
+
+function closePoolPreview() {
+  previewItem.value = null
 }
 
 // ── 微调 ──────────────────────────────────────────────────────────────────────
@@ -3249,6 +3647,10 @@ const tuneImportedSources = computed(() =>
 const tuneExportSources = computed(() =>
   media.value.filter((item) => item.kind === 'video' && itemRole(item) === 'export')
 )
+function tuneExportOptionLabel(item) {
+  const variant = item?.metadata?.variant_label
+  return variant ? `${variant} · ${shortPath(item.path)}` : shortPath(item.path)
+}
 const tuneSource = computed(() =>
   media.value.find((item) => item.id === tuneSourceId.value) || null
 )
@@ -3310,6 +3712,11 @@ const tuneBedName = computed(() => (
 const tuneHasVideoEffects = computed(() =>
   tuneClips.value.some((clip) => clip.is_effect && clip.kind !== 'image')
 )
+const tuneHasBurnedSource = computed(() => hasBurnedSubtitleSource(
+  tuneClips.value,
+  tuneBed.value,
+  media.value
+))
 const tuneBaseHasVoiceover = computed(() => Boolean(
   tuneKeepSound.value
   && tuneBed.value
@@ -3379,6 +3786,9 @@ function pushTuneUndo() {
     bed: tuneBed.value ? { ...tuneBed.value } : null,
     subtitles: tuneSubtitles.value,
     subtitleNote: tuneSubtitleNote.value,
+    subtitleNoteKind: tuneSubtitleNoteKind.value,
+    subtitleBlocked: tuneSubtitleBlocked.value,
+    subtitleLoading: tuneSubtitleLoading.value,
     playhead: tunePlayhead.value
   })
   if (tuneUndoStack.value.length > TUNE_UNDO_LIMIT) tuneUndoStack.value.shift()
@@ -3387,10 +3797,18 @@ function pushTuneUndo() {
 function undoTune() {
   const previous = tuneUndoStack.value.pop()
   if (!previous) return
+  tuneSubtitleRequestId += 1
   tuneClips.value = previous.clips
   tuneBed.value = previous.bed
   tuneSubtitles.value = previous.subtitles ?? null
   tuneSubtitleNote.value = previous.subtitleNote ?? ''
+  tuneSubtitleNoteKind.value = previous.subtitleNoteKind ?? 'muted'
+  tuneSubtitleBlocked.value = Boolean(previous.subtitleBlocked)
+  tuneSubtitleLoading.value = false
+  if (previous.subtitleLoading && tuneBed.value) {
+    const bedItem = media.value.find((item) => item.path === tuneBed.value.source_path)
+    loadTuneSubtitles(bedItem?.id)
+  }
   tunePlayhead.value = previous.playhead
   if (tuneMode.value === 'result') backToSource()
 }
@@ -3407,7 +3825,8 @@ function newTuneClip() {
     start: isImage ? 0 : Number(tuneIn.value.toFixed(2)),
     duration: Number(tunePlaceDuration.value.toFixed(2)),
     kind: isImage ? 'image' : 'video',
-    is_effect: tuneIsEffect.value
+    is_effect: tuneIsEffect.value,
+    has_burned_subtitles: Boolean(source.metadata?.has_burned_subtitles)
   }
 }
 
@@ -3419,7 +3838,9 @@ function adoptTuneBed(clip, offsetSeconds) {
     source_path: clip.source_path,
     source_start: clip.start,
     timeline_start: offsetSeconds,
-    has_voiceover: Boolean(sourceItem?.metadata?.has_voiceover)
+    has_voiceover: Boolean(sourceItem?.metadata?.has_voiceover),
+    _anchorUid: clip.uid,
+    _anchorOffset: 0
   }
   // The words belong to the sound, so they come from wherever the sound came from. Fetched at
   // the moment the bed is pinned, because that is the only point at which we know which video
@@ -3427,34 +3848,51 @@ function adoptTuneBed(clip, offsetSeconds) {
   loadTuneSubtitles(clip.media_id)
 }
 
+function alignTuneBed(fallbackTime) {
+  if (!tuneBed.value || !tuneClips.value.length) return
+  tuneBed.value = alignAudioBedToTimeline(tuneClips.value, tuneBed.value, fallbackTime)
+}
+
 // Cues carried over from the export the soundtrack was taken from, so re-cutting can put them
 // back over whatever picture ends up underneath — a still, an effect clip, anything.
 const tuneSubtitles = ref(null)
 const tuneSubtitleNote = ref('')
 const tuneSubtitleNoteKind = ref('muted')
+const tuneSubtitleBlocked = ref(false)
+const tuneSubtitleLoading = ref(false)
+let tuneSubtitleRequestId = 0
 
 function clearTuneSubtitles() {
+  tuneSubtitleRequestId += 1
   tuneSubtitles.value = null
   tuneSubtitleNote.value = ''
+  tuneSubtitleNoteKind.value = 'muted'
+  tuneSubtitleBlocked.value = false
+  tuneSubtitleLoading.value = false
 }
 
 async function loadTuneSubtitles(mediaId) {
+  const requestId = ++tuneSubtitleRequestId
+  const expectedBedPath = tuneBed.value?.source_path || ''
   tuneSubtitles.value = null
   tuneSubtitleNote.value = ''
-  if (!mediaId) return
+  tuneSubtitleNoteKind.value = 'muted'
+  tuneSubtitleBlocked.value = false
+  tuneSubtitleLoading.value = Boolean(mediaId && expectedBedPath)
+  if (!mediaId || !expectedBedPath) return
   try {
     const info = await api(`/subtitles/track?media_id=${encodeURIComponent(mediaId)}`)
-    if (tuneBed.value) tuneBed.value.has_voiceover = Boolean(info.has_voiceover)
+    if (requestId !== tuneSubtitleRequestId || tuneBed.value?.source_path !== expectedBedPath) return
+    tuneBed.value.has_voiceover = Boolean(info.has_voiceover)
     if (info.has_burned_subtitles) {
-      // Its subtitles are pixels now and cannot be moved. Re-cutting drags them to the wrong
-      // times and slices them mid-word, so say so rather than quietly producing that.
-      tuneSubtitleNoteKind.value = 'warn'
-      tuneSubtitleNote.value = '这个成片已经把字幕压在画面里了，重新剪会把字幕一起剪乱。建议改用同一组里的「母版（无字幕）」。'
+      // The timeline-level guard names this once and also catches a burned export inserted
+      // after the soundtrack was pinned from another clip.
       return
     }
     if (info.problem) {
       tuneSubtitleNoteKind.value = 'warn'
       tuneSubtitleNote.value = info.problem
+      tuneSubtitleBlocked.value = true
       return
     }
     if (info.track?.cues?.length) {
@@ -3463,8 +3901,14 @@ async function loadTuneSubtitles(mediaId) {
       tuneSubtitleNote.value = `已带上原字幕 ${info.track.cues.length} 句，渲染时会重新压到新画面上。`
     }
   } catch (err) {
+    if (requestId !== tuneSubtitleRequestId || tuneBed.value?.source_path !== expectedBedPath) return
     tuneSubtitleNoteKind.value = 'warn'
     tuneSubtitleNote.value = `原字幕没读到：${humanError(err.message)}`
+    tuneSubtitleBlocked.value = true
+  } finally {
+    if (requestId === tuneSubtitleRequestId && tuneBed.value?.source_path === expectedBedPath) {
+      tuneSubtitleLoading.value = false
+    }
   }
 }
 
@@ -3472,10 +3916,12 @@ function placeAtStart() {
   const clip = newTuneClip()
   if (!clip) return
   pushTuneUndo()
-  // The sound moves with the picture, so nothing that follows can drift out of step.
-  if (tuneBed.value) tuneBed.value.timeline_start += clip.duration
+  const bedFallback = tuneBed.value
+    ? Number(tuneBed.value.timeline_start || 0) + clip.duration
+    : undefined
   tuneClips.value.unshift(clip)
   adoptTuneBed(clip, 0)
+  alignTuneBed(bedFallback)
   afterTuneEdit()
 }
 
@@ -3486,6 +3932,7 @@ function placeAtEnd() {
   const offset = tuneTotal.value
   tuneClips.value.push(clip)
   adoptTuneBed(clip, offset)
+  alignTuneBed(offset)
   afterTuneEdit()
 }
 
@@ -3499,6 +3946,7 @@ function placeOverwrite() {
   if (!clip || !tuneClips.value.length) return
   const point = Math.max(0, Math.min(tuneTotal.value, tunePlayhead.value))
   const finish = point + clip.duration
+  const bedFallback = tuneBed.value?.timeline_start
   const before = []
   const after = []
   let cursor = 0
@@ -3528,6 +3976,7 @@ function placeOverwrite() {
   const keep = (item) => item.duration >= 0.05
   tuneClips.value = [...before.filter(keep), clip, ...after.filter(keep)]
   adoptTuneBed(clip, point)
+  alignTuneBed(bedFallback)
   afterTuneEdit()
 }
 
@@ -3545,7 +3994,18 @@ function setPlayhead(event) {
 
 function removeTuneClip(index) {
   pushTuneUndo()
-  tuneClips.value.splice(index, 1)
+  const removedStart = tuneClips.value
+    .slice(0, index)
+    .reduce((sum, clip) => sum + Number(clip.duration || 0), 0)
+  const [removed] = tuneClips.value.splice(index, 1)
+  const removedEnd = removedStart + Number(removed?.duration || 0)
+  if (tuneBed.value && tuneClips.value.length) {
+    const oldStart = Number(tuneBed.value.timeline_start || 0)
+    const fallback = oldStart <= removedStart
+      ? oldStart
+      : (oldStart >= removedEnd ? oldStart - (removedEnd - removedStart) : removedStart)
+    alignTuneBed(fallback)
+  }
   if (!tuneClips.value.length) { tuneBed.value = null; clearTuneSubtitles() }
   afterTuneEdit()
 }
@@ -3556,7 +4016,9 @@ function dropTuneClip(index) {
   pushTuneUndo()
   const [clip] = tuneClips.value.splice(from, 1)
   tuneClips.value.splice(index, 0, clip)
+  alignTuneBed(tuneBed.value?.timeline_start)
   tuneDragIndex.value = -1
+  afterTuneEdit()
 }
 
 function clearTune() {
@@ -3622,7 +4084,12 @@ function backToSource() {
 }
 
 async function renderTune() {
-  if (!tuneClips.value.length || isRenderingTimeline.value) return
+  if (
+    !tuneClips.value.length
+    || isRenderingTimeline.value
+    || tuneHasBurnedSource.value
+    || (tuneKeepSound.value && (tuneSubtitleLoading.value || tuneSubtitleBlocked.value))
+  ) return
   isRenderingTimeline.value = true
   jobStatusKind.value = 'muted'
   jobStatus.value = '正在提交渲染...'
@@ -3662,7 +4129,9 @@ async function renderTune() {
         // The soundtrack comes from the bed, laid unbroken under the cuts. Per-clip audio
         // would chop the sound at every edit, which is the thing this panel must not do.
         mute_original_audio: true,
-        audio_bed: tuneKeepSound.value && tuneBed.value ? { ...tuneBed.value } : null,
+        audio_bed: tuneKeepSound.value && tuneBed.value
+          ? renderableAudioBed(tuneBed.value)
+          : null,
         // Only alongside the sound they were timed against. Without the bed there is nothing
         // anchoring them, and cues placed by guesswork are worse than none.
         subtitles: tuneKeepSound.value && tuneBed.value && tuneSubtitles.value
@@ -3765,6 +4234,10 @@ async function confirmRename() {
         clip.source_path = updated.path
         clip.name = updated.path.split('/').pop()
       }
+    }
+    if (tuneBed.value?.source_path === path) {
+      tuneBed.value.source_path = updated.path
+      await loadTuneSubtitles(item.id)
     }
     await Promise.all([refreshMedia(), refreshVault(), refreshTtsAssets(), refreshSeedanceAssets()])
     cancelRename()
@@ -3889,11 +4362,23 @@ async function forgetAsset(asset) {
   }
 }
 
+async function preflightTrash(paths) {
+  await api('/media/trash-preflight', {
+    method: 'POST',
+    body: JSON.stringify({ paths })
+  })
+}
+
 async function trashAsset(asset) {
   if (!window.confirm(`删除 ${asset.name}？文件会移入系统废纸篓。`)) return
   try {
-    await window.desktopApi.trashPath(asset.path)
-    log(`已删除 ${asset.name}`)
+    await preflightTrash([asset.path])
+    const result = await window.desktopApi.trashPath(asset.path)
+    if (result?.companionFailures?.length) {
+      log(`已删除 ${asset.name}，但 ${result.companionFailures.length} 个关联文件未能移入废纸篓`)
+    } else {
+      log(`已删除 ${asset.name}`)
+    }
     await Promise.all([refreshMedia(), refreshVault()])
   } catch (err) {
     log(`删除失败：${humanError(err.message)}`)
@@ -3905,11 +4390,21 @@ async function trashVaultGroup(group) {
   // them is the only clean copy you have to re-edit from.
   const names = group.members.map((member) => `· ${member.variant_label || member.name}`).join('\n')
   if (!window.confirm(`删除「${group.name}」的全部 ${group.members.length} 个视频？\n${names}\n文件会移入系统废纸篓。`)) return
+  const deletable = group.members.filter((member) => member.can_delete)
+  if (!deletable.length) return
   const failed = []
-  for (const member of group.members) {
-    if (!member.can_delete) continue
+  try {
+    await preflightTrash(deletable.map((member) => member.path))
+  } catch (err) {
+    log(`删除失败：${humanError(err.message)}`)
+    return
+  }
+  for (const member of deletable) {
     try {
-      await window.desktopApi.trashPath(member.path)
+      const result = await window.desktopApi.trashPath(member.path)
+      for (const companion of result?.companionFailures || []) {
+        failed.push(`${member.name} 的关联文件（${humanError(companion.message)}）`)
+      }
     } catch (err) {
       failed.push(`${member.name}（${humanError(err.message)}）`)
     }
@@ -3925,10 +4420,6 @@ function shortPath(path) {
   return String(path || '').split('/').pop() || path
 }
 
-function isExportPath(path) {
-  return String(path || '').includes('/exports/') || String(path || '').includes('\\exports\\')
-}
-
 function isTtsPath(path) {
   return String(path || '').includes('/data/tts/') || String(path || '').includes('\\data\\tts\\')
 }
@@ -3940,7 +4431,6 @@ function isSeedanceEffectPath(path) {
 function itemRole(item) {
   if (item?.metadata?.role) return item.metadata.role
   if (item?.kind === 'video' && isSeedanceEffectPath(item.path)) return 'seedance_effect'
-  if (item?.kind === 'video' && isExportPath(item.path)) return 'export'
   if (item?.kind === 'audio' && isTtsPath(item.path)) return 'tts_voice'
   if (item?.kind === 'video') return 'raw_video'
   if (item?.kind === 'audio') return 'music'
@@ -4320,6 +4810,73 @@ async function testSeedance() {
   }
 }
 
+function resetVoiceoverReview() {
+  voiceoverDraftSource.value = ''
+  voiceoverDraftText.value = ''
+  voiceoverDraftTargetSeconds.value = null
+  voiceoverReviewChoice.value = ''
+}
+
+function voiceoverCharCount(text) {
+  return String(text || '').replace(/\s/g, '').length
+}
+
+function chooseVoiceoverVersion(version) {
+  if (!hasVoiceoverDraft.value) return
+  if (version === 'draft' && !voiceoverDraftText.value.trim()) return
+  voiceoverReviewChoice.value = version
+  voiceoverStatusKind.value = 'success'
+  voiceoverStatus.value = version === 'draft'
+    ? '已采用改写稿。'
+    : '已保留原文。'
+}
+
+async function draftVoiceover() {
+  if (!voiceoverUseLlm.value || !canDraftVoiceover.value || isDraftingVoiceover.value || isGeneratingVoiceover.value) return
+  const requestId = ++voiceoverDraftRequestId
+  const submitted = {
+    sourceText: voiceoverText.value,
+    targetSeconds: normalizedVoiceoverTargetSeconds(),
+    useLlm: voiceoverUseLlm.value
+  }
+  const requestIsCurrent = () => (
+    requestId === voiceoverDraftRequestId
+    && voiceoverText.value === submitted.sourceText
+    && normalizedVoiceoverTargetSeconds() === submitted.targetSeconds
+    && voiceoverUseLlm.value === submitted.useLlm
+  )
+  isDraftingVoiceover.value = true
+  voiceoverStatusKind.value = 'muted'
+  voiceoverStatus.value = '正在生成改写稿...'
+  try {
+    const result = await api('/tts/draft', {
+      method: 'POST',
+      body: JSON.stringify({
+        text: submitted.sourceText,
+        target_seconds: submitted.targetSeconds
+      })
+    })
+    if (!requestIsCurrent()) return
+    // Keep the reviewed source tied to the exact local text that produced this
+    // request. The server echo is informational and must not replace user input.
+    voiceoverDraftSource.value = submitted.sourceText
+    voiceoverDraftText.value = result.draft_text
+    voiceoverDraftTargetSeconds.value = submitted.targetSeconds
+    voiceoverReviewChoice.value = ''
+    voiceoverStatusKind.value = 'success'
+    voiceoverStatus.value = '改写稿已生成，请选择使用原文或改写稿。'
+  } catch (err) {
+    if (!requestIsCurrent()) return
+    resetVoiceoverReview()
+    voiceoverStatusKind.value = 'danger'
+    voiceoverStatus.value = `改写失败：${humanError(err.message)}`
+  } finally {
+    if (requestId === voiceoverDraftRequestId) {
+      isDraftingVoiceover.value = false
+    }
+  }
+}
+
 async function generateVoiceover() {
   if (!canGenerateVoiceover.value || isGeneratingVoiceover.value) return
   isGeneratingVoiceover.value = true
@@ -4330,19 +4887,22 @@ async function generateVoiceover() {
       method: 'POST',
       body: JSON.stringify({
         title: voiceoverTitle.value,
-        text: voiceoverText.value,
-        use_llm: voiceoverUseLlm.value,
-        // Length targeting only applies through the LLM, so send it only then.
-        target_seconds: voiceoverUseLlm.value && voiceoverSeconds.value > 0 ? voiceoverSeconds.value : null
+        text: reviewedVoiceoverText.value,
+        // LLM drafting already happened in /tts/draft and was reviewed. Sending false is the
+        // API-level guard against silently rewriting the chosen text a second time.
+        use_llm: false,
+        target_seconds: null
       })
     })
     await Promise.all([refreshMedia(), refreshVault(), refreshTtsAssets()])
     // Tick the new voiceover into the pool, so generating one is enough to use it. Without
     // this you would generate a narration and silently render without it.
     const newId = result.media_item?.id
-    if (newId && !selectedAutomationVoiceoverIds.value.includes(newId)
-        && selectedAutomationVoiceoverIds.value.length < MAX_AUTOMATION_ITEMS) {
-      selectedAutomationVoiceoverIds.value.push(newId)
+    if (newId && await addItemToMediaPool('voiceover', newId)) {
+      if (!selectedAutomationVoiceoverIds.value.includes(newId)
+          && selectedAutomationVoiceoverIds.value.length < MAX_AUTOMATION_ITEMS) {
+        selectedAutomationVoiceoverIds.value.push(newId)
+      }
     }
     voiceoverStatusKind.value = 'success'
     voiceoverStatus.value = `已创建 ${result.asset.name}，可在自动剪辑工作台的旁白池中选用。`
@@ -4573,10 +5133,12 @@ function humanError(message) {
     'That file no longer exists on disk': '硬盘上找不到这个文件了。',
     'That name is too long': '名称太长了。',
     'That file is being used by a render right now': '这个文件正在被渲染使用，等渲染结束再改名。',
+    'An editing job is using this media right now': '有剪辑任务正在使用这个素材，完成后再试。',
     'Route not found': '找不到该清单。',
     'A name cannot contain / \\ : * ? " < > |': '名称里不能有 / \\ : * ? " < > | 这些字符。',
     'Effect not found': '找不到该特效。',
     'Only imported clips can be removed from the library': '只有导入的素材可以从媒体库移出。',
+    'Only app-managed media files can be moved to the trash': '外部导入文件只能移出媒体库，不能由本应用删除。',
     'Voiceover needs text': '请填写旁白文案或大模型提示词。',
     'Nothing usable was found in the text': '文案里没有可用于口播的内容，请补充后再试。',
     'dwell_max_seconds must be >= dwell_min_seconds': '停留最长秒数不能小于最短秒数。',
@@ -4590,6 +5152,7 @@ function humanError(message) {
     'Voiceover must be generated TTS media': '旁白必须是生成的语音合成素材',
     'Music pool must contain music audio media': '音乐池只能包含音乐音频',
     'Voiceover pool must contain generated TTS media': '旁白池只能包含生成的语音合成素材',
+    'Effect pool must contain generated video effect media': '特效池只能包含已生成的视频特效',
     'Seedance is disabled': '未启用 Seedance 特效服务',
     'Seedance API key is not configured': '未配置 Seedance API 密钥',
     'Seedance model is not configured': '未配置 Seedance 视频模型或接入点 ID',

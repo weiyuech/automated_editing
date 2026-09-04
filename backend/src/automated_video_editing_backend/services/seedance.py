@@ -97,6 +97,7 @@ class SeedanceService:
         self.usage_path = self.root / "usage.json"
         self.effects_dir.mkdir(parents=True, exist_ok=True)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
+        self._usage_problem = ""
 
     def list_assets(self) -> list[SeedanceAsset]:
         assets: list[SeedanceAsset] = []
@@ -118,6 +119,9 @@ class SeedanceService:
                         metadata={"source": "data/seedance/effects", "role": "seedance_effect", "seedance_asset_id": asset.id},
                     )
         return assets
+
+    def get_asset(self, asset_id: str) -> SeedanceAsset | None:
+        return self._load_asset(self.effects_dir / f"{asset_id}.json")
 
     def delete_asset(self, asset_id: str) -> bool:
         """Remove an effect and its output file. Failed attempts leave clutter that cannot
@@ -746,19 +750,33 @@ class SeedanceService:
         return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()
 
     def _read_usage(self) -> dict[str, dict[str, int]]:
-        data, _problem = read_json(self.usage_path)
-        if not isinstance(data, dict):
+        if self._usage_problem:
+            raise RuntimeError(self._usage_problem)
+        data, problem = read_json(self.usage_path)
+        if problem:
+            self._fail_usage(problem)
+        if data is None:
+            quarantined = sorted(self.usage_path.parent.glob(f"{self.usage_path.name}.corrupt-*"))
+            if quarantined:
+                self._fail_usage(f"检测到已保留的损坏文件 {quarantined[-1].name}")
             return {}
+        if not isinstance(data, dict):
+            self._fail_usage("文件格式无效：顶层内容应为对象")
         usage: dict[str, dict[str, int]] = {}
         for key, value in data.items():
-            if isinstance(value, dict):
-                count = max(0, int(value.get("count", 0)))
-                video_seconds = max(0, int(value.get("video_seconds", 0)))
-            else:
-                # Old releases stored only a count. Treat every old generation as one
-                # minimum-billed effect: this preserves the allowance already spent today.
-                count = max(0, int(value))
-                video_seconds = count * MINIMUM_BILLABLE_VIDEO_SECONDS
+            try:
+                if isinstance(value, dict):
+                    count = int(value.get("count", 0))
+                    video_seconds = int(value.get("video_seconds", 0))
+                else:
+                    # Old releases stored only a count. Treat every old generation as one
+                    # minimum-billed effect: this preserves the allowance already spent today.
+                    count = int(value)
+                    video_seconds = count * MINIMUM_BILLABLE_VIDEO_SECONDS
+            except (TypeError, ValueError):
+                self._fail_usage(f"文件格式无效：{key!s} 的用量不是整数")
+            if count < 0 or video_seconds < 0:
+                self._fail_usage(f"文件格式无效：{key!s} 的用量不能为负数")
             usage[str(key)] = {"count": count, "video_seconds": video_seconds}
         return usage
 
@@ -775,7 +793,12 @@ class SeedanceService:
             "count": int(today.get("count", 0)) + 1,
             "video_seconds": int(today.get("video_seconds", 0)) + max(0, int(video_seconds)),
         }
-        write_json(self.usage_path, usage)
+        if not write_json(self.usage_path, usage):
+            self._fail_usage(f"{self.usage_path.name} 无法保存")
+
+    def _fail_usage(self, detail: str) -> None:
+        self._usage_problem = f"特效额度记录不可用，已停止生成以避免重复消费：{detail}"
+        raise RuntimeError(self._usage_problem)
 
     def _base_url(self, cfg: dict[str, Any]) -> str:
         return str(cfg.get("base_url") or "https://ark.cn-beijing.volces.com/api/v3").rstrip("/")
