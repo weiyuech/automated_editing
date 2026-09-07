@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from pydantic import ValidationError
 
@@ -29,6 +30,12 @@ def sidecar_path(video_path: str | Path) -> Path:
     """
     video = Path(video_path)
     return video.with_name(video.name + ".capture.json")
+
+
+def gimbal_sidecar_path(video_path: str | Path) -> Path:
+    """Where physical yaw/pitch samples live for downstream motion classification."""
+    video = Path(video_path)
+    return video.with_name(video.name + ".gimbal.json")
 
 
 def read_sidecar(video_path: str | Path) -> dict | None:
@@ -145,7 +152,13 @@ class CaptureService:
         self.path = path or generated_path("data", "capture-sessions.json")
         self.load_problem = ""
         self._sessions: dict[str, CaptureSession] = self._load()
-        self._active_id: str | None = None
+        active_ids = [session.id for session in self._sessions.values() if session.active]
+        self._active_id: str | None = active_ids[-1] if active_ids else None
+        # A valid store should contain at most one active capture. If an older build or an
+        # interrupted write left several, retain the newest one and make the in-memory view
+        # unambiguous without discarding any session metadata.
+        for session_id in active_ids[:-1]:
+            self._sessions[session_id].active = False
 
     def list_sessions(self) -> list[CaptureSession]:
         return list(self._sessions.values())
@@ -159,10 +172,19 @@ class CaptureService:
         if self._active_id and self._active_id in self._sessions:
             return self._sessions[self._active_id]
         session = CaptureSession(title=self._session_title(title), active=True, started_at=utc_now())
+        previous_sessions = self._sessions.copy()
         self._sessions[session.id] = session
         self._active_id = session.id
         self._trim()
-        self._save()
+        try:
+            self._save()
+        except OSError:
+            self._sessions = previous_sessions
+            self._active_id = next(
+                (item.id for item in reversed(list(self._sessions.values())) if item.active),
+                None,
+            )
+            raise
         await self.events.publish("CAPTURE_STARTED", session.model_dump(mode="json"))
         return session
 
@@ -170,12 +192,150 @@ class CaptureService:
         session = self.active_session()
         if not session:
             return None
+        previous_ended_at = session.ended_at
         session.active = False
         session.ended_at = utc_now()
         self._active_id = None
-        self._save()
+        try:
+            self._save()
+        except OSError:
+            session.active = True
+            session.ended_at = previous_ended_at
+            self._active_id = session.id
+            raise
         await self.events.publish("CAPTURE_STOPPED", session.model_dump(mode="json"))
         return session
+
+    async def discard(self) -> CaptureSession | None:
+        """Explicitly close an idle unrecoverable capture without deleting any robot file."""
+        session = self.active_session()
+        if session is None:
+            return None
+        previous = session.model_copy(deep=True)
+        session.active = False
+        session.ended_at = utc_now()
+        session.gimbal_samples = []
+        session.pending_media_url = None
+        session.pending_media_local_path = None
+        session.pending_media_sync_error = None
+        self._active_id = None
+        try:
+            self._save()
+        except OSError:
+            self._sessions[session.id] = previous
+            self._active_id = session.id
+            raise
+        await self.events.publish("CAPTURE_DISCARDED", session.model_dump(mode="json"))
+        return session
+
+    def remember_segments(
+        self,
+        session: CaptureSession,
+        segments: list[CruiseSegment],
+    ) -> None:
+        """Persist a cruise's spans before its recording has necessarily synced locally."""
+        stored = self._sessions.get(session.id)
+        if stored is None:
+            return
+        previous = stored.segments
+        stored.segments = [segment.model_dump(mode="json") for segment in segments]
+        try:
+            self._save()
+        except OSError:
+            stored.segments = previous
+            raise
+
+    def remember_gimbal_samples(
+        self,
+        session: CaptureSession,
+        samples: list[tuple[float, float, float]],
+    ) -> None:
+        """Persist measured camera movement until the recording is safely attached."""
+        stored = self._sessions.get(session.id)
+        if stored is None:
+            return
+        previous = stored.gimbal_samples
+        stored.gimbal_samples = [tuple(float(value) for value in sample) for sample in samples]
+        try:
+            self._save()
+        except OSError:
+            stored.gimbal_samples = previous
+            raise
+
+    def remember_pending_media(
+        self,
+        session: CaptureSession,
+        media_url: str | None,
+        sync_error: str | None = None,
+        local_path: str | None = None,
+    ) -> None:
+        """Keep a retryable video URL with an unfinished capture, including across restarts."""
+        stored = self._sessions.get(session.id)
+        if stored is None:
+            return
+        previous_url = stored.pending_media_url
+        previous_local_path = stored.pending_media_local_path
+        previous_error = stored.pending_media_sync_error
+        candidate = str(media_url or "").strip()
+        suffix = Path(urlsplit(candidate).path).suffix.casefold() if candidate else ""
+        if candidate and suffix not in {
+            ".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif", ".tif", ".tiff",
+        }:
+            stored.pending_media_url = candidate
+        if local_path:
+            stored.pending_media_local_path = str(local_path)
+        stored.pending_media_sync_error = str(sync_error or "").strip() or None
+        try:
+            self._save()
+        except OSError:
+            stored.pending_media_url = previous_url
+            stored.pending_media_local_path = previous_local_path
+            stored.pending_media_sync_error = previous_error
+            raise
+
+    def clear_pending_media(self, session: CaptureSession) -> None:
+        """Drop recovery pointers only after attachment and inactive state both committed."""
+        stored = self._sessions.get(session.id)
+        if stored is None:
+            return
+        previous = (
+            stored.pending_media_url,
+            stored.pending_media_local_path,
+            stored.pending_media_sync_error,
+        )
+        stored.pending_media_url = None
+        stored.pending_media_local_path = None
+        stored.pending_media_sync_error = None
+        try:
+            self._save()
+        except OSError:
+            (
+                stored.pending_media_url,
+                stored.pending_media_local_path,
+                stored.pending_media_sync_error,
+            ) = previous
+            raise
+
+    async def complete_with_recording(
+        self,
+        video_path: str,
+        segments: list[CruiseSegment] | None = None,
+    ) -> CaptureSession | None:
+        """Attach all metadata before making an unfinished capture disappear from recovery UI."""
+        session = self.active_session()
+        if session is None:
+            return None
+        if self.attach_to_recording(session, video_path, segments) is None:
+            raise OSError("视频已保存，但拍摄信息写入失败，请重试保存")
+        stopped = await self.stop()
+        if stopped is not None:
+            try:
+                self.clear_pending_media(stopped)
+            except OSError:
+                # Inactive is already durable and the sidecars are complete. Retaining a small
+                # recovery pointer is harmless and safer than reporting the video as lost.
+                pass
+        return stopped
 
     def attach_to_recording(
         self,
@@ -198,17 +358,41 @@ class CaptureService:
         if not video.exists():
             return None
 
+        serialized_segments = (
+            [segment.model_dump(mode="json") for segment in segments]
+            if segments is not None
+            else [dict(segment) for segment in session.segments]
+        )
         payload = {
             "capture_session_id": session.id,
             "title": session.title,
             "started_at": session.started_at.isoformat() if session.started_at else None,
-            "ended_at": session.ended_at.isoformat() if session.ended_at else None,
+            "ended_at": (session.ended_at or utc_now()).isoformat(),
             "notes": list(session.notes),
             "markers": [marker.model_dump(mode="json") for marker in session.markers],
-            "segments": [segment.model_dump(mode="json") for segment in (segments or [])],
+            "segments": serialized_segments,
         }
         target = sidecar_path(video)
-        return target if write_json(target, payload) else None
+        if not write_json(target, payload):
+            return None
+        if session.gimbal_samples and not write_json(
+                gimbal_sidecar_path(video),
+                {"samples": [list(sample) for sample in session.gimbal_samples]},
+        ):
+            return None
+
+        # The durable sidecars now own the high-volume motion track. Do not retain hundreds of
+        # thousands of samples in the 500-session index after a successful attachment.
+        stored = self._sessions.get(session.id)
+        if stored is not None:
+            stored.gimbal_samples = []
+            try:
+                self._save()
+            except OSError:
+                # Both sidecars and the inactive/active state were committed separately; a
+                # cleanup failure must not pretend the recording itself was lost.
+                pass
+        return target
 
     def _session_title(self, title: str) -> str:
         """Stamp every session with its local start time: '产品晨拍 08-04 17:20'.
@@ -241,7 +425,11 @@ class CaptureService:
             return None
         marker = TimelineMarker(timestamp=max(0.0, timestamp), label=label)
         session.markers.append(marker)
-        self._save()
+        try:
+            self._save()
+        except OSError:
+            session.markers.pop()
+            raise
         await self.events.publish(
             "CAPTURE_MARKER",
             {"session_id": session.id, "marker": marker.model_dump(mode="json")},
@@ -253,7 +441,11 @@ class CaptureService:
         if not session:
             return None
         session.notes.append(note)
-        self._save()
+        try:
+            self._save()
+        except OSError:
+            session.notes.pop()
+            raise
         await self.events.publish("CAPTURE_NOTE", {"session_id": session.id, "note": note})
         return session
 
@@ -280,10 +472,34 @@ class CaptureService:
                 session = CaptureSession(**entry)
             except (ValidationError, TypeError):
                 continue
-            # Nothing can still be recording after a restart.
-            session.active = False
+            # An active session may be waiting for a camera transfer retry. Preserve that
+            # ownership across a backend restart so its notes, point spans and gimbal samples
+            # remain attached to the eventual recording instead of becoming orphaned.
             sessions[session.id] = session
         return sessions
 
     def _save(self) -> None:
-        write_json(self.path, [session.model_dump(mode="json") for session in self._sessions.values()])
+        if self.load_problem:
+            try:
+                self.path.stat()
+            except FileNotFoundError:
+                # Invalid JSON is quarantined by read_json(), so creating a clean replacement
+                # is safe once the original path is gone and its bytes have been preserved.
+                pass
+            except OSError:
+                # If even existence cannot be checked, fail closed rather than gambling with
+                # the recovery record that may still own a recording on the robot.
+                raise OSError(
+                    f"{self.load_problem}；为避免覆盖原有采集记录，已阻止写入"
+                ) from None
+            else:
+                raise OSError(
+                    f"{self.load_problem}；为避免覆盖原有采集记录，已阻止写入"
+                )
+        saved = write_json(
+            self.path,
+            [session.model_dump(mode="json") for session in self._sessions.values()],
+        )
+        if not saved:
+            raise OSError(f"无法保存采集会话：{self.path}")
+        self.load_problem = ""

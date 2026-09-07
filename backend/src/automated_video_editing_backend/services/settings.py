@@ -2,26 +2,26 @@ from __future__ import annotations
 
 import json
 import os
-from datetime import date, timedelta
 from copy import deepcopy
+from datetime import date, timedelta
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from pydantic import ValidationError
 
 from automated_video_editing_backend.core.models import (
-    LLMSettingsSummary,
     AutomationSettingsSummary,
     CameraworkConfig,
+    LLMSettingsSummary,
     RobotSettingsSummary,
-    SeedanceSettingsSummary,
     SecretStatus,
+    SeedanceSettingsSummary,
     SettingsSummary,
     SettingsUpdateRequest,
     TTSSettingsSummary,
 )
 from automated_video_editing_backend.core.paths import generated_path
-
 
 DEFAULT_SETTINGS: dict[str, Any] = {
     "llm": {
@@ -236,30 +236,40 @@ class SettingsService:
         return {str(key): int(value) for key, value in data.items() if str(value).isdigit()}
 
     def update(self, request: SettingsUpdateRequest) -> SettingsSummary:
-        if request.llm:
-            patch = request.llm.model_dump(exclude_unset=True)
-            self._apply_patch("llm", patch, secret_keys={"api_key"})
-        if request.tts:
-            patch = request.tts.model_dump(exclude_unset=True)
-            self._apply_patch("tts", patch, secret_keys={"app_id", "access_token"})
-        if request.seedance:
-            patch = request.seedance.model_dump(exclude_unset=True)
-            self._apply_patch("seedance", patch, secret_keys={"api_key", "model", "image_model", "tos_access_key_id", "tos_secret_access_key", "tos_security_token"})
-        if request.robot:
-            patch = request.robot.model_dump(exclude_unset=True)
-            self._apply_patch("robot", patch, secret_keys=set())
-        if request.automation:
-            patch = request.automation.model_dump(exclude_unset=True)
-            self._apply_patch("automation", patch, secret_keys=set())
-        self._save()
+        previous = deepcopy(self._settings)
+        try:
+            if request.llm:
+                patch = request.llm.model_dump(exclude_unset=True)
+                self._apply_patch("llm", patch, secret_keys={"api_key"})
+            if request.tts:
+                patch = request.tts.model_dump(exclude_unset=True)
+                self._apply_patch("tts", patch, secret_keys={"app_id", "access_token"})
+            if request.seedance:
+                patch = request.seedance.model_dump(exclude_unset=True)
+                self._apply_patch("seedance", patch, secret_keys={"api_key", "model", "image_model", "tos_access_key_id", "tos_secret_access_key", "tos_security_token"})
+            if request.robot:
+                patch = request.robot.model_dump(exclude_unset=True)
+                self._apply_patch("robot", patch, secret_keys=set())
+            if request.automation:
+                patch = request.automation.model_dump(exclude_unset=True)
+                self._apply_patch("automation", patch, secret_keys=set())
+            self._save()
+        except Exception:
+            self._settings = previous
+            raise
         return self.summary()
 
     def replace_for_development(self, settings: dict[str, Any]) -> SettingsSummary:
+        previous = deepcopy(self._settings)
         merged = self._merged_defaults()
         for section in ("llm", "tts", "seedance", "robot", "automation"):
             merged[section].update(settings.get(section, {}))
         self._settings = merged
-        self._save()
+        try:
+            self._save()
+        except Exception:
+            self._settings = previous
+            raise
         return self.summary()
 
     def _apply_patch(self, section: str, patch: dict[str, Any], secret_keys: set[str]) -> None:
@@ -285,7 +295,15 @@ class SettingsService:
         return settings
 
     def _save(self) -> None:
-        self.path.write_text(json.dumps(self._settings, ensure_ascii=False, indent=2), encoding="utf-8")
+        temporary = self.path.with_name(f".{self.path.name}.{uuid4().hex}.tmp")
+        try:
+            temporary.write_text(
+                json.dumps(self._settings, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            temporary.replace(self.path)
+        finally:
+            temporary.unlink(missing_ok=True)
 
     def _merged_defaults(self) -> dict[str, Any]:
         settings = deepcopy(DEFAULT_SETTINGS)

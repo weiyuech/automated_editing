@@ -151,6 +151,18 @@ class CaptureSession(BaseModel):
     ended_at: datetime | None = None
     notes: list[str] = Field(default_factory=list)
     markers: list[TimelineMarker] = Field(default_factory=list)
+    # Persist cruise spans with the still-active capture as well as beside the final video.
+    # If stop/download must be retried later, the recovery path can still write the same
+    # transit/dwell evidence instead of silently treating the file as ordinary footage.
+    segments: list[dict[str, Any]] = Field(default_factory=list)
+    # Physical heartbeat samples belong to the capture until its video is safely local.  Keeping
+    # them here lets a later save retry write the same motion evidence as an immediate stop.
+    gimbal_samples: list[tuple[float, float, float]] = Field(default_factory=list)
+    # The camera may stop successfully while its HTTP transfer fails. Keep the robot URL with
+    # the still-active session so retry remains possible after the desktop backend restarts.
+    pending_media_url: str | None = None
+    pending_media_local_path: str | None = None
+    pending_media_sync_error: str | None = None
 
 
 class GimbalScanConfig(BaseModel):

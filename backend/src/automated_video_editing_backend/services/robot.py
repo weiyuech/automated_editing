@@ -3,8 +3,13 @@ from __future__ import annotations
 import asyncio
 import json
 from abc import ABC, abstractmethod
+from collections.abc import Awaitable, Callable
 from contextlib import suppress
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
+from urllib.parse import urlsplit
+
+import httpx
 
 from automated_video_editing_backend.core.diagnostics import log_event
 from automated_video_editing_backend.core.events import EventHub
@@ -17,10 +22,19 @@ from automated_video_editing_backend.core.models import (
     RobotState,
     utc_now,
 )
+from automated_video_editing_backend.services.media_download import (
+    camera_media_error_message,
+    exception_detail,
+    retry_camera_media_download,
+)
 
 if TYPE_CHECKING:
     from automated_video_editing_backend.core.models import MediaItem
     from automated_video_editing_backend.services.media import MediaService
+
+
+class RobotCommandNotSentError(ConnectionError):
+    """A command failed preflight and definitely never reached the robot socket."""
 
 
 class RobotAdapter(ABC):
@@ -108,6 +122,13 @@ class HardwareRobotAdapter(RobotAdapter):
         self._heartbeat_yaw: float | None = None
         self._heartbeat_pitch: float | None = None
         self._heartbeat_revision: int | None = None
+        # Photo and video replies share RobotState.media_url. Keep the active recording URL
+        # separately so an in-recording photo cannot become the fallback for video stop.
+        self._recording_media_url: str | None = None
+        # ``RobotState.recording`` defaults to false, but that is not an observation. After a
+        # process restart we must wait for a heartbeat/reply before deciding a persisted URL is
+        # a finished file that is safe to download.
+        self._recording_status_known = False
 
     async def configure_websocket_url(self, websocket_url: str) -> RobotState:
         next_url = websocket_url.strip()
@@ -117,9 +138,15 @@ class HardwareRobotAdapter(RobotAdapter):
             return self.state
 
         await self._stop_connection_loop()
+        self._recording_media_url = None
+        self._recording_status_known = False
         self.websocket_url = next_url
         self.state.connected = False
         self.state.connection_status = "disconnected"
+        self.state.recording = False
+        self.state.media_url = None
+        self.state.media_local_path = None
+        self.state.media_sync_error = None
         self.state.error = None if next_url else "Robot websocket URL is not configured"
         self._touch()
         await self._publish_state()
@@ -147,6 +174,8 @@ class HardwareRobotAdapter(RobotAdapter):
 
     async def disconnect(self) -> RobotState:
         await self._stop_connection_loop()
+        self._recording_media_url = None
+        self._recording_status_known = False
         self.state.connected = False
         self.state.connection_status = "disconnected"
         self.state.error = None
@@ -158,6 +187,14 @@ class HardwareRobotAdapter(RobotAdapter):
         if self.websocket_url:
             self._start_connection_loop()
         return self.state
+
+    def pending_recording_media_url(self) -> str | None:
+        """Return the video URL without exposing a later photo URL as its replacement."""
+        return self._recording_media_url
+
+    def recording_status_known(self) -> bool:
+        """Whether recording/idle came from hardware rather than the model default."""
+        return self._recording_status_known
 
     async def map_list(self) -> list[str]:
         response = await self._request({"get_map_list": "all"}, "robot_map_list")
@@ -352,6 +389,9 @@ class HardwareRobotAdapter(RobotAdapter):
         return self.state
 
     async def start_recording(self) -> RobotState:
+        # A new capture must never inherit the previous file as its recovery candidate. Clear
+        # before sending because send/ack failure is precisely where stale fallback is unsafe.
+        self._recording_media_url = None
         response = await self._request(
             {"video_record": {"start": 0, "resolution": 4}},
             "robot_video_record",
@@ -359,9 +399,12 @@ class HardwareRobotAdapter(RobotAdapter):
         )
         if not _response_ok(response):
             self.state.recording = False
+            self._recording_status_known = True
             raise ValueError(f"机器人拒绝开始录制：{_response_error(response)}")
         self.state.recording = True
-        self.state.media_url = str(response.get("url") or "") or self.state.media_url
+        self._recording_status_known = True
+        self._recording_media_url = str(response.get("url") or "").strip() or None
+        self.state.media_url = self._recording_media_url
         self.state.last_command = "video_record:start"
         self._touch()
         await self._publish_state()
@@ -376,7 +419,11 @@ class HardwareRobotAdapter(RobotAdapter):
         if not _response_ok(response):
             raise ValueError(f"机器人拒绝停止录制：{_response_error(response)}")
         self.state.recording = False
-        self.state.media_url = str(response.get("url") or "") or self.state.media_url
+        self._recording_status_known = True
+        self.state.media_url = (
+            str(response.get("url") or "").strip() or self._recording_media_url
+        )
+        self._recording_media_url = None
         if not self.state.media_url:
             raise ValueError("机器人停止了录制，但没有返回视频地址")
         self.state.last_command = "video_record:stop"
@@ -409,7 +456,9 @@ class HardwareRobotAdapter(RobotAdapter):
         async with self._request_lock:
             await self.connect()
             if not self._socket or not self.state.connected:
-                raise ConnectionError(self.state.error or "Robot websocket is not connected")
+                raise RobotCommandNotSentError(
+                    self.state.error or "Robot websocket is not connected"
+                )
 
             loop = asyncio.get_running_loop()
             future: asyncio.Future[Any] = loop.create_future()
@@ -435,7 +484,9 @@ class HardwareRobotAdapter(RobotAdapter):
     async def _send(self, payload: dict[str, Any]) -> None:
         await self.connect()
         if not self._socket or not self.state.connected:
-            raise ConnectionError(self.state.error or "Robot websocket is not connected")
+            raise RobotCommandNotSentError(
+                self.state.error or "Robot websocket is not connected"
+            )
         async with self._send_lock:
             log_event("info", "robot.command.sent", payload=payload)
             await self._socket.send(json.dumps(payload, ensure_ascii=False))
@@ -448,6 +499,7 @@ class HardwareRobotAdapter(RobotAdapter):
         self._connection_task = asyncio.create_task(self._connection_loop())
 
     async def _stop_connection_loop(self) -> None:
+        self._recording_status_known = False
         self._fail_pending(ConnectionError("Robot websocket was reconfigured"))
         socket = self._socket
         self._socket = None
@@ -466,6 +518,7 @@ class HardwareRobotAdapter(RobotAdapter):
             socket: Any | None = None
             try:
                 websockets = _load_websockets()
+                self._recording_status_known = False
                 self.state.connected = False
                 self.state.connection_status = "connecting" if first_attempt else "reconnecting"
                 self.state.error = None
@@ -501,6 +554,7 @@ class HardwareRobotAdapter(RobotAdapter):
                 await self._publish_state()
                 return
             except Exception as exc:
+                self._recording_status_known = False
                 self.state.connected = False
                 self.state.connection_status = "reconnecting"
                 self.state.error = str(exc)
@@ -592,6 +646,7 @@ class HardwareRobotAdapter(RobotAdapter):
             # send the stop command, so a missing field must mean "unchanged", not "no".
             if "record_status" in gimbal:
                 self.state.recording = gimbal.get("record_status") == "recording"
+                self._recording_status_known = True
             self.state.yaw = _maybe_float(gimbal.get("yaw"))
             self._heartbeat_yaw = self.state.yaw
             self.state.pitch = _maybe_float(gimbal.get("pitch"))
@@ -602,16 +657,24 @@ class HardwareRobotAdapter(RobotAdapter):
 
         record = payload.get("robot_video_record")
         if isinstance(record, dict):
-            if record.get("status") == "ok" and "stop" in record:
+            record_url = _maybe_str(record.get("url"))
+            if _response_ok(record) and "stop" in record:
                 self.state.recording = False
-            elif record.get("status") == "ok":
+                self._recording_status_known = True
+                self._recording_media_url = record_url or self._recording_media_url
+            elif _response_ok(record):
                 self.state.recording = True
-            self.state.media_url = _maybe_str(record.get("url")) or self.state.media_url
+                self._recording_status_known = True
+                self._recording_media_url = record_url or self._recording_media_url
+            self.state.media_url = record_url or self.state.media_url
             changed = True
 
         photo = payload.get("robot_take_photo")
         if isinstance(photo, dict):
-            self.state.media_url = _maybe_str(photo.get("url")) or self.state.media_url
+            # Only the live request owns shared photo state. A delayed/duplicate photo reply
+            # after Stop must not replace the final video's URL in the UI.
+            if "robot_take_photo" in self._pending:
+                self.state.media_url = _maybe_str(photo.get("url")) or self.state.media_url
             changed = True
 
         return changed
@@ -643,12 +706,158 @@ class RobotService:
         self.events = events
         self.adapter = adapter or HardwareRobotAdapter(events, websocket_url)
         self.media = media
+        # A stop response and the resulting camera-file transfer are one capture boundary.
+        # Serializing that boundary prevents a later start/photo from clearing or replacing the
+        # shared adapter state while an earlier REC_xxxx file is still being downloaded.
+        self._capture_lock = asyncio.Lock()
+        # A photo taken during recording replaces RobotState.media_url, so video recovery owns
+        # a separate URL that survives a timed-out Stop acknowledgement.
+        self._recoverable_video_url: str | None = None
+        # HTTP transfers finish independently of WebSocket commands. Tokens stop a late photo
+        # completion from publishing state owned by a newer Stop/start/photo operation.
+        self._media_revision = 0
 
     async def configure_websocket_url(self, websocket_url: str) -> RobotState:
-        return await self.adapter.configure_websocket_url(websocket_url)
+        async with self._capture_lock:
+            self._media_revision += 1
+            current = await self.adapter.status()
+            if current.recording:
+                raise ValueError("录制进行中，无法更改机器人连接")
+            previous_url = str(getattr(self.adapter, "websocket_url", "") or "").strip()
+            result = await self.adapter.configure_websocket_url(websocket_url)
+            if websocket_url.strip() != previous_url:
+                self._recoverable_video_url = None
+            return result
+
+    async def configure_websocket_url_and_commit(
+        self,
+        websocket_url: str,
+        commit: Callable[[], Any],
+        *,
+        preserve_capture_recovery: bool = False,
+    ) -> Any:
+        """Change endpoint and persist its settings as one capture-reserved transaction.
+
+        A restored capture may be blocked only because its saved endpoint is stale.  In that
+        recovery flow the operator must be able to repair the endpoint without dropping the
+        video URL that still belongs to the active capture.
+        """
+        async with self._capture_lock:
+            self._media_revision += 1
+            current = await self.adapter.status()
+            if current.recording:
+                raise ValueError("录制进行中，无法更改机器人连接")
+            previous_url = str(getattr(self.adapter, "websocket_url", "") or "")
+            recovery_url = self._select_video_url(str(current.media_url or ""))
+            recovery_local_path = (
+                str(current.media_local_path)
+                if current.media_local_path and Path(current.media_local_path).is_file()
+                else None
+            )
+            recovery_sync_error = current.media_sync_error
+            try:
+                configured_state = await self.adapter.configure_websocket_url(websocket_url)
+                result = commit()
+                if (
+                    websocket_url.strip() != previous_url.strip()
+                    and not preserve_capture_recovery
+                ):
+                    self._recoverable_video_url = None
+                elif preserve_capture_recovery:
+                    self._restore_preserved_capture_state(
+                        configured_state,
+                        recovery_url,
+                        recovery_local_path,
+                        recovery_sync_error,
+                    )
+                    await self.events.publish(
+                        "ROBOT_STATE",
+                        configured_state.model_dump(mode="json"),
+                    )
+                return result
+            except (Exception, asyncio.CancelledError):
+                try:
+                    rolled_back_state = await asyncio.shield(
+                        self.adapter.configure_websocket_url(previous_url)
+                    )
+                    if preserve_capture_recovery:
+                        self._restore_preserved_capture_state(
+                            rolled_back_state,
+                            recovery_url,
+                            recovery_local_path,
+                            recovery_sync_error,
+                        )
+                        await self.events.publish(
+                            "ROBOT_STATE",
+                            rolled_back_state.model_dump(mode="json"),
+                        )
+                except Exception as rollback_exc:
+                    log_event(
+                        "error",
+                        "robot.configuration.rollback.failed",
+                        previous_url=previous_url,
+                        exception=exception_detail(rollback_exc),
+                    )
+                raise
+
+    def _restore_preserved_capture_state(
+        self,
+        state: RobotState,
+        media_url: str,
+        local_path: str | None,
+        sync_error: str | None,
+    ) -> None:
+        """Restore durable capture pointers cleared by an endpoint reconfiguration."""
+        # Prefer a fresh URL already reported by the corrected endpoint; otherwise retain the
+        # durable pre-repair URL. This also keeps relative camera paths useful with the new host.
+        candidate = self._select_video_url(str(state.media_url or ""), prefer_state=True)
+        if not candidate:
+            candidate = media_url
+        self._recoverable_video_url = candidate or None
+        state.media_url = candidate or None
+        state.media_local_path = local_path
+        state.media_sync_error = sync_error
 
     async def status(self) -> RobotState:
         return await self.adapter.status()
+
+    async def discard_capture_recovery(
+        self,
+        commit: Callable[[], Awaitable[Any]],
+    ) -> Any:
+        """Verify hardware idle, durably close the session, then forget its URL atomically."""
+        async with self._capture_lock:
+            current = await self.adapter.status()
+            if current.recording:
+                raise ValueError("机器人仍在录制，不能放弃当前采集")
+            known_reader = getattr(self.adapter, "recording_status_known", None)
+            if callable(known_reader) and (
+                not current.connected or not bool(known_reader())
+            ):
+                raise ConnectionError("正在等待机器人同步录制状态，请稍后再试")
+            result = await commit()
+            self._recoverable_video_url = None
+            current.media_url = None
+            current.media_local_path = None
+            current.media_sync_error = None
+            await self.events.publish("ROBOT_STATE", current.model_dump(mode="json"))
+            return result
+
+    def restore_recoverable_video_url(
+        self,
+        robot_url: str | None,
+        local_path: str | None = None,
+        sync_error: str | None = None,
+    ) -> None:
+        """Restore an unfinished capture's transfer state from durable session metadata."""
+        candidate = str(robot_url or "").strip()
+        if candidate and not _looks_like_image_url(candidate):
+            self._recoverable_video_url = candidate
+            self.adapter.state.media_url = candidate
+        saved_path = Path(str(local_path or ""))
+        if local_path and saved_path.is_file():
+            self.adapter.state.media_local_path = str(saved_path)
+        self.adapter.state.media_sync_error = str(sync_error or "").strip() or None
 
     async def connect(self) -> RobotState:
         state = await self.adapter.connect()
@@ -736,55 +945,222 @@ class RobotService:
         The protocol does not define which reported yaw is the physical front, so ordinary
         capture must not issue an implicit gimbal command. Camera movement remains explicit.
         """
-        await self._clear_media_state()
-        state = await self.adapter.start_recording()
-        log_event("info", "capture.recording.started", recording=state.recording)
-        await self.events.publish("ROBOT_STATE", state.model_dump(mode="json"))
-        return state
+        async with self._capture_lock:
+            self._media_revision += 1
+            current = await self.adapter.status()
+            if current.recording:
+                raise ValueError("机器人已在录制，请先停止当前录制")
+            self._recoverable_video_url = None
+            await self._clear_media_state()
+            state = await self.adapter.start_recording()
+            result = state.model_copy(deep=True)
+            self._recoverable_video_url = str(result.media_url or "").strip() or None
+            log_event("info", "capture.recording.started", recording=result.recording)
+            await self.events.publish("ROBOT_STATE", result.model_dump(mode="json"))
+            return result
 
     async def stop_recording(self, sync_media: bool = True) -> RobotState:
+        async with self._capture_lock:
+            self._media_revision += 1
+            return await self._stop_recording_locked(sync_media)
+
+    async def finalize_capture_recording(
+        self,
+        on_media_url: Callable[[str], None] | None = None,
+    ) -> RobotState:
+        """Stop an active recording, or retry saving a late already-stopped recording.
+
+        Some firmware applies Stop even when its WebSocket reply reaches the desktop too late.
+        The next heartbeat then says ``recording=false`` and carries the media URL. A capture
+        session must be able to consume that URL without sending a second invalid Stop command.
+        """
+        async with self._capture_lock:
+            self._media_revision += 1
+            current = await self.adapter.status()
+            result = current.model_copy(deep=True)
+            # A verified local file was downloaded only after Stop was accepted. It is safe to
+            # finalize even before the first post-restart heartbeat.
+            if result.media_local_path and Path(result.media_local_path).is_file():
+                return result
+            if current.recording:
+                return await self._stop_recording_locked(
+                    sync_media=True,
+                    on_media_url=on_media_url,
+                )
+
+            known_reader = getattr(self.adapter, "recording_status_known", None)
+            if callable(known_reader) and (
+                not current.connected or not bool(known_reader())
+            ):
+                raise ConnectionError("正在等待机器人同步录制状态，请稍后重试保存")
+
+            robot_url = self._select_video_url(str(result.media_url or ""))
+            if not robot_url:
+                raise ValueError("机器人已停止录制，但没有可恢复的视频地址")
+
+            result.media_url = robot_url
+            self._recoverable_video_url = robot_url
+            self._notify_media_url(on_media_url, robot_url)
+            await self._sync_robot_media(result, robot_url, "video")
+            live_result = await self._mirror_media_result(result, recording=False)
+            await self.events.publish("ROBOT_STATE", live_result.model_dump(mode="json"))
+            return live_result
+
+    async def _stop_recording_locked(
+        self,
+        sync_media: bool,
+        on_media_url: Callable[[str], None] | None = None,
+    ) -> RobotState:
+        # The shared adapter state may still contain a prior video or an in-recording photo.
+        # Clear local outcomes before stop so only values deliberately produced by this stop can
+        # survive. Keep media_url: some firmware returns it at start and omits it at stop.
+        before_stop = await self.adapter.status()
+        if not before_stop.recording:
+            raise ValueError("机器人当前未在录制")
+        before_stop.media_local_path = None
+        before_stop.media_sync_error = None
         state = await self.adapter.stop_recording()
-        if sync_media:
+        result = state.model_copy(deep=True)
+        robot_url = self._select_video_url(str(result.media_url or ""), prefer_state=True)
+        result.media_url = robot_url or None
+        self._recoverable_video_url = robot_url or self._recoverable_video_url
+        self._notify_media_url(on_media_url, robot_url)
+        # Preserve a fresh local path supplied by adapters that perform their own transfer as
+        # part of stop_recording; otherwise the desktop media service owns the transfer.
+        result.media_sync_error = None
+        if sync_media and not result.media_local_path:
             # Recording and transferring the resulting file are separate outcomes. Once the
             # robot accepted stop, a network/routing failure must not rewrite that success as
-            # "recording failed" or leave the capture session active.
-            await self._sync_robot_media(state.media_url, "video")
+            # "recording failed"; callers can keep the capture session for a save retry.
+            await self._sync_robot_media(result, robot_url, "video")
+        live_result = await self._mirror_media_result(result, recording=result.recording)
         log_event(
             "info",
             "capture.recording.stopped",
-            robot_url=state.media_url,
-            local_path=state.media_local_path,
-            media_sync_error=state.media_sync_error,
+            robot_url=robot_url,
+            local_path=result.media_local_path,
+            media_sync_error=result.media_sync_error,
         )
-        await self.events.publish("ROBOT_STATE", state.model_dump(mode="json"))
-        return state
+        await self.events.publish("ROBOT_STATE", live_result.model_dump(mode="json"))
+        return live_result
+
+    @staticmethod
+    def _notify_media_url(
+        callback: Callable[[str], None] | None,
+        robot_url: str,
+    ) -> None:
+        """Persist an accepted Stop URL before the potentially long HTTP transfer.
+
+        A storage error must not prevent the already-running camera from stopping or skip the
+        transfer. Callers persist the complete transfer result again after this method returns,
+        so a transient storage failure still gets a second durable-write opportunity.
+        """
+        if callback is None or not robot_url:
+            return
+        try:
+            callback(robot_url)
+        except Exception as exc:
+            log_event(
+                "error",
+                "capture.media_url.persist.failed",
+                robot_url=robot_url,
+                exception=exception_detail(exc),
+            )
+
+    def _select_video_url(self, state_url: str = "", *, prefer_state: bool = False) -> str:
+        reader = getattr(self.adapter, "pending_recording_media_url", None)
+        adapter_url = str(reader() or "").strip() if callable(reader) else ""
+        state_url = state_url.strip()
+        candidates = (
+            (state_url, adapter_url, self._recoverable_video_url or "")
+            if prefer_state
+            else (adapter_url, self._recoverable_video_url or "", state_url)
+        )
+        for candidate in candidates:
+            if candidate and not _looks_like_image_url(candidate):
+                return candidate
+        return ""
+
+    async def stop_recording_with_download(
+        self,
+        downloader: Callable[[str], Awaitable[Any]],
+    ) -> tuple[RobotState, Any]:
+        """Stop and consume disposable media without exposing it as a library item.
+
+        Framing previews use this path so their temporary HTTP transfer participates in the
+        same capture lock as ordinary recording sync, while remaining outside MediaService.
+        """
+        async with self._capture_lock:
+            self._media_revision += 1
+            state = await self._stop_recording_locked(sync_media=False)
+            robot_url = str(state.media_url or "")
+            if not robot_url:
+                raise RuntimeError("机器人没有返回测试视频地址")
+            return state, await downloader(self.resolve_media_url(robot_url))
+
+    def resolve_media_url(self, robot_url: str) -> str:
+        from automated_video_editing_backend.services.media import resolve_robot_media_url
+
+        return resolve_robot_media_url(
+            robot_url,
+            str(getattr(self.adapter, "websocket_url", "") or ""),
+        )
 
     async def capture_photo(self) -> dict[str, Any]:
-        await self._clear_media_state()
-        result = await self.adapter.capture_photo()
-        synced = await self._sync_robot_media(str(result.get("url") or ""), "image")
+        # Serialize the physical command and take a private state snapshot, then release the
+        # capture lock before the optional HTTP transfer. A stalled photo server must never
+        # delay the operator's Stop command while the robot keeps recording.
+        async with self._capture_lock:
+            self._media_revision += 1
+            media_revision = self._media_revision
+            await self._clear_media_state()
+            result = await self.adapter.capture_photo()
+            robot_url = str(result.get("url") or "")
+            state = (await self.adapter.status()).model_copy(deep=True)
+
+        synced = await self._sync_robot_media(state, robot_url, "image")
+        async with self._capture_lock:
+            live_state = None
+            if media_revision == self._media_revision:
+                live = await self.adapter.status()
+                live.media_local_path = state.media_local_path
+                live.media_sync_error = state.media_sync_error
+                live_state = live.model_copy(deep=True)
+                await self.events.publish("ROBOT_STATE", live_state.model_dump(mode="json"))
         if synced:
             result["local_media_item"] = synced.model_dump(mode="json")
-        state = await self.adapter.status()
         result["media_sync_error"] = state.media_sync_error
         log_event(
             "info",
             "capture.photo.completed",
-            robot_url=result.get("url"),
+            robot_url=robot_url,
             local_path=synced.path if synced else None,
             media_sync_error=state.media_sync_error,
         )
         await self.events.publish("ROBOT_PHOTO", result)
         return result
 
+    async def _mirror_media_result(
+        self,
+        result: RobotState,
+        *,
+        recording: bool | None = None,
+    ) -> RobotState:
+        """Copy only this operation's owned fields back to the adapter's live state."""
+        live = await self.adapter.status()
+        if recording is not None:
+            live.recording = recording
+        live.media_url = result.media_url
+        live.media_local_path = result.media_local_path
+        live.media_sync_error = result.media_sync_error
+        return live.model_copy(deep=True)
+
     async def _sync_robot_media(
         self,
+        state: RobotState,
         robot_url: str | None,
         kind_hint: str,
     ) -> MediaItem | None:
-        from automated_video_editing_backend.services.media import resolve_robot_media_url
-
-        state = await self.adapter.status()
         state.media_sync_error = None
         if not self.media:
             error = "媒体服务不可用，无法保存机器人文件"
@@ -792,10 +1168,7 @@ class RobotService:
             return None
 
         try:
-            download_url = resolve_robot_media_url(
-                str(robot_url or ""),
-                str(getattr(self.adapter, "websocket_url", "") or ""),
-            )
+            download_url = self.resolve_media_url(str(robot_url or ""))
             log_event(
                 "info",
                 "robot.media.download.started",
@@ -803,19 +1176,46 @@ class RobotService:
                 resolved_url=download_url,
                 kind=kind_hint,
             )
-            item = await self.media.download_url(
-                download_url,
-                metadata={
-                    "source": "data/downloads",
-                    "origin": "robot_hardware",
-                    "robot_url": download_url,
-                    "kind_hint": kind_hint,
-                },
-                filename_prefix="robot-",
-            )
+            async def download() -> MediaItem:
+                return await self.media.download_url(
+                    download_url,
+                    metadata={
+                        "source": "data/downloads",
+                        "origin": "robot_hardware",
+                        "robot_url": download_url,
+                        "kind_hint": kind_hint,
+                    },
+                    filename_prefix="robot-",
+                    request_timeout=httpx.Timeout(60.0, connect=3.0, pool=3.0),
+                )
+
+            def log_retry(
+                attempt: int,
+                total_attempts: int,
+                delay: float,
+                exc: BaseException,
+            ) -> None:
+                log_event(
+                    "warning",
+                    "robot.media.download.retry",
+                    robot_url=download_url,
+                    kind=kind_hint,
+                    failed_attempt=attempt,
+                    total_attempts=total_attempts,
+                    retry_in_seconds=delay,
+                    exception=exception_detail(exc),
+                )
+
+            item = await retry_camera_media_download(download, on_retry=log_retry)
         except Exception as exc:
-            error = str(exc)
-            await self._media_sync_failed(state, robot_url or "", kind_hint, error)
+            error = camera_media_error_message(exc)
+            await self._media_sync_failed(
+                state,
+                robot_url or "",
+                kind_hint,
+                error,
+                exception_detail(exc),
+            )
             return None
 
         state.media_local_path = item.path
@@ -827,7 +1227,6 @@ class RobotService:
             local_path=item.path,
             kind=kind_hint,
         )
-        await self.events.publish("ROBOT_STATE", state.model_dump(mode="json"))
         await self.events.publish(
             "ROBOT_MEDIA_SYNCED",
             {"url": robot_url, "kind_hint": kind_hint, "media_item": item.model_dump(mode="json")},
@@ -840,6 +1239,7 @@ class RobotService:
         robot_url: str,
         kind_hint: str,
         error: str,
+        exception: str | None = None,
     ) -> None:
         state.media_sync_error = error
         log_event(
@@ -848,8 +1248,8 @@ class RobotService:
             robot_url=robot_url,
             kind=kind_hint,
             error=error,
+            exception=exception,
         )
-        await self.events.publish("ROBOT_STATE", state.model_dump(mode="json"))
         await self.events.publish(
             "ROBOT_MEDIA_SYNC_FAILED",
             {"url": robot_url, "kind_hint": kind_hint, "error": error},
@@ -860,6 +1260,11 @@ def _load_websockets() -> Any:
     import websockets
 
     return websockets
+
+
+def _looks_like_image_url(url: str) -> bool:
+    path = urlsplit(url).path.casefold()
+    return path.endswith((".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif", ".tif", ".tiff"))
 
 
 def _response_error(response: Any) -> str:

@@ -11,10 +11,13 @@ from pydantic import ValidationError
 from automated_video_editing_backend.core.models import (
     AutomationSettingsUpdate,
     CameraworkConfig,
+    RobotState,
     SeedanceSettingsUpdate,
     SettingsUpdateRequest,
     TTSGenerateRequest,
 )
+from automated_video_editing_backend.api.routes import build_router
+from automated_video_editing_backend.services.admin_access import AdminAccessService
 from automated_video_editing_backend.core.paths import generated_path
 from automated_video_editing_backend.services.media import MediaService
 from automated_video_editing_backend.services.settings import SettingsService
@@ -58,6 +61,104 @@ def test_settings_accepts_only_robot_websocket_url(tmp_path):
 
     with pytest.raises(ValidationError):
         SettingsUpdateRequest.model_validate({"robot": {"websocket_url": "https://example.com"}})
+
+
+def test_failed_settings_save_restores_the_in_memory_configuration(monkeypatch, tmp_path):
+    path = tmp_path / "settings.json"
+    service = SettingsService(path=path)
+    service.update(
+        SettingsUpdateRequest.model_validate({"robot": {"websocket_url": "ws://old.local:8765"}})
+    )
+
+    def fail_save():
+        raise OSError("settings disk is read-only")
+
+    monkeypatch.setattr(service, "_save", fail_save)
+    with pytest.raises(OSError, match="read-only"):
+        service.update(
+            SettingsUpdateRequest.model_validate(
+                {"robot": {"websocket_url": "ws://new.local:8765"}}
+            )
+        )
+
+    assert service.summary().robot.websocket_url == "ws://old.local:8765"
+    assert json.loads(path.read_text(encoding="utf-8"))["robot"]["websocket_url"] == (
+        "ws://old.local:8765"
+    )
+
+
+@pytest.mark.asyncio
+async def test_settings_endpoint_repairs_robot_url_without_releasing_active_capture(tmp_path):
+    settings = SettingsService(path=tmp_path / "settings.json")
+    settings.update(
+        SettingsUpdateRequest.model_validate(
+            {"robot": {"websocket_url": "ws://wrong.local:8765"}}
+        )
+    )
+
+    class Robot:
+        def __init__(self):
+            self.preserve_capture_recovery = None
+
+        async def status(self):
+            return RobotState(connected=False, recording=False)
+
+        async def configure_websocket_url_and_commit(
+            self,
+            _url,
+            commit,
+            *,
+            preserve_capture_recovery=False,
+        ):
+            self.preserve_capture_recovery = preserve_capture_recovery
+            return commit()
+
+    class Capture:
+        session = object()
+
+        def active_session(self):
+            return self.session
+
+    class Cruise:
+        is_running = False
+
+    class FramingTest:
+        def status(self):
+            return {"running": False}
+
+    robot = Robot()
+    capture = Capture()
+    router = build_router(
+        robot,
+        capture,
+        Cruise(),
+        None,
+        None,
+        None,
+        None,
+        settings,
+        None,
+        None,
+        None,
+        None,
+        FramingTest(),
+        AdminAccessService(),
+    )
+    update_endpoint = next(
+        route.endpoint
+        for route in router.routes
+        if route.path == "/settings" and "PUT" in (route.methods or set())
+    )
+
+    summary = await update_endpoint(
+        SettingsUpdateRequest.model_validate(
+            {"robot": {"websocket_url": "ws://correct.local:8765"}}
+        )
+    )
+
+    assert robot.preserve_capture_recovery is True
+    assert capture.active_session() is capture.session
+    assert summary.robot.websocket_url == "ws://correct.local:8765"
 
 
 def test_output_framing_starts_unset_and_persists_one_preference(tmp_path):

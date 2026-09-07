@@ -13,10 +13,15 @@ from automated_video_editing_backend.core.models import (
     CruisePoint,
     CruiseRequest,
     GimbalScanConfig,
+    MediaItem,
     RobotGoalCommand,
     RobotState,
 )
-from automated_video_editing_backend.services.capture import CaptureService, sidecar_path
+from automated_video_editing_backend.services.capture import (
+    CaptureService,
+    gimbal_sidecar_path,
+    sidecar_path,
+)
 from automated_video_editing_backend.services.cruise import CruiseService
 from automated_video_editing_backend.services.robot import HardwareRobotAdapter, RobotService
 
@@ -106,6 +111,20 @@ async def test_hardware_adapter_keeps_raw_heartbeat_pitch_separate_from_command_
     assert adapter.heartbeat_revision() == 2
 
 
+@pytest.mark.asyncio
+async def test_reconnect_forgets_stale_recording_status_until_a_new_heartbeat():
+    adapter = armed_adapter()
+    await adapter._handle_message(heartbeat("going", yaw=7, pitch=-3))
+    assert adapter.recording_status_known() is True
+
+    await adapter._stop_connection_loop()
+    adapter.state.connected = True  # fresh socket, before its first new gimbal heartbeat
+    assert adapter.recording_status_known() is False
+
+    await adapter._handle_message(heartbeat("going", yaw=8, pitch=-2))
+    assert adapter.recording_status_known() is True
+
+
 class FakeAdapter:
     """Duck-typed robot that reports arrival for every goal except those in fail_ids."""
 
@@ -176,7 +195,20 @@ class FakeAdapter:
 def build_cruise(fail_ids=(), camerawork_provider=None):
     events = EventHub()
     adapter = FakeAdapter(fail_ids=fail_ids)
-    robot = RobotService(events, adapter=adapter)
+    media_root = Path(tempfile.mkdtemp())
+
+    class FakeMedia:
+        def __init__(self):
+            self.counter = 0
+
+        async def download_url(self, _url, metadata=None, **_kwargs):
+            self.counter += 1
+            target = media_root / f"cruise-{self.counter}.mp4"
+            target.write_bytes(b"video")
+            return MediaItem(path=str(target), kind="video", metadata=metadata or {})
+
+    robot = RobotService(events, adapter=adapter, media=FakeMedia())
+    robot.resolve_media_url = lambda url: url
     capture = CaptureService(events, path=Path(tempfile.mkdtemp()) / "sessions.json")
     return CruiseService(events, robot, capture, camerawork_provider), adapter, capture
 
@@ -269,6 +301,24 @@ async def test_gimbal_scan_is_off_by_default_and_returns_to_centre_when_enabled(
     # Recording does not move the gimbal. Each point scans from its current angle and returns.
     assert adapter.sweeps == [(35.0, 30.0), (20.0, 30.0), (35.0, 30.0), (20.0, 30.0)]
     assert adapter.state.yaw == 20.0
+    samples = json.loads(
+        gimbal_sidecar_path(run.media_local_path).read_text(encoding="utf-8")
+    )["samples"]
+    assert samples
+
+
+@pytest.mark.asyncio
+async def test_plain_cruise_never_inherits_gimbal_samples_from_previous_run():
+    cruise, adapter, _ = build_cruise()
+    adapter.state.yaw = 20.0
+    scan = GimbalScanConfig(enabled=True, yaw_offset_deg=15.0, yaw_speed_deg_s=30.0)
+    scanned = await cruise.start(cruise_request(gimbal_scan=scan))
+    await cruise._task
+    assert gimbal_sidecar_path(scanned.media_local_path).exists()
+
+    plain = await cruise.start(cruise_request())
+    await cruise._task
+    assert not gimbal_sidecar_path(plain.media_local_path).exists()
 
 
 @pytest.mark.asyncio
@@ -287,7 +337,6 @@ async def test_each_run_gets_a_timestamped_session_so_runs_are_distinguishable()
     await cruise.start(cruise_request(title="早班清单"))
     await cruise._task
     first = capture.list_sessions()[0].title
-
     await cruise.start(cruise_request(title="早班清单"))
     await cruise._task
     titles = [session.title for session in capture.list_sessions()]
@@ -345,6 +394,11 @@ class RunningCruise:
     is_running = True
 
 
+class IdleFramingTest:
+    def status(self):
+        return {"running": False}
+
+
 @pytest.mark.asyncio
 async def test_ws_refuses_manual_capture_while_a_cruise_runs():
     from automated_video_editing_backend.api.ws import _handle_command
@@ -354,7 +408,15 @@ async def test_ws_refuses_manual_capture_while_a_cruise_runs():
 
     for command in ("CAPTURE_START", "CAPTURE_STOP"):
         with pytest.raises(ValueError):
-            await _handle_command(socket, command, {}, cruise.robot, capture, RunningCruise())
+            await _handle_command(
+                socket,
+                command,
+                {},
+                cruise.robot,
+                capture,
+                RunningCruise(),
+                IdleFramingTest(),
+            )
 
     # The refusal must happen before the robot is touched.
     assert adapter.recording_calls == []
@@ -362,24 +424,139 @@ async def test_ws_refuses_manual_capture_while_a_cruise_runs():
 
 
 @pytest.mark.asyncio
-async def test_ws_closes_capture_session_when_stop_operation_fails():
+async def test_ws_never_starts_robot_when_capture_session_cannot_be_saved(monkeypatch):
     from automated_video_editing_backend.api.ws import _handle_command
 
-    cruise, _, capture = build_cruise()
+    _, _, capture = build_cruise()
+
+    def refuse_save():
+        raise OSError("capture index is read-only")
+
+    monkeypatch.setattr(capture, "_save", refuse_save)
+
+    class StartTrackingRobot:
+        def __init__(self):
+            self.start_calls = 0
+
+        async def start_recording(self):
+            self.start_calls += 1
+            return RobotState(connected=True, recording=True)
+
+    class IdleCruise:
+        is_running = False
+
+    robot = StartTrackingRobot()
+    with pytest.raises(OSError, match="read-only"):
+        await _handle_command(
+            FakeSocket(),
+            "CAPTURE_START",
+            {"title": "不能保存"},
+            robot,
+            capture,
+            IdleCruise(),
+            IdleFramingTest(),
+        )
+
+    assert robot.start_calls == 0
+    assert capture.active_session() is None
+
+
+@pytest.mark.asyncio
+async def test_ws_can_explicitly_discard_an_observed_idle_pending_capture():
+    from automated_video_editing_backend.api.ws import _handle_command
+
+    _, _, capture = build_cruise()
+    await capture.start("无法恢复")
+
+    class DiscardRobot:
+        async def discard_capture_recovery(self, commit):
+            return await commit()
+
+    class IdleCruise:
+        is_running = False
+
+    socket = FakeSocket()
+    await _handle_command(
+        socket,
+        "CAPTURE_DISCARD",
+        {},
+        DiscardRobot(),
+        capture,
+        IdleCruise(),
+        IdleFramingTest(),
+    )
+
+    assert capture.active_session() is None
+    assert socket.sent[-1]["type"] == "CAPTURE_DISCARDED"
+
+
+@pytest.mark.asyncio
+async def test_ws_reserves_camera_commands_for_the_running_framing_test():
+    from automated_video_editing_backend.api.ws import _handle_command
+
+    cruise, adapter, capture = build_cruise()
+    socket = FakeSocket()
+
+    class IdleCruise:
+        is_running = False
+
+    class RunningFramingTest:
+        def status(self):
+            return {"running": True}
+
+    for command in (
+        "ROBOT_GIMBAL",
+        "ROBOT_START_RECORDING",
+        "ROBOT_STOP_RECORDING",
+        "ROBOT_CAPTURE_PHOTO",
+        "CAPTURE_START",
+        "CAPTURE_STOP",
+        "CRUISE_START",
+    ):
+        with pytest.raises(ValueError, match="取景测试正在进行"):
+            await _handle_command(
+                socket,
+                command,
+                {},
+                cruise.robot,
+                capture,
+                IdleCruise(),
+                RunningFramingTest(),
+            )
+
+    assert adapter.recording_calls == []
+
+
+@pytest.mark.asyncio
+async def test_ws_keeps_capture_session_when_stop_operation_fails():
+    from automated_video_editing_backend.api.ws import _handle_command
+
+    _, _, capture = build_cruise()
     await capture.start("拍摄")
     socket = FakeSocket()
 
     class SaveFailureRobot:
-        async def stop_recording(self):
+        async def finalize_capture_recording(self, **_kwargs):
             raise ValueError("机器人拒绝停止录制")
+
+        async def status(self):
+            return RobotState(connected=True, recording=True)
 
     class IdleCruise:
         is_running = False
 
     with pytest.raises(ValueError, match="拒绝停止录制"):
-        await _handle_command(socket, "CAPTURE_STOP", {}, SaveFailureRobot(), capture, IdleCruise())
+        await _handle_command(
+            socket,
+            "CAPTURE_STOP",
+            {},
+            SaveFailureRobot(),
+            capture,
+            IdleCruise(),
+            IdleFramingTest(),
+        )
 
-    assert capture.active_session() is None
+    assert capture.active_session() is not None
 
 
 @pytest.mark.asyncio
@@ -391,7 +568,7 @@ async def test_ws_reports_recording_success_separately_from_windows_save_failure
     socket = FakeSocket()
 
     class RecordedButNotDownloadedRobot:
-        async def stop_recording(self):
+        async def finalize_capture_recording(self, **_kwargs):
             return RobotState(
                 connected=True,
                 recording=False,
@@ -409,9 +586,10 @@ async def test_ws_reports_recording_success_separately_from_windows_save_failure
         RecordedButNotDownloadedRobot(),
         capture,
         IdleCruise(),
+        IdleFramingTest(),
     )
 
-    assert capture.active_session() is None
+    assert capture.active_session() is not None
     assert socket.sent[-1]["type"] == "CAPTURE_STOPPED"
     assert socket.sent[-1]["data"]["media_url"] == "http://192.168.1.201:82/video.mp4"
     assert socket.sent[-1]["data"]["media_local_path"] is None
@@ -419,11 +597,57 @@ async def test_ws_reports_recording_success_separately_from_windows_save_failure
 
 
 @pytest.mark.asyncio
+async def test_ws_cancellation_after_confirmed_save_closes_the_capture_session(tmp_path):
+    from automated_video_editing_backend.api.ws import _handle_command
+
+    _, _, capture = build_cruise()
+    await capture.start("拍摄")
+    saved_video = tmp_path / "video.mp4"
+    saved_video.write_bytes(b"video")
+    stopped = asyncio.Event()
+    never_finish = asyncio.Event()
+
+    class CancelledAfterStopRobot:
+        def __init__(self):
+            self.state = RobotState(connected=True, recording=True)
+
+        async def finalize_capture_recording(self, **_kwargs):
+            self.state.recording = False
+            self.state.media_local_path = str(saved_video)
+            stopped.set()
+            await never_finish.wait()
+
+        async def status(self):
+            return self.state
+
+    class IdleCruise:
+        is_running = False
+
+    task = asyncio.create_task(
+        _handle_command(
+            FakeSocket(),
+            "CAPTURE_STOP",
+            {},
+            CancelledAfterStopRobot(),
+            capture,
+            IdleCruise(),
+            IdleFramingTest(),
+        )
+    )
+    await stopped.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert capture.active_session() is None
+
+
+@pytest.mark.asyncio
 async def test_a_recording_that_never_started_is_not_stopped():
     """Stopping was driven by what was asked for rather than by what is happening. A start
     that fails leaves nothing to stop, and sending the stop anyway is a command about a state
     the robot is not in."""
-    cruise, adapter, capture = build_cruise()
+    cruise, adapter, _ = build_cruise()
 
     async def refuse(*_args, **_kwargs):
         raise ConnectionError("recorder unavailable")
@@ -439,10 +663,29 @@ async def test_a_recording_that_never_started_is_not_stopped():
 
 
 @pytest.mark.asyncio
+async def test_failure_before_start_attempt_never_stops_an_unowned_recording():
+    cruise, adapter, capture = build_cruise()
+    adapter.state.recording = True
+
+    async def fail_map_switch(*_args, **_kwargs):
+        raise ConnectionError("map switch failed before capture setup")
+
+    adapter.switch_map = fail_map_switch
+
+    run = await cruise.start(cruise_request(map_name="map1"))
+    await cruise._task
+
+    assert run.status == "failed"
+    assert adapter.state.recording is True
+    assert adapter.recording_calls == []
+    assert capture.active_session() is None
+
+
+@pytest.mark.asyncio
 async def test_a_recording_left_running_is_stopped_even_if_the_run_broke_early():
     """The recording is the one thing here that has a stop, so leaving one running is ours to
     prevent — whatever else went wrong."""
-    cruise, adapter, capture = build_cruise()
+    cruise, adapter, _ = build_cruise()
 
     async def explode(*_args, **_kwargs):
         raise RuntimeError("navigation stack died")
@@ -457,10 +700,95 @@ async def test_a_recording_left_running_is_stopped_even_if_the_run_broke_early()
 
 
 @pytest.mark.asyncio
+async def test_stop_failure_marks_cruise_failed_and_keeps_session_for_manual_recovery():
+    cruise, adapter, capture = build_cruise()
+
+    async def refuse_stop(*_args, **_kwargs):
+        adapter.recording_calls.append("stop")
+        raise ConnectionError("stop command was not confirmed")
+
+    adapter.stop_recording = refuse_stop
+
+    run = await cruise.start(cruise_request())
+    await cruise._task
+
+    assert run.status == "failed"
+    assert "Stop recording failed" in run.error
+    assert adapter.state.recording is True
+    assert capture.active_session() is not None
+
+
+@pytest.mark.asyncio
+async def test_manual_retry_after_failed_cruise_stop_preserves_point_spans(tmp_path):
+    from automated_video_editing_backend.api.ws import _handle_command
+
+    cruise, adapter, capture = build_cruise()
+
+    async def refuse_stop(*_args, **_kwargs):
+        adapter.recording_calls.append("stop")
+        raise ConnectionError("stop command was not confirmed")
+
+    adapter.stop_recording = refuse_stop
+    run = await cruise.start(cruise_request())
+    await cruise._task
+    capture.remember_gimbal_samples(
+        capture.active_session(),
+        [(0.0, -3.0, 1.0), (0.3, -1.0, 1.0)],
+    )
+
+    recording = tmp_path / "recovered-cruise.mp4"
+    recording.write_bytes(b"video")
+
+    async def recover_stop(*_args, **_kwargs):
+        adapter.recording_calls.append("stop")
+        adapter.state.recording = False
+        adapter.state.media_local_path = str(recording)
+        return adapter.state
+
+    adapter.stop_recording = recover_stop
+    socket = FakeSocket()
+    await _handle_command(
+        socket,
+        "CAPTURE_STOP",
+        {},
+        cruise.robot,
+        capture,
+        cruise,
+        IdleFramingTest(),
+    )
+
+    payload = json.loads(sidecar_path(recording).read_text(encoding="utf-8"))
+    assert capture.active_session() is None
+    assert payload["capture_session_id"] == run.capture_session_id
+    assert len(payload["segments"]) == len(run.segments)
+    assert payload["segments"][0]["path_name"] == "path1"
+    assert json.loads(gimbal_sidecar_path(recording).read_text(encoding="utf-8"))["samples"] == [
+        [0.0, -3.0, 1.0],
+        [0.3, -1.0, 1.0],
+    ]
+
+
+@pytest.mark.asyncio
+async def test_explicit_recording_start_rejection_does_not_leave_a_retry_session():
+    cruise, adapter, capture = build_cruise()
+
+    async def reject(*_args, **_kwargs):
+        raise ValueError("机器人拒绝开始录制")
+
+    adapter.start_recording = reject
+    run = await cruise.start(cruise_request())
+    await cruise._task
+
+    assert run.status == "failed"
+    assert capture.active_session() is None
+
+
+@pytest.mark.asyncio
 async def test_losing_the_point_spans_is_reported_rather_than_passed_over():
     """Footage without spans is edited as ordinary video, which quietly removes most of the
     editing choices available to it. The recording still looks perfectly fine."""
     cruise, adapter, capture = build_cruise()
+    cruise.robot.media = None
 
     async def stop_without_syncing(*_args, **_kwargs):
         adapter.recording_calls.append("stop")
@@ -473,14 +801,15 @@ async def test_losing_the_point_spans_is_reported_rather_than_passed_over():
     run = await cruise.start(cruise_request())
     await cruise._task
 
-    assert run.status == "succeeded"
+    assert run.status == "failed"
+    assert capture.active_session() is not None
     assert any("点位信息未能写入" in note for note in run.warnings), run.warnings
 
 
 @pytest.mark.asyncio
 async def test_a_healthy_run_reports_no_warnings(tmp_path):
     """The counterpart: warnings must mean something, so a run that wrote its spans has none."""
-    cruise, adapter, capture = build_cruise()
+    cruise, adapter, _ = build_cruise()
     recording = tmp_path / "cruise.mp4"
     recording.write_bytes(b"fake")
 

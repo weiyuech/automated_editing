@@ -9,11 +9,17 @@ from starlette.websockets import WebSocketDisconnect
 
 from automated_video_editing_backend.core.diagnostics import log_event
 from automated_video_editing_backend.core.events import EventHub
-from automated_video_editing_backend.core.models import CameraAngle, CruiseRequest, GimbalMoveRequest, MoveCommand
+from automated_video_editing_backend.core.models import (
+    CameraAngle,
+    CruiseRequest,
+    GimbalMoveRequest,
+    MoveCommand,
+)
 from automated_video_editing_backend.core.security import require_ws_token
 from automated_video_editing_backend.services.capture import CaptureService
 from automated_video_editing_backend.services.cruise import CruiseService
-from automated_video_editing_backend.services.robot import RobotService
+from automated_video_editing_backend.services.framing_test import FramingTestService
+from automated_video_editing_backend.services.robot import RobotCommandNotSentError, RobotService
 
 ALLOWED_COMMANDS = {
     "PING",
@@ -26,6 +32,7 @@ ALLOWED_COMMANDS = {
     "ROBOT_CAPTURE_PHOTO",
     "CAPTURE_START",
     "CAPTURE_STOP",
+    "CAPTURE_DISCARD",
     "CAPTURE_NOTE",
     "CRUISE_START",
     "CRUISE_CANCEL",
@@ -38,6 +45,7 @@ async def websocket_endpoint(
     robot: RobotService,
     capture: CaptureService,
     cruise: CruiseService,
+    framing_test: FramingTestService,
 ) -> None:
     subprotocol = await require_ws_token(websocket)
     await websocket.accept(subprotocol=subprotocol)
@@ -55,7 +63,9 @@ async def websocket_endpoint(
                 await websocket.send_json({"type": "ERROR", "data": {"message": "Unknown command"}})
                 continue
             try:
-                await _handle_command(websocket, msg_type, data, robot, capture, cruise)
+                await _handle_command(
+                    websocket, msg_type, data, robot, capture, cruise, framing_test
+                )
             except Exception as exc:
                 log_event("error", "ui.command.failed", command=msg_type, error=str(exc))
                 await websocket.send_json(
@@ -79,7 +89,32 @@ async def _handle_command(
     robot: RobotService,
     capture: CaptureService,
     cruise: CruiseService,
+    framing_test: FramingTestService,
 ) -> None:
+    camera_commands = {
+        "ROBOT_CAMERA_ANGLE",
+        "ROBOT_GIMBAL",
+        "ROBOT_START_RECORDING",
+        "ROBOT_STOP_RECORDING",
+        "ROBOT_CAPTURE_PHOTO",
+        "CAPTURE_START",
+        "CAPTURE_STOP",
+        "CAPTURE_DISCARD",
+    }
+    if msg_type in camera_commands and framing_test.status().get("running"):
+        raise ValueError("取景测试正在进行，请等待测试完成")
+    if msg_type in camera_commands and cruise.is_running:
+        raise ValueError("巡游正在进行，镜头和录制由巡游控制")
+    if msg_type == "ROBOT_MOVE" and cruise.is_running:
+        raise ValueError("巡游正在进行，地图与导航由巡游控制")
+    if (
+        msg_type in {"ROBOT_START_RECORDING", "ROBOT_STOP_RECORDING"}
+        and capture.active_session() is not None
+    ):
+        raise ValueError("原地采集正在进行，请使用采集停止操作")
+    if msg_type == "CRUISE_START" and framing_test.status().get("running"):
+        raise ValueError("取景测试正在进行，请等待测试完成")
+
     if msg_type == "PING":
         await websocket.send_json({"type": "PONG", "data": {}})
     elif msg_type == "ROBOT_STOP":
@@ -100,27 +135,74 @@ async def _handle_command(
         state = await robot.stop_recording()
         await websocket.send_json({"type": "ROBOT_STATE", "data": state.model_dump(mode="json")})
     elif msg_type == "ROBOT_CAPTURE_PHOTO":
+        if capture.active_session() is not None and not (await robot.status()).recording:
+            raise ValueError("当前视频尚未保存，请先重试保存")
         await websocket.send_json({"type": "ROBOT_PHOTO", "data": await robot.capture_photo()})
     elif msg_type == "CAPTURE_START":
-        if cruise.is_running:
-            raise ValueError("A cruise is running; it already controls recording")
+        if capture.active_session() is not None:
+            raise ValueError("已有采集正在进行，请先停止当前采集")
         title = str(data.get("title") or "Untitled capture")
-        await robot.start_recording()
         session = await capture.start(title)
+        try:
+            state = await robot.start_recording()
+        except (RobotCommandNotSentError, ValueError):
+            with suppress(OSError):
+                await capture.stop()
+            raise
+        capture.remember_pending_media(session, state.media_url)
         await websocket.send_json({"type": "CAPTURE_STARTED", "data": session.model_dump(mode="json")})
     elif msg_type == "CAPTURE_STOP":
-        if cruise.is_running:
-            raise ValueError("A cruise is running; cancel it instead of stopping the recording")
+        session = capture.active_session()
+
+        def remember_final_url(media_url: str) -> None:
+            if session is not None:
+                capture.remember_pending_media(session, media_url)
+
         try:
-            state = await robot.stop_recording()
-        except Exception:
-            # The hardware may have stopped successfully before Windows failed to download the
-            # file. The session is still over and must not remain stuck as an active recording.
-            await capture.stop()
+            state = await robot.finalize_capture_recording(
+                on_media_url=remember_final_url,
+            )
+        except asyncio.CancelledError:
+            with suppress(Exception):
+                current = await robot.status()
+                pending_session = capture.active_session()
+                if pending_session is not None:
+                    capture.remember_pending_media(
+                        pending_session,
+                        current.media_url,
+                        current.media_sync_error,
+                        current.media_local_path,
+                    )
+                if not current.recording and current.media_local_path:
+                    await capture.complete_with_recording(current.media_local_path)
             raise
-        session = await capture.stop()
-        if session is not None and state.media_local_path:
-            capture.attach_to_recording(session, state.media_local_path)
+        except Exception:
+            # Preserve notes/markers when stop was never confirmed and the robot may still be
+            # recording. An idle recording without a local file also remains recoverable: a
+            # late heartbeat may still provide its URL for the operator's next retry.
+            with suppress(Exception):
+                current = await robot.status()
+                pending_session = capture.active_session()
+                if pending_session is not None:
+                    capture.remember_pending_media(
+                        pending_session,
+                        current.media_url,
+                        current.media_sync_error,
+                        current.media_local_path,
+                    )
+                if not current.recording and current.media_local_path:
+                    await capture.complete_with_recording(current.media_local_path)
+            raise
+        session = capture.active_session()
+        if session is not None:
+            capture.remember_pending_media(
+                session,
+                state.media_url,
+                state.media_sync_error,
+                state.media_local_path,
+            )
+        if state.media_local_path:
+            session = await capture.complete_with_recording(state.media_local_path)
         payload = session.model_dump(mode="json") if session else {}
         payload.update(
             {
@@ -130,6 +212,12 @@ async def _handle_command(
             }
         )
         await websocket.send_json({"type": "CAPTURE_STOPPED", "data": payload})
+    elif msg_type == "CAPTURE_DISCARD":
+        session = await robot.discard_capture_recovery(capture.discard)
+        await websocket.send_json({
+            "type": "CAPTURE_DISCARDED",
+            "data": session.model_dump(mode="json") if session else {},
+        })
     elif msg_type == "CAPTURE_NOTE":
         note = str(data.get("note") or "")[:500]
         session = await capture.add_note(note)

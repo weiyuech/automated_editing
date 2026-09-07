@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+from contextlib import suppress
 from pathlib import Path
 from typing import Annotated
 
@@ -42,7 +44,7 @@ from automated_video_editing_backend.services.llm import LLMService
 from automated_video_editing_backend.services.media import MediaService
 from automated_video_editing_backend.services.media_vault import MediaVaultService
 from automated_video_editing_backend.services.rename import MediaRenameService
-from automated_video_editing_backend.services.robot import RobotService
+from automated_video_editing_backend.services.robot import RobotCommandNotSentError, RobotService
 from automated_video_editing_backend.services.seedance import SeedanceService
 from automated_video_editing_backend.services.settings import SettingsService
 from automated_video_editing_backend.services.tts import TTSService
@@ -184,6 +186,40 @@ def build_router(
         if media.generated_metadata_problem:
             raise HTTPException(status_code=409, detail=media.generated_metadata_problem)
 
+    def require_camera_not_reserved() -> None:
+        if framing_test.status().get("running"):
+            raise HTTPException(status_code=409, detail="取景测试正在进行，请等待测试完成")
+
+    def require_manual_camera_control() -> None:
+        require_camera_not_reserved()
+        if cruise.is_running:
+            raise HTTPException(status_code=409, detail="巡游正在进行，镜头和录制由巡游控制")
+
+    def require_manual_navigation_control() -> None:
+        if cruise.is_running:
+            raise HTTPException(status_code=409, detail="巡游正在进行，地图与导航由巡游控制")
+
+    def require_raw_recording_not_owned_by_capture() -> None:
+        if capture.active_session() is not None:
+            raise HTTPException(status_code=409, detail="原地采集正在进行，请使用采集停止操作")
+
+    async def close_capture_if_robot_confirmed_idle() -> None:
+        try:
+            state = await robot.status()
+        except (ConnectionError, TimeoutError):
+            return
+        session = capture.active_session()
+        if session is not None:
+            capture.remember_pending_media(
+                session,
+                state.media_url,
+                state.media_sync_error,
+                state.media_local_path,
+            )
+        if state.recording or not state.media_local_path:
+            return
+        await capture.complete_with_recording(state.media_local_path)
+
     @router.get("/health")
     async def health(_: Secured = None) -> dict[str, str]:
         return {"ok": "true", "service": "automated-video-editing-backend"}
@@ -200,29 +236,35 @@ def build_router(
     async def robot_maps(_: Secured = None):
         try:
             return await robot.map_list()
-        except ConnectionError as exc:
+        except (ConnectionError, TimeoutError) as exc:
             raise HTTPException(status_code=503, detail=str(exc)) from exc
 
     @router.post("/robot/switch-map")
     async def robot_switch_map(request: SwitchMapRequest, _: Secured = None):
+        require_manual_navigation_control()
         try:
             return await robot.switch_map(request.map_name)
-        except ConnectionError as exc:
+        except (ConnectionError, TimeoutError) as exc:
             raise HTTPException(status_code=503, detail=str(exc)) from exc
 
     @router.get("/robot/paths")
     async def robot_paths(map_name: str, _: Secured = None):
         try:
             return await robot.path_list(map_name)
-        except ConnectionError as exc:
+        except (ConnectionError, TimeoutError) as exc:
             raise HTTPException(status_code=503, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     @router.post("/robot/goal")
     async def robot_goal(command: RobotGoalCommand, _: Secured = None):
+        require_manual_navigation_control()
         try:
             return await robot.set_goal(command)
-        except ConnectionError as exc:
+        except (ConnectionError, TimeoutError) as exc:
             raise HTTPException(status_code=503, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     @router.post("/robot/stop")
     async def robot_stop(_: Secured = None):
@@ -230,6 +272,7 @@ def build_router(
 
     @router.post("/robot/move")
     async def robot_move(command: MoveCommand, _: Secured = None):
+        require_manual_navigation_control()
         try:
             return await robot.move(command)
         except ValueError as exc:
@@ -237,38 +280,57 @@ def build_router(
 
     @router.post("/robot/camera-angle")
     async def robot_camera_angle(angle: CameraAngle, _: Secured = None):
+        require_manual_camera_control()
         try:
             return await robot.set_camera_angle(angle)
-        except ConnectionError as exc:
+        except (ConnectionError, TimeoutError) as exc:
             raise HTTPException(status_code=503, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     @router.post("/robot/gimbal")
     async def robot_gimbal(command: GimbalMoveRequest, _: Secured = None):
+        require_manual_camera_control()
         try:
             return await robot.set_gimbal(command)
-        except ConnectionError as exc:
+        except (ConnectionError, TimeoutError) as exc:
             raise HTTPException(status_code=503, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     @router.post("/robot/start-recording")
     async def robot_start_recording(_: Secured = None):
+        require_manual_camera_control()
+        require_raw_recording_not_owned_by_capture()
         try:
             return await robot.start_recording()
-        except ConnectionError as exc:
+        except (ConnectionError, TimeoutError) as exc:
             raise HTTPException(status_code=503, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     @router.post("/robot/stop-recording")
     async def robot_stop_recording(_: Secured = None):
+        require_manual_camera_control()
+        require_raw_recording_not_owned_by_capture()
         try:
             return await robot.stop_recording()
-        except ConnectionError as exc:
+        except (ConnectionError, TimeoutError) as exc:
             raise HTTPException(status_code=503, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     @router.post("/robot/capture-photo")
     async def robot_capture_photo(_: Secured = None):
+        require_manual_camera_control()
+        if capture.active_session() is not None and not (await robot.status()).recording:
+            raise HTTPException(status_code=409, detail="当前视频尚未保存，请先重试保存")
         try:
             return await robot.capture_photo()
-        except ConnectionError as exc:
+        except (ConnectionError, TimeoutError) as exc:
             raise HTTPException(status_code=503, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     @router.get("/framing-test/status")
     async def framing_test_status(_: Secured = None):
@@ -280,7 +342,7 @@ def build_router(
             raise HTTPException(status_code=409, detail="请先停止当前采集或巡游")
         try:
             return await framing_test.start()
-        except ConnectionError as exc:
+        except (ConnectionError, TimeoutError) as exc:
             raise HTTPException(status_code=503, detail=str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -346,30 +408,92 @@ def build_router(
 
     @router.post("/capture/start")
     async def capture_start(request: CaptureStartRequest, _: Secured = None):
+        require_camera_not_reserved()
         if cruise.is_running:
             raise HTTPException(status_code=409, detail="A cruise is running; it already controls recording")
+        if capture.active_session() is not None:
+            raise HTTPException(status_code=409, detail="已有采集正在进行，请先停止当前采集")
+        # Persist ownership before sending Start. A disk failure must never leave the robot
+        # recording with no session/recovery control in the UI.
+        session = await capture.start(request.title)
         try:
-            await robot.start_recording()
-        except ConnectionError as exc:
+            state = await robot.start_recording()
+        except RobotCommandNotSentError as exc:
+            with suppress(OSError):
+                await capture.stop()
             raise HTTPException(status_code=503, detail=str(exc)) from exc
-        return await capture.start(request.title)
+        except (ConnectionError, TimeoutError) as exc:
+            # Delivery is ambiguous: preserve the session so the operator can stop/recover if
+            # the robot applied Start before the connection was lost.
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        except ValueError as exc:
+            # An explicit protocol refusal is definitive, so no pending capture is needed.
+            with suppress(OSError):
+                await capture.stop()
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        capture.remember_pending_media(session, state.media_url)
+        return session
 
     @router.post("/capture/stop")
     async def capture_stop(_: Secured = None):
+        require_camera_not_reserved()
         if cruise.is_running:
             raise HTTPException(
                 status_code=409,
                 detail="A cruise is running; cancel it instead of stopping the recording",
             )
+        session = capture.active_session()
+
+        def remember_final_url(media_url: str) -> None:
+            if session is not None:
+                capture.remember_pending_media(session, media_url)
+
         try:
-            state = await robot.stop_recording()
+            state = await robot.finalize_capture_recording(
+                on_media_url=remember_final_url,
+            )
+        except asyncio.CancelledError:
+            await close_capture_if_robot_confirmed_idle()
+            raise
         except Exception as exc:
-            await capture.stop()
+            await close_capture_if_robot_confirmed_idle()
+            status_code = 409 if isinstance(exc, ValueError) else 503
+            raise HTTPException(status_code=status_code, detail=str(exc)) from exc
+        session = capture.active_session()
+        if session is not None:
+            capture.remember_pending_media(
+                session,
+                state.media_url,
+                state.media_sync_error,
+                state.media_local_path,
+            )
+        if state.media_local_path:
+            try:
+                session = await capture.complete_with_recording(state.media_local_path)
+            except OSError as exc:
+                raise HTTPException(status_code=507, detail=str(exc)) from exc
+        payload = session.model_dump(mode="json") if session else {}
+        payload.update(
+            {
+                "media_url": state.media_url,
+                "media_local_path": state.media_local_path,
+                "media_sync_error": state.media_sync_error,
+            }
+        )
+        return payload
+
+    @router.post("/capture/discard")
+    async def capture_discard(_: Secured = None):
+        require_camera_not_reserved()
+        if cruise.is_running:
+            raise HTTPException(status_code=409, detail="巡游仍在进行，不能放弃当前采集")
+        try:
+            session = await robot.discard_capture_recovery(capture.discard)
+        except (ConnectionError, TimeoutError) as exc:
             raise HTTPException(status_code=503, detail=str(exc)) from exc
-        session = await capture.stop()
-        if session is not None and state.media_local_path:
-            capture.attach_to_recording(session, state.media_local_path)
-        return session
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return session or {}
 
     @router.post("/capture/note")
     async def capture_note(request: CaptureNoteRequest, _: Secured = None):
@@ -381,11 +505,12 @@ def build_router(
 
     @router.post("/cruise/start")
     async def cruise_start(request: CruiseRequest, _: Secured = None):
+        require_camera_not_reserved()
         try:
             return await cruise.start(request)
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
-        except ConnectionError as exc:
+        except (ConnectionError, TimeoutError) as exc:
             raise HTTPException(status_code=503, detail=str(exc)) from exc
 
     @router.post("/cruise/cancel")
@@ -415,6 +540,7 @@ def build_router(
 
     @router.post("/cruise/routes/{route_id}/start")
     async def cruise_route_start(route_id: str, _: Secured = None):
+        require_camera_not_reserved()
         route = cruise_routes.get(route_id)
         if route is None:
             raise HTTPException(status_code=404, detail="Route not found")
@@ -643,10 +769,33 @@ def build_router(
 
     @router.put("/settings", dependencies=[Depends(require_settings_admin)])
     async def settings_update(request: SettingsUpdateRequest, _: Secured = None):
-        summary = settings.update(request)
-        if request.robot:
-            await robot.configure_websocket_url(summary.robot.websocket_url)
-        return summary
+        previous = settings.summary()
+        requested_url = (
+            request.robot.websocket_url
+            if request.robot and request.robot.websocket_url is not None
+            else previous.robot.websocket_url
+        )
+        robot_url_changed = requested_url.strip() != previous.robot.websocket_url.strip()
+        if robot_url_changed:
+            require_manual_camera_control()
+            # An active session can outlive the process that started it.  If its configured
+            # endpoint is stale, prohibiting endpoint repair leaves Stop/retry and safe discard
+            # permanently unreachable.  RobotService still refuses the change whenever the
+            # currently observed robot is recording, and this flag keeps capture ownership and
+            # its recoverable media URL intact while the connection is repaired.
+            preserve_capture_recovery = capture.active_session() is not None
+            state = await robot.status()
+            if state.recording:
+                raise HTTPException(status_code=409, detail="录制进行中，无法更改机器人连接")
+            try:
+                return await robot.configure_websocket_url_and_commit(
+                    requested_url,
+                    lambda: settings.update(request),
+                    preserve_capture_recovery=preserve_capture_recovery,
+                )
+            except ValueError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return settings.update(request)
 
     @router.post("/settings/test/llm", dependencies=[Depends(require_settings_admin)])
     async def settings_test_llm(_: Secured = None):

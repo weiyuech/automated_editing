@@ -16,6 +16,10 @@ from automated_video_editing_backend.core.paths import (
     generated_path,
 )
 from automated_video_editing_backend.core.store import read_json, write_json
+from automated_video_editing_backend.services.media_download import (
+    MediaDownloadNotReadyError,
+    validate_downloaded_video,
+)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -155,6 +159,14 @@ def _is_supported_download(url: str, content_type: str | None = None) -> bool:
     ext = Path(unquote(urlparse(url).path)).suffix.lower()
     mime = _content_type(content_type)
     return ext in MEDIA_EXTS or mime.startswith(("video/", "audio/", "image/"))
+
+
+def _content_type_matches_kind(content_type: str | None, expected_kind: str) -> bool:
+    """Treat absent/generic MIME as unknown, but never accept an explicit different kind."""
+    mime = _content_type(content_type)
+    if not mime or mime in {"application/octet-stream", "binary/octet-stream"}:
+        return True
+    return mime.startswith(f"{expected_kind}/")
 
 
 def _safe_download_name(url: str, content_type: str | None = None) -> str:
@@ -860,38 +872,61 @@ class MediaService:
         url: str,
         metadata: dict | None = None,
         filename_prefix: str = "",
+        request_timeout: float | httpx.Timeout = 60,
     ) -> MediaItem:
         parsed = urlparse(url)
         if parsed.scheme not in {"http", "https"}:
             raise ValueError("Only direct http(s) media URLs are supported")
 
         target: Path | None = None
+        partial: Path | None = None
+        downloaded_bytes = 0
         try:
             async with (
-                httpx.AsyncClient(follow_redirects=True, timeout=60) as client,
+                httpx.AsyncClient(
+                    follow_redirects=True,
+                    timeout=request_timeout,
+                ) as client,
                 client.stream("GET", url) as response,
             ):
                 response.raise_for_status()
                 content_type = response.headers.get("content-type")
                 if not _is_supported_download(str(response.url), content_type):
                     raise ValueError("Only direct video, audio, or image URLs are supported")
+                expected_kind = str((metadata or {}).get("kind_hint") or "")
+                if expected_kind and not _content_type_matches_kind(content_type, expected_kind):
+                    raise MediaDownloadNotReadyError(
+                        f"摄像头返回的文件类型暂时不是{expected_kind}"
+                    )
                 target = generated_path(
                     "data",
                     "downloads",
                     f"{filename_prefix}{_safe_download_name(str(response.url), content_type)}",
                 )
                 target.parent.mkdir(parents=True, exist_ok=True)
-                with target.open("wb") as handle:
+                partial = target.with_name(f".{target.name}.{uuid4().hex}.part")
+                with partial.open("wb") as handle:
                     async for chunk in response.aiter_bytes():
                         if chunk:
+                            downloaded_bytes += len(chunk)
                             handle.write(chunk)
 
-            if not target.is_file() or target.stat().st_size == 0:
-                raise ValueError("下载完成但服务器返回了空文件")
-        except Exception:
-            if target:
-                target.unlink(missing_ok=True)
-            raise
+            if not partial.is_file() or partial.stat().st_size == 0:
+                raise MediaDownloadNotReadyError("服务器返回的媒体文件暂时为空")
+            content_length = response.headers.get("content-length")
+            if (
+                content_length
+                and content_length.isdigit()
+                and not response.headers.get("content-encoding")
+                and downloaded_bytes != int(content_length)
+            ):
+                raise MediaDownloadNotReadyError("服务器返回的媒体文件尚未传输完整")
+            if expected_kind == "video":
+                validate_downloaded_video(partial)
+            partial.replace(target)
+        finally:
+            if partial:
+                partial.unlink(missing_ok=True)
 
         kind = self.infer_kind(target)
         item_metadata = {"source": "data/downloads", "source_url": url, "role": role_for_kind(kind)}

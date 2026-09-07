@@ -25,6 +25,7 @@ from automated_video_editing_backend.services.framing_test import FramingTestSer
 from automated_video_editing_backend.services.jobs import JobService
 from automated_video_editing_backend.services.llm import LLMService
 from automated_video_editing_backend.services.media import MediaService
+from automated_video_editing_backend.services.media_download import cleanup_abandoned_download_parts
 from automated_video_editing_backend.services.media_vault import MediaVaultService
 from automated_video_editing_backend.services.rename import MediaRenameService
 from automated_video_editing_backend.services.render import RenderService
@@ -39,6 +40,15 @@ def create_app() -> FastAPI:
     ensure_generated_dirs()
     configure_diagnostics(GENERATED_DIRS["logs"] / "diagnostics.log")
     log_event("info", "backend.started", version="0.1.5")
+    abandoned_parts = cleanup_abandoned_download_parts(
+        GENERATED_DIRS["data"] / "downloads"
+    )
+    if abandoned_parts:
+        log_event(
+            "info",
+            "media.download.partials.cleaned",
+            removed=abandoned_parts,
+        )
     events = EventHub()
     settings = SettingsService()
     media = MediaService()
@@ -49,6 +59,12 @@ def create_app() -> FastAPI:
     )
     framing_test = FramingTestService(robot)
     capture = CaptureService(events)
+    if pending_capture := capture.active_session():
+        robot.restore_recoverable_video_url(
+            pending_capture.pending_media_url,
+            pending_capture.pending_media_local_path,
+            pending_capture.pending_media_sync_error,
+        )
     cruise = CruiseService(events, robot, capture, settings.camerawork_config)
     cruise_routes = CruiseRouteStore()
     vault = MediaVaultService(media)
@@ -98,7 +114,7 @@ def create_app() -> FastAPI:
 
     @app.websocket("/ws")
     async def ws(websocket: WebSocket) -> None:
-        await websocket_endpoint(websocket, events, robot, capture, cruise)
+        await websocket_endpoint(websocket, events, robot, capture, cruise, framing_test)
 
     return app
 

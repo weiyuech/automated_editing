@@ -1,12 +1,10 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import random
 import time
 from collections.abc import Callable
 from contextlib import suppress
-from pathlib import Path
 from typing import Any
 
 from automated_video_editing_backend.core.events import EventHub
@@ -24,7 +22,7 @@ from automated_video_editing_backend.core.models import (
     utc_now,
 )
 from automated_video_editing_backend.services.capture import CaptureService
-from automated_video_editing_backend.services.robot import RobotService
+from automated_video_editing_backend.services.robot import RobotCommandNotSentError, RobotService
 
 # Preserve the original 50/30/20 choice, but replace the unsafe temporary-hold block with a
 # visible move back to the operator's anchor. The anchor choice is one action, not permission to
@@ -246,6 +244,10 @@ class CruiseService:
         run: CruiseRun,
         camerawork: CameraworkConfig | None,
     ) -> None:
+        recording_start_rejected = False
+        recording_start_attempted = False
+        # Never let motion samples from an earlier run leak into a later ordinary cruise.
+        self._telemetry = []
         try:
             if request.map_name:
                 await self.robot.switch_map(request.map_name)
@@ -261,13 +263,20 @@ class CruiseService:
             run.capture_session_id = session.id
 
             if request.record:
-                await self.robot.start_recording()
+                try:
+                    recording_start_attempted = True
+                    recording_state = await self.robot.start_recording()
+                except (RobotCommandNotSentError, ValueError):
+                    # An explicit protocol refusal is definitive. Connection/time-out errors
+                    # remain ambiguous because the robot may have applied Start before loss.
+                    recording_start_rejected = True
+                    raise
+                self.capture.remember_pending_media(session, recording_state.media_url)
             # Every timestamp on this run is seconds from here, so markers line up with the
             # start of the recorded file rather than with wall-clock time.
             self._origin_monotonic = time.monotonic()
 
-            if request.auto_camerawork and request.record:
-                self._telemetry = []
+            if (request.auto_camerawork or request.gimbal_scan.enabled) and request.record:
                 self._telemetry_task = asyncio.create_task(self._sample_telemetry())
 
             canceled = False
@@ -284,7 +293,13 @@ class CruiseService:
             run.status = "failed"
             run.error = str(exc)
         finally:
-            await self._finish(request, run, camerawork)
+            await self._finish(
+                request,
+                run,
+                camerawork,
+                recording_start_rejected,
+                recording_start_attempted,
+            )
 
     async def _run_segment(
         self,
@@ -798,18 +813,6 @@ class CruiseService:
                 pass
             await asyncio.sleep(0.3)
 
-    def _write_gimbal_sidecar(self, media_local_path: str | None) -> None:
-        """Persist the physical gimbal track used by downstream motion/static classification."""
-        if not media_local_path or not self._telemetry:
-            return
-        try:
-            Path(str(media_local_path) + ".gimbal.json").write_text(
-                json.dumps({"samples": [list(sample) for sample in self._telemetry]}, ensure_ascii=False),
-                encoding="utf-8",
-            )
-        except OSError:
-            pass
-
     async def _fail_segment(self, run: CruiseRun, segment: CruiseSegment, error: str) -> None:
         """Failure policy: keep recording, mark the moment, move to the next point.
 
@@ -833,10 +836,23 @@ class CruiseService:
         request: CruiseRequest,
         run: CruiseRun,
         camerawork: CameraworkConfig | None,
+        recording_start_rejected: bool = False,
+        recording_start_attempted: bool = True,
     ) -> None:
         for segment in run.segments:
             if segment.status in {"pending", "navigating"}:
                 segment.status = "skipped"
+
+        session = self.capture.active_session()
+        if session is not None and session.id == run.capture_session_id:
+            # Save the timing evidence before stop/download. A failed transfer deliberately
+            # leaves this capture active so a later manual retry can attach the same spans.
+            try:
+                self.capture.remember_segments(session, run.segments)
+            except OSError as exc:
+                run.status = "failed"
+                run.error = run.error or str(exc)
+                run.warnings.append("点位信息暂存失败；录制仍会立即停止")
 
         # A cancel/failure can happen during transit, before the normal parked return. Send the
         # home pose once more before recording closes; cancellation intentionally skips waiting.
@@ -849,33 +865,81 @@ class CruiseService:
             with suppress(asyncio.CancelledError):
                 await self._telemetry_task
             self._telemetry_task = None
-
-        # Stop what is actually recording, rather than what was asked for. The two differ in
-        # both directions: a start that failed leaves nothing to stop, and a run cancelled
-        # before its first point may never have reached the start at all. The robot's own
-        # state answers it — the heartbeat keeps `recording` current, and a successful start
-        # sets it directly — so there is nothing to track separately.
-        if await self._is_recording():
+        if session is not None and session.id == run.capture_session_id:
+            # The transfer may fail after recording has stopped. Persist the measured track
+            # before that boundary so a later manual retry writes the same gimbal sidecar.
             try:
-                state = await self.robot.stop_recording()
+                self.capture.remember_gimbal_samples(session, self._telemetry)
+            except OSError as exc:
+                run.status = "failed"
+                run.error = run.error or str(exc)
+                run.warnings.append("云台轨迹暂存失败；录制仍会立即停止")
+
+        # Stop what is actually recording, or recover a Stop that the robot applied before its
+        # reply reached us. The finalizer does not send Stop when the current state is already
+        # idle; it consumes the late video URL instead.
+        media_sync_error = ""
+        state = None
+        if request.record and recording_start_attempted and not recording_start_rejected:
+            def remember_final_url(media_url: str) -> None:
+                if session is not None and session.id == run.capture_session_id:
+                    self.capture.remember_pending_media(session, media_url)
+
+            try:
+                state = await self.robot.finalize_capture_recording(
+                    on_media_url=remember_final_url,
+                )
             except Exception as exc:
                 run.error = run.error or f"Stop recording failed: {exc}"
-                state = await self.robot.status()
+                run.status = "failed"
+                with suppress(Exception):
+                    state = await self.robot.status()
+        if state is not None:
             run.media_url = state.media_url
             run.media_local_path = state.media_local_path
-            self._write_gimbal_sidecar(run.media_local_path)
+            media_sync_error = str(state.media_sync_error or "")
+            if session is not None and session.id == run.capture_session_id:
+                try:
+                    self.capture.remember_pending_media(
+                        session,
+                        state.media_url,
+                        state.media_sync_error,
+                        state.media_local_path,
+                    )
+                except OSError as exc:
+                    run.status = "failed"
+                    run.error = run.error or str(exc)
+                    run.warnings.append("待保存视频地址暂存失败")
 
-        session = self.capture.active_session()
-        with suppress(Exception):
-            await self.capture.stop()
+        if request.record and not run.media_local_path:
+            run.error = run.error or media_sync_error or "录制文件尚未保存到本地"
+            run.status = "failed"
 
-        # The spans are the whole reason editing can tell a parked shot from a moving one.
-        # Losing them costs far more than it used to: footage without them is edited as
-        # ordinary video, which drops most of the editing choices available to it. So each way
-        # this can fail now says so, rather than leaving a recording that looks complete and
-        # quietly is not.
-        if request.record:
-            self._attach_spans(run, session)
+        # Stopped on the robot is not the same as safely finalized on the desktop. Attach the
+        # point/gimbal sidecars first; only then may the session disappear from recovery UI.
+        if request.record and run.media_local_path:
+            try:
+                completed = await self.capture.complete_with_recording(
+                    run.media_local_path,
+                    run.segments,
+                )
+                if completed is None:
+                    raise OSError("本次没有可恢复的采集会话")
+            except OSError as exc:
+                run.status = "failed"
+                run.error = run.error or str(exc)
+                run.warnings.append("拍摄信息写入失败，请到「拍摄」中重试保存")
+        elif not request.record or recording_start_rejected or not recording_start_attempted:
+            try:
+                await self.capture.stop()
+            except OSError as exc:
+                run.status = "failed"
+                run.error = run.error or str(exc)
+                run.warnings.append("采集会话状态未能保存，请重试后再开始下一次拍摄")
+        elif request.record:
+            # The spans are the whole reason editing can tell a parked shot from a moving one.
+            # No local file means they cannot be attached yet, so keep the session recoverable.
+            run.warnings.append("录制文件未同步到本地，点位信息未能写入")
 
         run.ended_at = utc_now()
         event = {
@@ -883,33 +947,6 @@ class CruiseService:
             "failed": "CRUISE_FAILED",
         }.get(run.status, "CRUISE_FINISHED")
         await self.events.publish(event, run.model_dump(mode="json"))
-
-    async def _is_recording(self) -> bool:
-        try:
-            return bool((await self.robot.status()).recording)
-        except Exception:
-            return False
-
-    def _attach_spans(self, run: CruiseRun, session) -> None:
-        """Write the run's notes and point spans beside the recording, and say if it did not.
-
-        Three ways this fails, each of which used to pass in silence: no session, no file
-        synced back from the robot, or the write itself refused. All three end with footage
-        that looks fine and carries none of what the robot knew about it.
-        """
-        if session is None:
-            run.warnings.append("本次没有采集会话，点位信息未能写入")
-            return
-        if not run.media_local_path:
-            run.warnings.append("录制文件未同步到本地，点位信息未能写入")
-            return
-        try:
-            written = self.capture.attach_to_recording(session, run.media_local_path, run.segments)
-        except Exception as exc:
-            run.warnings.append(f"点位信息写入失败：{exc}")
-            return
-        if written is None:
-            run.warnings.append("点位信息写入失败，剪辑时将按普通视频处理")
 
     async def _publish_segment(self, event: str, run: CruiseRun, segment: CruiseSegment) -> None:
         await self.events.publish(

@@ -59,12 +59,12 @@
 
         <Panel title="地图与路径文件">
           <div class="form-stack">
-            <select v-model="selectedRobotMap" class="field">
+            <select v-model="selectedRobotMap" class="field" :disabled="cruiseRunning">
               <option value="">选择地图</option>
               <option v-for="name in robotMaps" :key="name" :value="name">{{ name }}</option>
             </select>
             <div class="button-row">
-              <button class="primary" :disabled="!selectedRobotMap || isRobotBusy" @click="switchRobotMap">切换地图</button>
+              <button class="primary" :disabled="!selectedRobotMap || isRobotBusy || cruiseRunning" @click="switchRobotMap">切换地图</button>
               <button :disabled="!selectedRobotMap || isRobotBusy" @click="refreshRobotPaths">刷新路径文件</button>
             </div>
             <p class="form-hint">
@@ -80,7 +80,7 @@
               <label>偏航角：{{ cameraAngle }}</label>
               <input v-model.number="cameraAngle" type="range" min="-90" max="90" />
               <div class="button-row">
-                <button :disabled="isRobotBusy || framingTestBusy" @click="setCameraAngle">设置云台偏航</button>
+                <button :disabled="isRobotBusy || framingTestBusy || framingTest.running || cruiseRunning" @click="setCameraAngle">设置云台偏航</button>
               </div>
 
               <div class="settings-group">取景测试</div>
@@ -184,7 +184,7 @@
               <label><small>目标 (1~3.5)</small><input v-model.number="gimbalForm.zoom_end" class="field" type="number" min="1" max="3.5" step="0.1" /></label>
             </div>
             <div class="button-row">
-              <button class="primary" :disabled="isRobotBusy || framingTestBusy" @click="sendGimbal">发送镜头控制</button>
+              <button class="primary" :disabled="isRobotBusy || framingTestBusy || framingTest.running || cruiseRunning" @click="sendGimbal">发送镜头控制</button>
             </div>
 
             <div id="automatic-camerawork-settings" class="camera-settings-section">
@@ -242,9 +242,11 @@
               <span v-if="recordingElapsed" class="record-time">{{ recordingElapsed }}</span>
               <span class="record-source">{{ recordingSourceLabel }}</span>
               <div class="button-row">
-                <button :disabled="robot.recording || cruiseRunning" @click="captureStart">开始原地采集</button>
-                <button class="danger" :disabled="!robot.recording || cruiseRunning" @click="captureStop">停止采集</button>
-                <button :disabled="cruiseRunning" @click="capturePhoto">拍照</button>
+                <button :disabled="robot.recording || manualCaptureActive || cruiseRunning || framingTestBusy || framingTest.running" @click="captureStart">开始原地采集</button>
+                <button class="danger" :disabled="(!robot.recording && !manualCaptureActive) || cruiseRunning || framingTestBusy || framingTest.running" @click="captureStop">{{ !robot.recording && manualCaptureActive ? '重试保存' : '停止采集' }}</button>
+                <button v-if="manualCaptureActive && !robot.recording" :disabled="cruiseRunning || framingTestBusy || framingTest.running" @click="captureDiscard">放弃此次</button>
+                <button v-if="manualCaptureActive && !robot.recording && !robot.connected" :disabled="cruiseRunning || framingTestBusy || framingTest.running" @click="openRobotConnectionSettings">修正机器人地址</button>
+                <button :disabled="cruiseRunning || framingTestBusy || framingTest.running || (manualCaptureActive && !robot.recording)" @click="capturePhoto">拍照</button>
               </div>
             </div>
             <input v-model="captureTitle" class="field compact-field" placeholder="采集标题" />
@@ -252,6 +254,7 @@
             <p v-if="robot.media_local_path" class="inline-status success">已保存到本地：{{ shortPath(robot.media_local_path) }}</p>
             <p v-else-if="robot.media_url" class="inline-status muted">机器人媒体地址：{{ robot.media_url }}</p>
             <p v-if="robot.media_sync_error" class="inline-status danger">媒体同步失败：{{ humanError(robot.media_sync_error) }}</p>
+            <p v-if="manualCaptureActive && !robot.recording && !robot.connected" class="form-hint">若机器人地址有误，可先修正同一台机器人的连接地址；本次采集和待保存信息会保留。</p>
             <p v-if="captureStatus" class="inline-status" :class="captureStatusKind">{{ captureStatus }}</p>
           </div>
         </Panel>
@@ -357,7 +360,7 @@
               <div class="asset-actions">
                 <button @click="loadCruiseRoute(route)">载入</button>
                 <button :disabled="isCruiseBusy" @click="validateCruiseRoute(route)">校验</button>
-                <button :disabled="isCruiseBusy || cruiseRunning" @click="startCruiseRoute(route)">直接开始</button>
+                <button :disabled="isCruiseBusy || cruiseRunning || framingTestBusy || framingTest.running" @click="startCruiseRoute(route)">直接开始</button>
                 <button @click="deleteCruiseRoute(route)">删除</button>
               </div>
             </div>
@@ -1443,9 +1446,10 @@
             </div>
           </div>
         </Panel>
-        <Panel title="机器人硬件">
+        <Panel id="robot-hardware-settings" title="机器人硬件">
           <div class="form-stack settings-form">
             <div class="settings-scroll">
+            <p v-if="manualCaptureActive" class="form-hint">当前有一条待恢复的采集。这里只应修正同一台机器人的连接地址；保存设置不会结束采集，也不会删除机器人上的文件。</p>
             <label class="field-row"><span>机器人 WebSocket 地址</span>
               <input v-model="settingsForm.robot.websocket_url" class="field" placeholder="ws://10.73.2.199:8765" />
             </label>
@@ -2562,15 +2566,26 @@ function connectWs() {
       captureStatus.value = '录制已开始。'
     }
     if (msg.type === 'CAPTURE_STOPPED') {
-      activeSession.value = null
-      const localPath = msg.data?.media_local_path || robot.value.media_local_path
-      const syncError = msg.data?.media_sync_error || robot.value.media_sync_error
+      // A direct stop reply uses explicit null to say the file is not local yet. Only the
+      // CaptureService event omits these fields; falling back on explicit null can resurrect a
+      // stale path from an earlier recording and hide the retry button.
+      const hasLocalPath = Object.prototype.hasOwnProperty.call(msg.data || {}, 'media_local_path')
+      const hasSyncError = Object.prototype.hasOwnProperty.call(msg.data || {}, 'media_sync_error')
+      const localPath = hasLocalPath ? msg.data.media_local_path : robot.value.media_local_path
+      const syncError = hasSyncError ? msg.data.media_sync_error : robot.value.media_sync_error
+      const savePending = Boolean(msg.data?.active) && !localPath
+      activeSession.value = savePending ? msg.data : null
       captureStatusKind.value = syncError ? 'danger' : 'success'
       captureStatus.value = syncError
-        ? `机器人录制成功，但保存到 Windows 失败：${humanError(syncError)}`
+        ? `录制已停止，但保存失败：${humanError(syncError)}。请点击“重试保存”。`
         : localPath
           ? `视频已保存：${shortPath(localPath)}`
           : '机器人录制已停止。'
+    }
+    if (msg.type === 'CAPTURE_DISCARDED') {
+      activeSession.value = null
+      captureStatusKind.value = 'muted'
+      captureStatus.value = '已结束本次未保存的采集；不会删除机器人上的文件。'
     }
     if (msg.type === 'JOB_UPDATED' || msg.type === 'JOB_CREATED') {
       refreshJobs()
@@ -2597,8 +2612,10 @@ function connectWs() {
       const action = msg.data?.kind_hint === 'image' ? '拍照' : '录制'
       const error = humanError(msg.data?.error || '未知错误')
       captureStatusKind.value = 'danger'
-      captureStatus.value = `机器人${action}成功，但保存到 Windows 失败：${error}`
-      log(`机器人${action}成功，但保存到 Windows 失败：${error}`)
+      captureStatus.value = action === '录制' && activeSession.value
+        ? `录制已停止，但保存失败：${error}。请点击“重试保存”。`
+        : `${action}成功，但保存失败：${error}`
+      log(`${action}成功，但保存失败：${error}`)
     }
     // Deliberately does not clear cruiseIssues: this event is published before the start
     // response returns, and clearing here would race away the validation warnings it carries.
@@ -2618,7 +2635,7 @@ function connectWs() {
     }
     if (msg.type === 'ERROR') {
       const message = humanError(msg.data?.message || '未知后端错误')
-      if (['CAPTURE_START', 'CAPTURE_STOP', 'ROBOT_CAPTURE_PHOTO'].includes(msg.data?.command)) {
+      if (['CAPTURE_START', 'CAPTURE_STOP', 'CAPTURE_DISCARD', 'ROBOT_CAPTURE_PHOTO'].includes(msg.data?.command)) {
         captureStatusKind.value = 'danger'
         captureStatus.value = message
       }
@@ -2635,6 +2652,14 @@ function sendWs(type, data = {}) {
 }
 
 async function refreshRobot() { robot.value = await api('/robot/status') }
+async function refreshCaptureSession() {
+  const sessions = await api('/capture/sessions')
+  activeSession.value = sessions.find((session) => session.active) || null
+  if (activeSession.value?.pending_media_sync_error) {
+    captureStatusKind.value = 'danger'
+    captureStatus.value = `上次录制尚未保存：${humanError(activeSession.value.pending_media_sync_error)}。请点击“重试保存”。`
+  }
+}
 async function refreshJobs() { jobs.value = await api('/jobs') }
 async function refreshMedia() {
   const poolVersion = mediaPoolWriteVersion
@@ -2785,7 +2810,7 @@ async function refreshVault() {
 }
 async function refreshAll() {
   await Promise.all([
-    refreshRobot(), refreshMedia(), refreshJobs(), refreshVault(), refreshSettings(),
+    refreshRobot(), refreshCaptureSession(), refreshMedia(), refreshJobs(), refreshVault(), refreshSettings(),
     refreshTtsAssets(), refreshSeedanceAssets(), refreshCruiseRoutes(), refreshCruiseRun(),
     refreshSubtitleFonts(), refreshFramingTest()
   ])
@@ -2865,6 +2890,7 @@ const cameraworkWarning = computed(() => {
 const manualCaptureActive = computed(() => Boolean(activeSession.value) && !cruiseRunning.value)
 const canStartCruise = computed(() =>
   cruisePoints.value.length > 0 && !cruiseRunning.value && !isCruiseBusy.value
+  && !framingTestBusy.value && !framingTest.value.running
   && !cruiseDwellWarning.value && !manualCaptureActive.value
   && (!cruiseAutoCamerawork.value || cameraworkConfigured.value)
 )
@@ -3172,7 +3198,14 @@ async function cancelCruise() {
   setCruiseStatus('muted', '正在取消巡游并停止录制...')
   try {
     cruiseRun.value = await api('/cruise/cancel', { method: 'POST', body: '{}' })
-    setCruiseStatus('muted', '巡游已取消，录制已停止。')
+    await refreshRobot()
+    if (robot.value.recording) {
+      setCruiseStatus('danger', '巡游已结束，但录制停止未确认。请到「拍摄」中停止采集或重试保存。')
+    } else if (cruiseRun.value?.error) {
+      setCruiseStatus('danger', '巡游已结束，但视频尚未保存。请到「拍摄」中重试保存。')
+    } else {
+      setCruiseStatus('muted', '巡游已取消，录制已停止。')
+    }
   } catch (err) {
     setCruiseStatus('danger', `取消失败：${humanError(err.message)}`)
   } finally {
@@ -3227,6 +3260,11 @@ async function refreshRobotMaps(allowBusy = false) {
 }
 
 async function switchRobotMap() {
+  if (cruiseRunning.value) {
+    robotCommandStatusKind.value = 'danger'
+    robotCommandStatus.value = '巡游进行中，地图与导航由巡游控制。'
+    return
+  }
   if (!selectedRobotMap.value || isRobotBusy.value) return
   isRobotBusy.value = true
   robotCommandStatusKind.value = 'muted'
@@ -3344,8 +3382,20 @@ function captureStart() {
 }
 function captureStop() {
   captureStatusKind.value = 'muted'
-  captureStatus.value = '正在停止录制并保存到 Windows…'
+  captureStatus.value = robot.value.recording ? '正在停止录制并保存…' : '正在重试保存…'
   sendWs('CAPTURE_STOP')
+}
+function captureDiscard() {
+  const confirmed = window.confirm('未保存到电脑的视频可能无法恢复。此操作不会删除机器人上的文件，确定结束本次采集吗？')
+  if (!confirmed) return
+  captureStatusKind.value = 'muted'
+  captureStatus.value = '正在结束本次采集…'
+  sendWs('CAPTURE_DISCARD')
+}
+async function openRobotConnectionSettings() {
+  active.value = 'settings'
+  await nextTick()
+  document.getElementById('robot-hardware-settings')?.scrollIntoView({ behavior: 'smooth', block: 'center' })
 }
 function capturePhoto() {
   captureStatusKind.value = 'muted'
