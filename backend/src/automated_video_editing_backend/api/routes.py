@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 from contextlib import suppress
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Literal
 
 import httpx
 from fastapi import APIRouter, Depends, Header, HTTPException
@@ -41,7 +41,11 @@ from automated_video_editing_backend.services.cruise_routes import CruiseRouteSt
 from automated_video_editing_backend.services.framing_test import FramingTestService
 from automated_video_editing_backend.services.jobs import JobService
 from automated_video_editing_backend.services.llm import LLMService
-from automated_video_editing_backend.services.media import MediaService
+from automated_video_editing_backend.services.media import (
+    GeneratedMetadataPersistenceError,
+    MediaLibraryPersistenceError,
+    MediaService,
+)
 from automated_video_editing_backend.services.media_vault import MediaVaultService
 from automated_video_editing_backend.services.rename import MediaRenameService
 from automated_video_editing_backend.services.robot import RobotCommandNotSentError, RobotService
@@ -52,6 +56,7 @@ from automated_video_editing_backend.services.tts import TTSService
 
 class ImportMediaRequest(BaseModel):
     path: str
+    storage_mode: Literal["reference", "copy"] = "reference"
 
 
 class DownloadMediaRequest(BaseModel):
@@ -635,7 +640,19 @@ def build_router(
 
     @router.post("/media/import")
     async def media_import(request: ImportMediaRequest, _: Secured = None):
-        return media.import_path(request.path)
+        try:
+            return await media.import_path_async(request.path, request.storage_mode)
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail="选择的媒体文件不存在或不是文件") from exc
+        except (MediaLibraryPersistenceError, GeneratedMetadataPersistenceError) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except OSError as exc:
+            raise HTTPException(
+                status_code=500,
+                detail="媒体文件导入失败；请检查磁盘空间和文件权限",
+            ) from exc
 
     @router.post("/media/download")
     async def media_download(request: DownloadMediaRequest, _: Secured = None):

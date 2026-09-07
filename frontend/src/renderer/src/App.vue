@@ -430,11 +430,12 @@
       <section v-else-if="active === 'media'" class="grid vault-grid">
         <Panel title="媒体导入" class="wide">
           <div class="media-actions">
-            <button class="primary" :disabled="!bridgeReady" @click="importMedia">导入本地媒体</button>
+            <button class="primary" :disabled="!bridgeReady || isImporting" @click="importMedia">{{ isImporting ? '正在导入…' : '导入本地媒体' }}</button>
             <input v-model="downloadUrl" class="field url-field" :disabled="!bridgeReady || isDownloading" placeholder="视频或音乐直链" />
             <button :disabled="!bridgeReady || !downloadUrl.trim() || isDownloading" @click="downloadMedia">{{ isDownloading ? '导入中...' : '导入链接' }}</button>
             <button @click="refreshAll">重新扫描</button>
           </div>
+          <p v-if="importStatus" class="inline-status" :class="importStatusKind">{{ importStatus }}</p>
           <p v-if="downloadStatus" class="inline-status" :class="downloadStatusKind">{{ downloadStatus }}</p>
           <div v-if="storageReport" class="storage-strip" :class="{ warning: storageReport.over_threshold }">
             <div>
@@ -519,7 +520,7 @@
                       </div>
                     </template>
                     <div v-else-if="row.type === 'asset'" class="asset-row compact">
-                      <span class="role-pill" :class="row.asset.role">{{ roleLabel(row.asset.role) }}</span>
+                      <span class="role-pill" :class="row.asset.role">{{ roleKindLabel(row.asset.role, row.asset.kind) }}</span>
                       <span class="asset-name">{{ row.asset.name }}</span>
                       <span>{{ formatBytes(row.asset.size_bytes) }}</span>
                       <span v-if="renameTarget === row.asset.path" class="asset-actions">
@@ -589,7 +590,7 @@
                 </div>
               </template>
               <div v-else-if="row.type === 'asset'" class="table-row">
-                <span><span class="role-pill" :class="row.asset.role">{{ roleLabel(row.asset.role) }}</span></span>
+                <span><span class="role-pill" :class="row.asset.role">{{ roleKindLabel(row.asset.role, row.asset.kind) }}</span></span>
                 <span>{{ row.asset.name }}</span>
                 <span>{{ formatBytes(row.asset.size_bytes) }}</span>
                 <span>{{ formatDate(row.asset.modified_at) }}</span>
@@ -631,7 +632,7 @@
               <div v-else class="scroll-list-sm">
               <div v-for="asset in cleanupCandidates" :key="asset.id" class="cleanup-row">
                 <span>{{ asset.name }}</span>
-                <span>{{ roleLabel(asset.role) }} · {{ formatBytes(asset.size_bytes) }}</span>
+                <span>{{ roleKindLabel(asset.role, asset.kind) }} · {{ formatBytes(asset.size_bytes) }}</span>
                 <button class="danger" @click="trashAsset(asset)">删除</button>
               </div>
               </div>
@@ -656,7 +657,7 @@
                   <button @click="openMediaLibrary('source')">从媒体库添加</button>
                   <button @click="selectAllSources">全选</button>
                   <button :disabled="!selectedSourceIds.length" @click="selectedSourceIds = []">取消全选</button>
-                  <button :disabled="mediaPoolSaving || !sourcePoolItems.length" @click="clearMediaPool('source')">清空媒体池</button>
+                  <button :disabled="mediaPoolSaving || !mediaPool.source_media_ids.length" @click="clearMediaPool('source')">清空媒体池</button>
                 </div>
               </div>
               <div class="source-pool-body">
@@ -664,7 +665,7 @@
                   <input v-model="sourceFilter" class="field compact-field" placeholder="筛选文件名" />
                   <small>{{ filteredSourceVideos.length }} / {{ sourcePoolItems.length }}</small>
                 </div>
-                <div v-if="sourcePoolItems.length === 0" class="empty">媒体池为空，可从媒体库添加源视频。</div>
+                <div v-if="sourcePoolItems.length === 0" class="empty">{{ sourcePoolEmptyText }}</div>
                 <div v-else-if="filteredSourceVideos.length === 0" class="empty">没有匹配「{{ sourceFilter }}」的视频。</div>
                 <div v-else class="scroll-list">
                   <div v-for="item in filteredSourceVideos" :key="item.id" class="source-row">
@@ -689,16 +690,16 @@
               <div class="pool-title pool-title-rich">
                 <div class="pool-heading">
                   <strong>音乐池</strong>
-                  <small>已入池 {{ musicPoolItems.length }} · 已选用 {{ selectedAutomationMusicIds.length }}</small>
+                  <small>已入池 {{ mediaPool.music_media_ids.length }} · 已选用 {{ selectedAutomationMusicIds.length }}</small>
                 </div>
                 <div class="pool-title-actions">
                   <button @click="openMediaLibrary('music')">从媒体库添加</button>
                   <button @click="selectAllMusicPool">全选</button>
                   <button :disabled="!selectedAutomationMusicIds.length" @click="selectedAutomationMusicIds = []">取消全选</button>
-                  <button :disabled="mediaPoolSaving || !musicPoolItems.length" @click="clearMediaPool('music')">清空媒体池</button>
+                  <button :disabled="mediaPoolSaving || !mediaPool.music_media_ids.length" @click="clearMediaPool('music')">清空媒体池</button>
                 </div>
               </div>
-              <div v-if="musicPoolItems.length === 0" class="empty compact-empty">媒体池为空，可从媒体库添加音乐。</div>
+              <div v-if="musicPoolItems.length === 0" class="empty compact-empty">{{ musicPoolEmptyText }}</div>
               <div v-else class="pool-list">
                 <div v-for="item in musicPoolItems" :key="item.id" class="pool-row pool-asset-row">
                   <label :title="selectionLimitTitle('music', item.id)">
@@ -715,16 +716,16 @@
               <div class="pool-title pool-title-rich">
                 <div class="pool-heading">
                   <strong>旁白池</strong>
-                  <small>已入池 {{ voiceoverPoolItems.length }} · 已选用 {{ selectedAutomationVoiceoverIds.length }}</small>
+                  <small>已入池 {{ mediaPool.voiceover_media_ids.length }} · 已选用 {{ selectedAutomationVoiceoverIds.length }}</small>
                 </div>
                 <div class="pool-title-actions">
                   <button @click="openMediaLibrary('voiceover')">从媒体库添加</button>
                   <button @click="selectAllVoiceoverPool">全选</button>
                   <button :disabled="!selectedAutomationVoiceoverIds.length" @click="selectedAutomationVoiceoverIds = []">取消全选</button>
-                  <button :disabled="mediaPoolSaving || !voiceoverPoolItems.length" @click="clearMediaPool('voiceover')">清空媒体池</button>
+                  <button :disabled="mediaPoolSaving || !mediaPool.voiceover_media_ids.length" @click="clearMediaPool('voiceover')">清空媒体池</button>
                 </div>
               </div>
-              <div v-if="voiceoverPoolItems.length === 0" class="empty compact-empty">媒体池为空，可从媒体库添加旁白。</div>
+              <div v-if="voiceoverPoolItems.length === 0" class="empty compact-empty">{{ voiceoverPoolEmptyText }}</div>
               <div v-else class="pool-list">
                 <div v-for="item in voiceoverPoolItems" :key="item.id" class="pool-row pool-asset-row">
                   <label :title="selectionLimitTitle('voiceover', item.id)">
@@ -739,17 +740,17 @@
             </div>
             <div class="effect-pool">
               <div class="pool-title pool-title-rich effect-pool-head">
-                <div class="pool-heading"><strong>特效池</strong><small>已入池 {{ effectPoolItems.length }} · 已选用 {{ selectedEffectCount }}</small></div>
+                <div class="pool-heading"><strong>特效池</strong><small>已入池 {{ mediaPool.effect_media_ids.length }} · 已选用 {{ selectedEffectCount }}</small></div>
                 <div class="pool-title-actions">
                   <button @click="openMediaLibrary('effect')">从媒体库添加</button>
-                  <button :disabled="mediaPoolSaving || !effectPoolItems.length" @click="clearMediaPool('effect')">清空媒体池</button>
+                  <button :disabled="mediaPoolSaving || !mediaPool.effect_media_ids.length" @click="clearMediaPool('effect')">清空媒体池</button>
                 </div>
               </div>
-              <div class="effect-zones">
+              <div v-if="effectPoolItems.length === 0" class="empty compact-empty">{{ effectPoolEmptyText }}</div>
+              <div v-else class="effect-zones">
                 <div class="effect-zone intro">
                   <div class="effect-zone-head"><span>片头特效</span><button @click="selectAllIntroEffects">全选</button><button @click="selectedIntroEffectIds = []">取消全选</button></div>
-                  <div v-if="effectPoolItems.length === 0" class="empty compact-empty">暂无入池特效。</div>
-                  <div v-else class="pool-list">
+                  <div class="pool-list">
                     <div v-for="item in effectPoolItems" :key="'in-' + item.id" class="pool-row effect-asset-row">
                       <label :title="selectionLimitTitle('introEffect', item.id)"><input type="checkbox"
                         :checked="selectedIntroEffectIds.includes(item.id)" :disabled="selectionAtLimit('introEffect', item.id)"
@@ -760,8 +761,7 @@
                 </div>
                 <div class="effect-zone outro">
                   <div class="effect-zone-head"><span>片尾特效</span><button @click="selectAllOutroEffects">全选</button><button @click="selectedOutroEffectIds = []">取消全选</button></div>
-                  <div v-if="effectPoolItems.length === 0" class="empty compact-empty">暂无入池特效。</div>
-                  <div v-else class="pool-list">
+                  <div class="pool-list">
                     <div v-for="item in effectPoolItems" :key="'out-' + item.id" class="pool-row effect-asset-row">
                       <label :title="selectionLimitTitle('outroEffect', item.id)"><input type="checkbox"
                         :checked="selectedOutroEffectIds.includes(item.id)" :disabled="selectionAtLimit('outroEffect', item.id)"
@@ -1530,11 +1530,12 @@
         <div v-if="filteredMediaLibraryItems.length === 0" class="empty library-empty">该分类暂无可用素材。</div>
         <div v-else class="library-picker-list">
           <div v-for="item in filteredMediaLibraryItems" :key="item.id" class="library-picker-row"
-            :class="{ pooled: isItemInPool(mediaLibraryTab, item.id) }">
-            <label>
+            :class="{ pooled: isItemInPool(mediaLibraryTab, item.id), unavailable: !isMediaPoolEligible(mediaLibraryTab, item) }">
+            <label :title="mediaPoolAvailabilityTitle(mediaLibraryTab, item)">
               <input type="checkbox" :checked="isItemInPool(mediaLibraryTab, item.id) || pendingPoolIds.includes(item.id)"
-                :disabled="isItemInPool(mediaLibraryTab, item.id)" @change="togglePendingPoolItem(item.id, $event.target.checked)" />
-              <span><strong>{{ shortPath(item.path) }}</strong><small>{{ isItemInPool(mediaLibraryTab, item.id) ? '已在媒体池' : roleLabel(itemRole(item)) }}</small></span>
+                :disabled="isItemInPool(mediaLibraryTab, item.id) || !isMediaPoolEligible(mediaLibraryTab, item)"
+                @change="togglePendingPoolItem(item, $event.target.checked)" />
+              <span><strong>{{ shortPath(item.path) }}</strong><small>{{ isItemInPool(mediaLibraryTab, item.id) ? '已在媒体池' : mediaPoolAvailabilityLabel(mediaLibraryTab, item) }}</small></span>
             </label>
             <button type="button" @click="previewPoolItem(item)">{{ item.kind === 'audio' ? '试听' : '预览' }}</button>
           </div>
@@ -1550,8 +1551,9 @@
     </div>
     <div v-if="previewItem" class="modal-backdrop preview-backdrop" @click.self="closePoolPreview">
       <div class="modal-card pool-preview-modal">
-        <div class="library-picker-head"><div><strong>{{ shortPath(previewItem.path) }}</strong><small>{{ roleLabel(itemRole(previewItem)) }}</small></div><button @click="closePoolPreview">关闭</button></div>
+        <div class="library-picker-head"><div><strong>{{ shortPath(previewItem.path) }}</strong><small>{{ roleKindLabel(itemRole(previewItem), previewItem.kind) }}</small></div><button @click="closePoolPreview">关闭</button></div>
         <audio v-if="previewItem.kind === 'audio'" :src="mediaFileUrl(previewItem.path)" controls autoplay></audio>
+        <img v-else-if="previewItem.kind === 'image'" :src="mediaFileUrl(previewItem.path)" :alt="shortPath(previewItem.path)" />
         <video v-else :src="mediaFileUrl(previewItem.path)" controls autoplay playsinline></video>
       </div>
     </div>
@@ -1580,6 +1582,18 @@ import {
   hasBurnedSubtitleSource,
   renderableAudioBed
 } from './tune-policy.js'
+import {
+  captureLifecycleDecision,
+  resolveCaptureStoppedMedia
+} from './capture-policy.js'
+import {
+  eligibleMediaIds,
+  formatMediaImportOutcome,
+  isMediaPoolEligible,
+  itemRole,
+  mediaPoolEmptyMessage,
+  mediaPoolInventory
+} from '../../shared/media-policy.js'
 
 const nav = [
   { key: 'dashboard', label: '总览', icon: '01', description: '查看系统状态和最近活动。' },
@@ -1647,6 +1661,8 @@ const cruiseIssues = ref([])
 const cruiseStatus = ref('')
 const cruiseStatusKind = ref('muted')
 const isCruiseBusy = ref(false)
+const nonRecordingCruiseLaunchPending = ref(false)
+const nonRecordingCruiseCaptureSessionId = ref('')
 const MAX_CRUISE_POINTS = 200
 const media = ref([])
 const jobs = ref([])
@@ -1737,6 +1753,9 @@ let tuneStillTimer = null
 
 const isRenderingTimeline = ref(false)
 const downloadUrl = ref('')
+const isImporting = ref(false)
+const importStatus = ref('')
+const importStatusKind = ref('muted')
 const isDownloading = ref(false)
 const downloadStatus = ref('')
 const downloadStatusKind = ref('muted')
@@ -2281,20 +2300,30 @@ const filteredSourceVideos = computed(() => {
 const sourceVideoItems = computed(() => media.value.filter((item) => item.kind === 'video' && itemRole(item) === 'raw_video'))
 const audioItems = computed(() => media.value.filter((item) => item.kind === 'audio' && itemRole(item) === 'music'))
 const voiceoverItems = computed(() => media.value.filter((item) => item.kind === 'audio' && itemRole(item) === 'tts_voice'))
-const imageItems = computed(() => media.value.filter((item) => item.kind === 'image' && itemRole(item) === 'image'))
+const importedImageItems = computed(() => media.value.filter((item) => item.kind === 'image' && itemRole(item) === 'image'))
+const imageItems = computed(() => media.value.filter((item) => item.kind === 'image' && ['image', 'seedance_effect'].includes(itemRole(item))))
 const effectItems = computed(() => media.value.filter((item) => item.kind === 'video' && itemRole(item) === 'seedance_effect'))
+const effectLibraryItems = computed(() => media.value.filter((item) => itemRole(item) === 'seedance_effect'))
 const sourcePoolItems = computed(() => poolItems(sourceVideoItems.value, 'source'))
 const musicPoolItems = computed(() => poolItems(audioItems.value, 'music'))
 const voiceoverPoolItems = computed(() => poolItems(voiceoverItems.value, 'voiceover'))
 const effectPoolItems = computed(() => poolItems(effectItems.value, 'effect'))
+const sourcePoolInventory = computed(() => mediaPoolInventory(mediaPool.value.source_media_ids, sourcePoolItems.value))
+const musicPoolInventory = computed(() => mediaPoolInventory(mediaPool.value.music_media_ids, musicPoolItems.value))
+const voiceoverPoolInventory = computed(() => mediaPoolInventory(mediaPool.value.voiceover_media_ids, voiceoverPoolItems.value))
+const effectPoolInventory = computed(() => mediaPoolInventory(mediaPool.value.effect_media_ids, effectPoolItems.value))
+const sourcePoolEmptyText = computed(() => mediaPoolEmptyMessage(sourcePoolInventory.value, '媒体池为空，可从媒体库添加源视频。'))
+const musicPoolEmptyText = computed(() => mediaPoolEmptyMessage(musicPoolInventory.value, '媒体池为空，可从媒体库添加音乐。'))
+const voiceoverPoolEmptyText = computed(() => mediaPoolEmptyMessage(voiceoverPoolInventory.value, '媒体池为空，可从媒体库添加旁白。'))
+const effectPoolEmptyText = computed(() => mediaPoolEmptyMessage(effectPoolInventory.value, '媒体池为空，可从媒体库添加特效。'))
 const selectedEffectCount = computed(() => new Set([
   ...selectedIntroEffectIds.value, ...selectedOutroEffectIds.value
 ]).size)
 const mediaLibraryItems = computed(() => ({
-  source: sourceVideoItems.value,
+  source: [...sourceVideoItems.value, ...importedImageItems.value],
   music: audioItems.value,
   voiceover: voiceoverItems.value,
-  effect: effectItems.value
+  effect: effectLibraryItems.value
 })[mediaLibraryTab.value] || [])
 const filteredMediaLibraryItems = computed(() => {
   const needle = mediaLibraryFilter.value.trim().toLowerCase()
@@ -2364,7 +2393,7 @@ const filteredVaultAssets = computed(() => {
   const needle = vaultFilter.value.trim().toLowerCase()
   if (!needle) return userVaultAssets.value
   return userVaultAssets.value.filter((asset) =>
-    asset.name.toLowerCase().includes(needle) || roleLabel(asset.role).toLowerCase().includes(needle)
+    asset.name.toLowerCase().includes(needle) || roleKindLabel(asset.role, asset.kind).toLowerCase().includes(needle)
   )
 })
 const userVaultAssets = computed(() => vaultAssets.value.filter((asset) => asset.role !== 'cache'))
@@ -2550,6 +2579,39 @@ async function api(path, options = {}) {
   return res.json()
 }
 
+function ignoreCaptureLifecycleEvent(msg) {
+  const decision = captureLifecycleDecision({
+    type: msg.type,
+    data: msg.data,
+    cruiseRun: cruiseRun.value,
+    nonRecordingCruisePending: nonRecordingCruiseLaunchPending.value,
+    nonRecordingCaptureSessionId: nonRecordingCruiseCaptureSessionId.value
+  })
+  nonRecordingCruiseCaptureSessionId.value = decision.nonRecordingCaptureSessionId
+  if (msg.type === 'CAPTURE_STARTED' && decision.ignore && decision.nonRecordingCaptureSessionId) {
+    nonRecordingCruiseLaunchPending.value = false
+  }
+  return decision.ignore
+}
+
+function applyCruiseRunState(run) {
+  cruiseRun.value = run
+  if (run?.recording !== false) {
+    if (run?.status === 'running') {
+      nonRecordingCruiseLaunchPending.value = false
+      nonRecordingCruiseCaptureSessionId.value = ''
+    }
+    return
+  }
+  if (run.status === 'running') {
+    if (!nonRecordingCruiseCaptureSessionId.value) nonRecordingCruiseLaunchPending.value = true
+    return
+  }
+  nonRecordingCruiseLaunchPending.value = false
+  // Keep a known no-record session id until its CAPTURE_STOPPED arrives. The cruise terminal
+  // event can be observed first, and clearing here would let that late stop look manual.
+}
+
 function connectWs() {
   const cfg = apiConfig.value
   if (!cfg) return
@@ -2559,28 +2621,30 @@ function connectWs() {
   socket.onerror = () => { connected.value = false }
   socket.onmessage = (event) => {
     const msg = JSON.parse(event.data)
+    let ignoredCaptureLifecycle = false
     if (msg.type === 'ROBOT_STATE') robot.value = msg.data
     if (msg.type === 'CAPTURE_STARTED') {
-      activeSession.value = msg.data
-      captureStatusKind.value = 'success'
-      captureStatus.value = '录制已开始。'
+      ignoredCaptureLifecycle = ignoreCaptureLifecycleEvent(msg)
+      if (!ignoredCaptureLifecycle) {
+        activeSession.value = msg.data
+        captureStatusKind.value = 'success'
+        captureStatus.value = '录制已开始。'
+      }
     }
     if (msg.type === 'CAPTURE_STOPPED') {
-      // A direct stop reply uses explicit null to say the file is not local yet. Only the
-      // CaptureService event omits these fields; falling back on explicit null can resurrect a
-      // stale path from an earlier recording and hide the retry button.
-      const hasLocalPath = Object.prototype.hasOwnProperty.call(msg.data || {}, 'media_local_path')
-      const hasSyncError = Object.prototype.hasOwnProperty.call(msg.data || {}, 'media_sync_error')
-      const localPath = hasLocalPath ? msg.data.media_local_path : robot.value.media_local_path
-      const syncError = hasSyncError ? msg.data.media_sync_error : robot.value.media_sync_error
-      const savePending = Boolean(msg.data?.active) && !localPath
-      activeSession.value = savePending ? msg.data : null
-      captureStatusKind.value = syncError ? 'danger' : 'success'
-      captureStatus.value = syncError
-        ? `录制已停止，但保存失败：${humanError(syncError)}。请点击“重试保存”。`
-        : localPath
-          ? `视频已保存：${shortPath(localPath)}`
-          : '机器人录制已停止。'
+      ignoredCaptureLifecycle = ignoreCaptureLifecycleEvent(msg)
+      if (!ignoredCaptureLifecycle) {
+        // A direct stop reply uses explicit null to say the file is not local yet. Only the
+        // CaptureService event omits these fields and may use the current robot result.
+        const { localPath, syncError, savePending } = resolveCaptureStoppedMedia(msg.data, robot.value)
+        activeSession.value = savePending ? msg.data : null
+        captureStatusKind.value = syncError ? 'danger' : 'success'
+        captureStatus.value = syncError
+          ? `录制已停止，但保存失败：${humanError(syncError)}。请点击“重试保存”。`
+          : localPath
+            ? `视频已保存：${shortPath(localPath)}`
+            : '机器人录制已停止。'
+      }
     }
     if (msg.type === 'CAPTURE_DISCARDED') {
       activeSession.value = null
@@ -2619,7 +2683,7 @@ function connectWs() {
     }
     // Deliberately does not clear cruiseIssues: this event is published before the start
     // response returns, and clearing here would race away the validation warnings it carries.
-    if (msg.type === 'CRUISE_STARTED') cruiseRun.value = msg.data
+    if (msg.type === 'CRUISE_STARTED') applyCruiseRunState(msg.data)
     if (['CRUISE_POINT_DISPATCHED', 'CRUISE_POINT_ARRIVED', 'CRUISE_POINT_DEPARTED', 'CRUISE_POINT_FAILED'].includes(msg.type)) {
       applyCruiseSegment(msg.data)
       if (msg.type === 'CRUISE_POINT_FAILED') {
@@ -2627,7 +2691,7 @@ function connectWs() {
       }
     }
     if (['CRUISE_FINISHED', 'CRUISE_CANCELED', 'CRUISE_FAILED'].includes(msg.type)) {
-      cruiseRun.value = msg.data
+      applyCruiseRunState(msg.data)
       if (msg.type === 'CRUISE_FINISHED') setCruiseStatus('success', `巡游结束：到达 ${cruiseArrivedCount.value} 个点位，失败 ${cruiseFailedCount.value} 个。`)
       if (msg.type === 'CRUISE_CANCELED') setCruiseStatus('muted', '巡游已取消。')
       if (msg.type === 'CRUISE_FAILED') setCruiseStatus('danger', `巡游失败：${humanError(msg.data?.error || '未知错误')}`)
@@ -2642,7 +2706,7 @@ function connectWs() {
       log(`错误：${message}`)
       return
     }
-    if (!['PONG'].includes(msg.type)) log(eventLabel(msg.type))
+    if (!ignoredCaptureLifecycle && !['PONG'].includes(msg.type)) log(eventLabel(msg.type))
   }
   ws.value = socket
 }
@@ -2654,7 +2718,23 @@ function sendWs(type, data = {}) {
 async function refreshRobot() { robot.value = await api('/robot/status') }
 async function refreshCaptureSession() {
   const sessions = await api('/capture/sessions')
-  activeSession.value = sessions.find((session) => session.active) || null
+  const session = sessions.find((candidate) => candidate.active) || null
+  if (session) {
+    const decision = captureLifecycleDecision({
+      type: 'CAPTURE_STARTED',
+      data: session,
+      cruiseRun: cruiseRun.value,
+      nonRecordingCruisePending: nonRecordingCruiseLaunchPending.value,
+      nonRecordingCaptureSessionId: nonRecordingCruiseCaptureSessionId.value
+    })
+    nonRecordingCruiseCaptureSessionId.value = decision.nonRecordingCaptureSessionId
+    if (decision.ignore) {
+      nonRecordingCruiseLaunchPending.value = false
+      if (activeSession.value?.id === session.id) activeSession.value = null
+      return
+    }
+  }
+  activeSession.value = session
   if (activeSession.value?.pending_media_sync_error) {
     captureStatusKind.value = 'danger'
     captureStatus.value = `上次录制尚未保存：${humanError(activeSession.value.pending_media_sync_error)}。请点击“重试保存”。`
@@ -2810,8 +2890,8 @@ async function refreshVault() {
 }
 async function refreshAll() {
   await Promise.all([
-    refreshRobot(), refreshCaptureSession(), refreshMedia(), refreshJobs(), refreshVault(), refreshSettings(),
-    refreshTtsAssets(), refreshSeedanceAssets(), refreshCruiseRoutes(), refreshCruiseRun(),
+    refreshRobot(), refreshMedia(), refreshJobs(), refreshVault(), refreshSettings(),
+    refreshTtsAssets(), refreshSeedanceAssets(), refreshCruiseRoutes(), refreshCruiseCaptureState(),
     refreshSubtitleFonts(), refreshFramingTest()
   ])
 }
@@ -2885,8 +2965,8 @@ const cameraworkWarning = computed(() => {
   if (form.anchor_zoom < form.zoom_min || form.anchor_zoom > form.zoom_max) return '变焦锚点必须位于变焦范围内。'
   return ''
 })
-// A cruise always records, so it needs sole ownership of the recording. activeSession is
-// also set during a cruise, hence the cruiseRunning exclusion: this means a *manual* one.
+// A recording cruise needs sole ownership of the recording. Internal no-record trial sessions
+// are filtered by capture-policy; the cruiseRunning exclusion leaves only a manual session here.
 const manualCaptureActive = computed(() => Boolean(activeSession.value) && !cruiseRunning.value)
 const canStartCruise = computed(() =>
   cruisePoints.value.length > 0 && !cruiseRunning.value && !isCruiseBusy.value
@@ -2933,7 +3013,11 @@ function setCruiseStatus(kind, message) {
 }
 
 async function refreshCruiseRoutes() { cruiseRoutes.value = await api('/cruise/routes') }
-async function refreshCruiseRun() { cruiseRun.value = await api('/cruise') }
+async function refreshCruiseRun() { applyCruiseRunState(await api('/cruise')) }
+async function refreshCruiseCaptureState() {
+  await refreshCruiseRun()
+  await refreshCaptureSession()
+}
 
 // Loads the same map list as the hardware page, but reports into this page's status line.
 // Reusing refreshRobotMaps here would write the result somewhere the operator cannot see.
@@ -2955,10 +3039,12 @@ async function refreshCruiseMaps() {
 async function testCruisePoint(point) {
   if (isCruiseBusy.value || cruiseRunning.value) return
   isCruiseBusy.value = true
+  nonRecordingCruiseLaunchPending.value = true
+  nonRecordingCruiseCaptureSessionId.value = ''
   cruiseIssues.value = []
   setCruiseStatus('muted', `正在试跑 ${point.path_name} · #${point.goal_id}（不录制）...`)
   try {
-    cruiseRun.value = await api('/cruise/start', {
+    applyCruiseRunState(await api('/cruise/start', {
       method: 'POST',
       body: JSON.stringify({
         title: `试跑 ${point.path_name}#${point.goal_id}`,
@@ -2970,9 +3056,11 @@ async function testCruisePoint(point) {
         arrival_timeout_seconds: CRUISE_ARRIVAL_TIMEOUT_SECONDS,
         gimbal_scan: { enabled: false }
       })
-    })
+    }))
     setCruiseStatus('muted', '试跑已开始，不录制。到达或失败会显示在「运行状态」。')
   } catch (err) {
+    nonRecordingCruiseLaunchPending.value = false
+    nonRecordingCruiseCaptureSessionId.value = ''
     setCruiseStatus('danger', `试跑失败：${humanError(err.message)}`)
   } finally {
     isCruiseBusy.value = false
@@ -3153,14 +3241,21 @@ async function startCruiseRoute(route) {
   }
   if (isCruiseBusy.value || cruiseRunning.value) return
   isCruiseBusy.value = true
+  const startsWithoutRecording = route.request?.record === false
+  nonRecordingCruiseLaunchPending.value = startsWithoutRecording
+  nonRecordingCruiseCaptureSessionId.value = ''
   cruiseIssues.value = []
   try {
     const result = await api(`/cruise/routes/${route.id}/start`, { method: 'POST', body: '{}' })
-    cruiseRun.value = result.run
+    applyCruiseRunState(result.run)
     cruiseIssues.value = result.validation?.issues || []
     await refreshCruiseRoutes()
     setCruiseStatus('success', `清单「${route.name}」已开始。`)
   } catch (err) {
+    if (startsWithoutRecording) {
+      nonRecordingCruiseLaunchPending.value = false
+      nonRecordingCruiseCaptureSessionId.value = ''
+    }
     // A 409 carries the validation payload, so the operator sees which rows are wrong.
     const issues = err.detail?.issues
     if (Array.isArray(issues)) {
@@ -3181,9 +3276,11 @@ async function startCruise() {
   }
   if (!canStartCruise.value) return
   isCruiseBusy.value = true
+  nonRecordingCruiseLaunchPending.value = false
+  nonRecordingCruiseCaptureSessionId.value = ''
   cruiseIssues.value = []
   try {
-    cruiseRun.value = await api('/cruise/start', { method: 'POST', body: JSON.stringify(buildCruiseRequest()) })
+    applyCruiseRunState(await api('/cruise/start', { method: 'POST', body: JSON.stringify(buildCruiseRequest()) }))
     setCruiseStatus('success', `巡游已开始，共 ${cruisePoints.value.length} 个点位。`)
   } catch (err) {
     setCruiseStatus('danger', `启动失败：${humanError(err.message)}`)
@@ -3197,7 +3294,7 @@ async function cancelCruise() {
   isCruiseBusy.value = true
   setCruiseStatus('muted', '正在取消巡游并停止录制...')
   try {
-    cruiseRun.value = await api('/cruise/cancel', { method: 'POST', body: '{}' })
+    applyCruiseRunState(await api('/cruise/cancel', { method: 'POST', body: '{}' }))
     await refreshRobot()
     if (robot.value.recording) {
       setCruiseStatus('danger', '巡游已结束，但录制停止未确认。请到「拍摄」中停止采集或重试保存。')
@@ -3405,10 +3502,68 @@ function capturePhoto() {
 function captureNoteSend() { sendWs('CAPTURE_NOTE', { note: captureNote.value }); captureNote.value = '' }
 
 async function importMedia() {
-  if (!window.desktopApi) throw new Error('桌面桥接不可用。请从 Electron 应用打开，而不是直接访问浏览器地址。')
-  const files = await window.desktopApi.selectMediaFiles()
-  for (const file of files) await api('/media/import', { method: 'POST', body: JSON.stringify({ path: file }) })
-  await Promise.all([refreshMedia(), refreshVault()])
+  if (isImporting.value) return
+  if (!window.desktopApi?.selectMediaFiles || !window.desktopApi?.chooseMediaImportMode) {
+    importStatusKind.value = 'danger'
+    importStatus.value = '导入失败：桌面桥接不可用，请从 Electron 应用打开。'
+    return
+  }
+  isImporting.value = true
+  importStatusKind.value = 'muted'
+  importStatus.value = '正在选择本地媒体…'
+  try {
+    const files = await window.desktopApi.selectMediaFiles()
+    if (!files.length) {
+      importStatus.value = '未选择文件，已取消导入。'
+      return
+    }
+    const storageMode = await window.desktopApi.chooseMediaImportMode(files.length)
+    if (!storageMode) {
+      importStatus.value = '已取消导入，未复制或记录任何文件。'
+      return
+    }
+
+    const successes = []
+    const failures = []
+    let refreshWarning = ''
+    for (const [index, file] of files.entries()) {
+      importStatus.value = `正在导入 ${index + 1}/${files.length}：${shortPath(file)}`
+      try {
+        const item = await api('/media/import', {
+          method: 'POST',
+          body: JSON.stringify({ path: file, storage_mode: storageMode })
+        })
+        successes.push(item)
+      } catch (err) {
+        const reason = humanError(err.message)
+        failures.push(`${shortPath(file)}：${reason}`)
+        log(`本地媒体导入失败：${shortPath(file)}：${reason}`)
+      }
+    }
+
+    try {
+      await Promise.all([refreshMedia(), refreshVault()])
+    } catch (err) {
+      refreshWarning = humanError(err.message)
+      log(`媒体库刷新失败：${refreshWarning}`)
+    }
+
+    const outcome = formatMediaImportOutcome({
+      successCount: successes.length,
+      failures,
+      storageMode,
+      refreshWarning
+    })
+    importStatusKind.value = outcome.kind
+    importStatus.value = outcome.text
+    log(importStatus.value)
+  } catch (err) {
+    importStatusKind.value = 'danger'
+    importStatus.value = `导入失败：${humanError(err.message)}`
+    log(importStatus.value)
+  } finally {
+    isImporting.value = false
+  }
 }
 
 async function downloadMedia() {
@@ -3604,7 +3759,18 @@ function isItemInPool(kind, id) {
   return Boolean(field && mediaPool.value[field]?.includes(id))
 }
 
-function togglePendingPoolItem(id, checked) {
+function mediaPoolAvailabilityTitle(kind, item) {
+  return isMediaPoolEligible(kind, item) ? '' : '自动剪辑暂不接受图片；仍可预览，并用于手动微调或生成特效。'
+}
+
+function mediaPoolAvailabilityLabel(kind, item) {
+  if (!isMediaPoolEligible(kind, item) && item.kind === 'image') return '自动剪辑不可选 · 可手动使用'
+  return roleKindLabel(itemRole(item), item.kind)
+}
+
+function togglePendingPoolItem(item, checked) {
+  if (!isMediaPoolEligible(mediaLibraryTab.value, item)) return
+  const id = item.id
   if (checked) {
     if (!pendingPoolIds.value.includes(id)) pendingPoolIds.value = [...pendingPoolIds.value, id]
     return
@@ -3652,8 +3818,18 @@ function pruneSelectionsToPool() {
 
 async function addPendingItemsToPool() {
   const field = MEDIA_POOL_FIELDS[mediaLibraryTab.value]
-  const ids = [...new Set([...(mediaPool.value[field] || []), ...pendingPoolIds.value])]
-  const added = pendingPoolIds.value.length
+  const eligibleIds = eligibleMediaIds(
+    pendingPoolIds.value,
+    mediaLibraryItems.value,
+    mediaLibraryTab.value
+  )
+  if (!eligibleIds.length) {
+    mediaPoolStatusKind.value = 'warn'
+    mediaPoolStatus.value = '没有可加入自动媒体池的素材；图片只能用于预览、手动微调或特效制作。'
+    return
+  }
+  const ids = [...new Set([...(mediaPool.value[field] || []), ...eligibleIds])]
+  const added = eligibleIds.length
   if (await saveMediaPool({ ...mediaPool.value, [field]: ids }, `已加入媒体池 ${added} 个素材。`)) closeMediaLibrary()
 }
 
@@ -3692,7 +3868,10 @@ function closePoolPreview() {
 // frames can appear.
 
 const tuneImportedSources = computed(() =>
-  media.value.filter((item) => item.kind === 'video' && itemRole(item) === 'raw_video')
+  media.value.filter((item) =>
+    (item.kind === 'video' && itemRole(item) === 'raw_video') ||
+    (item.kind === 'image' && itemRole(item) === 'image')
+  )
 )
 const tuneExportSources = computed(() =>
   media.value.filter((item) => item.kind === 'video' && itemRole(item) === 'export')
@@ -4467,25 +4646,7 @@ async function trashVaultGroup(group) {
 }
 
 function shortPath(path) {
-  return String(path || '').split('/').pop() || path
-}
-
-function isTtsPath(path) {
-  return String(path || '').includes('/data/tts/') || String(path || '').includes('\\data\\tts\\')
-}
-
-function isSeedanceEffectPath(path) {
-  return String(path || '').includes('/data/seedance/effects/') || String(path || '').includes('\\data\\seedance\\effects\\')
-}
-
-function itemRole(item) {
-  if (item?.metadata?.role) return item.metadata.role
-  if (item?.kind === 'video' && isSeedanceEffectPath(item.path)) return 'seedance_effect'
-  if (item?.kind === 'audio' && isTtsPath(item.path)) return 'tts_voice'
-  if (item?.kind === 'video') return 'raw_video'
-  if (item?.kind === 'audio') return 'music'
-  if (item?.kind === 'image') return 'image'
-  return 'unknown'
+  return String(path || '').split(/[\\/]/).pop() || path
 }
 
 function secretState(status) {
@@ -5071,13 +5232,20 @@ function roleLabel(role) {
     raw_video: '导入',
     music: '音乐',
     tts_voice: '旁白',
-    image: '图片',
+    image: '导入',
     seedance_effect: '特效',
     export: '导出',
     preview: '预览',
     cache: '缓存',
     unknown: '其他'
   }[role] || role
+}
+
+function roleKindLabel(role, kind) {
+  const label = roleLabel(role)
+  return kind === 'image' && ['image', 'seedance_effect'].includes(role)
+    ? `${label} · 图片`
+    : label
 }
 
 function bucketLabel(label) {

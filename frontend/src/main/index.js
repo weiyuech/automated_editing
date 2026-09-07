@@ -5,6 +5,11 @@ import { createServer } from 'node:net'
 import { existsSync, mkdirSync, appendFileSync, copyFileSync, readFileSync, writeFileSync } from 'node:fs'
 import { delimiter, dirname, extname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { ensureDeletableManagedPath, ensureInspectableMediaPath } from './path-policy.js'
+import {
+  MEDIA_IMPORT_DIALOG_BUTTONS,
+  MEDIA_PICKER_EXTENSIONS,
+  mediaImportModeForDialogResponse
+} from '../shared/media-policy.js'
 
 const SOURCE_ROOT = resolve(__dirname, '../../../')
 const DEFAULT_BACKEND_PORT = 4817
@@ -365,10 +370,25 @@ ipcMain.handle('select-media-files', async (event) => {
   const result = await dialog.showOpenDialog(win, {
     properties: ['openFile', 'multiSelections'],
     filters: [
-      { name: 'Media', extensions: ['mp4', 'mov', 'mkv', 'webm', 'mp3', 'wav', 'm4a', 'jpg', 'jpeg', 'png'] }
+      { name: 'Media', extensions: [...MEDIA_PICKER_EXTENSIONS] }
     ]
   })
   return result.canceled ? [] : result.filePaths
+})
+
+ipcMain.handle('choose-media-import-mode', async (event, fileCount = 1) => {
+  const win = BrowserWindow.fromWebContents(event.sender)
+  const result = await dialog.showMessageBox(win, {
+    type: 'warning',
+    title: '导入本地媒体',
+    message: `是否把选中的 ${Number(fileCount) || 1} 个文件复制到应用媒体库？`,
+    detail: '复制后，即使原文件被移动、改名或外接硬盘断开，应用内副本仍可使用。仅引用不会占用额外空间，但原文件变化后素材会失效。',
+    buttons: [...MEDIA_IMPORT_DIALOG_BUTTONS],
+    defaultId: 0,
+    cancelId: 2,
+    noLink: true
+  })
+  return mediaImportModeForDialogResponse(result.response)
 })
 
 

@@ -131,12 +131,12 @@ p { margin: 6px 0 0; color: var(--text-muted); }
 .asset-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .asset-actions { display: flex; justify-content: flex-end; gap: 6px; flex-wrap: wrap; }
 .asset-actions button { padding: 7px 9px; font-size: 12px; }
-.role-pill { display: inline-flex; align-items: center; justify-content: center; min-width: 68px; border-radius: 999px; border: 1px solid #33465b; padding: 4px 8px; font-size: 11px; font-weight: 800; text-transform: uppercase; color: #adc0d5; }
+.role-pill { display: inline-flex; align-items: center; justify-content: center; min-width: 68px; border-radius: 999px; border: 1px solid #33465b; padding: 4px 8px; font-size: 11px; font-weight: 800; text-transform: uppercase; white-space: nowrap; color: #adc0d5; }
 .role-pill.raw_video { color: #5eead4; border-color: #2f766d; background: #0b2728; }
 .role-pill.music { color: #f5b84b; border-color: #7a5b21; background: #261d0b; }
 .role-pill.tts_voice { color: #fb923c; border-color: #9a3412; background: #32150a; }
-.role-pill.image { color: #86efac; border-color: #166534; background: #052e1b; }
-.role-pill.seedance_effect { color: #b8bdc9; border-color: #4b515e; background: #1b1e26; }
+.role-pill.image { color: #5eead4; border-color: #2f766d; background: #0b2728; }
+.role-pill.seedance_effect { color: #86efac; border-color: #166534; background: #052e1b; }
 .role-pill.export { color: #93c5fd; border-color: #315f91; background: #0b1d33; }
 .role-pill.preview { color: #c4b5fd; border-color: #5b4b91; background: #1a1433; }
 .role-pill.cache { color: #fca5a5; border-color: #7f2b35; background: #2b1015; }
@@ -259,6 +259,8 @@ p { margin: 6px 0 0; color: var(--text-muted); }
 .library-picker-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 10px; padding: 10px 12px; border-bottom: 1px solid var(--border); }
 .library-picker-row:last-child { border-bottom: 0; }
 .library-picker-row.pooled { background: rgba(143, 91, 216, .06); }
+.library-picker-row.unavailable { background: rgba(90, 102, 116, .07); }
+.library-picker-row.unavailable > label { cursor: not-allowed; opacity: .62; }
 .library-picker-row > label { min-width: 0; display: grid; grid-template-columns: 22px minmax(0, 1fr); align-items: center; gap: 10px; cursor: pointer; }
 .library-picker-row > label > span { min-width: 0; display: flex; flex-direction: column; gap: 3px; }
 .library-picker-row > label strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text); font-size: 13px; }
@@ -268,7 +270,8 @@ p { margin: 6px 0 0; color: var(--text-muted); }
 .library-picker-footer { display: flex; align-items: center; justify-content: flex-end; gap: 8px; padding-top: 2px; }
 .library-picker-footer > span { margin-right: auto; color: var(--text-muted); font-size: 12px; }
 .pool-preview-modal { width: min(800px, 100%); display: flex; flex-direction: column; gap: 15px; }
-.pool-preview-modal video { width: 100%; max-height: min(620px, calc(100vh - 180px)); border-radius: 8px; background: #14141a; }
+.pool-preview-modal video,
+.pool-preview-modal img { width: 100%; max-height: min(620px, calc(100vh - 180px)); border-radius: 8px; background: #14141a; object-fit: contain; }
 .pool-preview-modal audio { width: 100%; }
 
 /* 镜头控制 — one row per axis: name + start / end / speed inputs. */
@@ -459,8 +462,8 @@ p { margin: 6px 0 0; color: var(--text-muted); }
 .role-pill.raw_video { color: var(--teal); border-color: rgba(39, 143, 138, .24); background: rgba(225, 255, 251, .48); }
 .role-pill.music { color: var(--amber); border-color: rgba(168, 103, 18, .22); background: rgba(255, 244, 221, .54); }
 .role-pill.tts_voice { color: #c2410c; border-color: rgba(234, 88, 12, .3); background: rgba(255, 228, 213, .68); }
-.role-pill.image { color: #166534; border-color: rgba(22, 101, 52, .3); background: rgba(220, 252, 231, .72); }
-.role-pill.seedance_effect { color: #5b6070; border-color: rgba(100, 106, 122, .28); background: rgba(236, 237, 241, .74); }
+.role-pill.image { color: var(--teal); border-color: rgba(39, 143, 138, .24); background: rgba(225, 255, 251, .48); }
+.role-pill.seedance_effect { color: #166534; border-color: rgba(22, 101, 52, .3); background: rgba(220, 252, 231, .72); }
 .role-pill.export { color: #6b56b5; border-color: rgba(107, 86, 181, .22); background: rgba(241, 236, 255, .58); }
 .role-pill.preview { color: #7a5ccc; border-color: rgba(122, 92, 204, .22); background: rgba(242, 236, 255, .54); }
 .role-pill.cache { color: var(--rose); border-color: rgba(196, 73, 109, .24); background: rgba(255, 235, 241, .54); }

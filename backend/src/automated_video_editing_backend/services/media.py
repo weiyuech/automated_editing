@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import asyncio
+import json
 import logging
 import re
+import shutil
 from pathlib import Path
 from urllib.parse import unquote, urljoin, urlparse, urlunparse
 from uuid import uuid4
@@ -12,6 +15,7 @@ from pydantic import ValidationError
 from automated_video_editing_backend.core.models import MediaItem
 from automated_video_editing_backend.core.paths import (
     GENERATED_DIRS,
+    RootPathError,
     ensure_inside_root,
     generated_path,
 )
@@ -78,6 +82,62 @@ def _is_flat_managed_export_file(path: str | Path) -> bool:
     except (OSError, RuntimeError, ValueError):
         return False
     return resolved.parent == export_root
+
+
+def _managed_media_source(path: str | Path) -> str | None:
+    """Return the authoritative app-owned area for a path, most specific first."""
+    try:
+        resolved = Path(path).expanduser().resolve()
+        roots = (
+            ("data/downloads", (GENERATED_DIRS["data"] / "downloads").resolve()),
+            ("data/tts", (GENERATED_DIRS["data"] / "tts").resolve()),
+            (
+                "data/seedance/effects",
+                (GENERATED_DIRS["data"] / "seedance" / "effects").resolve(),
+            ),
+            ("exports", GENERATED_DIRS["exports"].resolve()),
+            ("previews", GENERATED_DIRS["previews"].resolve()),
+            ("cache", GENERATED_DIRS["cache"].resolve()),
+            ("logs", GENERATED_DIRS["logs"].resolve()),
+            ("data", GENERATED_DIRS["data"].resolve()),
+        )
+    except (OSError, RuntimeError, ValueError):
+        return None
+    for source, root in roots:
+        if resolved == root or root in resolved.parents:
+            return source
+    return None
+
+
+def _discoverable_media_sources() -> dict[str, Path]:
+    """Folders whose direct media children are rebuilt by ``refresh_generated_media``."""
+    return {
+        "data/downloads": GENERATED_DIRS["data"] / "downloads",
+        "data/tts": GENERATED_DIRS["data"] / "tts",
+        "data/seedance/effects": GENERATED_DIRS["data"] / "seedance" / "effects",
+        "exports": GENERATED_DIRS["exports"],
+    }
+
+
+def _discoverable_media_source(path: str | Path) -> str | None:
+    """Return the scanner that owns this exact flat media-file location, if any."""
+    try:
+        resolved = Path(path).expanduser().resolve()
+        sources = {
+            source: folder.resolve() for source, folder in _discoverable_media_sources().items()
+        }
+    except (OSError, RuntimeError, ValueError):
+        return None
+    for source, root in sources.items():
+        if resolved.parent == root:
+            return source
+    return None
+
+
+def _safe_local_import_name(path: Path) -> str:
+    """Keep readable Unicode while removing characters Windows filenames cannot contain."""
+    stem = re.sub(r'[<>:"/\\|?*\x00-\x1f]+', "-", path.stem).strip(" .-") or "import"
+    return f"{stem[:120].rstrip(' .-') or 'import'}{path.suffix.lower()}"
 
 
 def _is_allowed_automatic_source_path(path: str | Path, source: object) -> bool:
@@ -193,6 +253,10 @@ def role_for_kind(kind: str) -> str:
 class MediaService:
     def __init__(self, path: Path | None = None) -> None:
         self._items: dict[str, MediaItem] = {}
+        # This is the durable catalog, including valid references that are temporarily offline.
+        # ``_items`` remains the currently usable inventory exposed to callers.
+        self._import_catalog: dict[str, MediaItem] = {}
+        self._import_lock = asyncio.Lock()
         # Generated media is rediscovered by scanning the app's own folders, but imported
         # clips live wherever the operator keeps them and were forgotten on every restart.
         self.path = path or generated_path("data", "media-library.json")
@@ -455,24 +519,52 @@ class MediaService:
         items = self.list_items()
         if not self._pool_initialized:
             # Upgrade compatibility: the old studio treated every compatible library item as
-            # pooled. Preserve that working set once, then only explicit pool edits change it.
+            # pooled. Include temporarily offline catalog entries so upgrading while a removable
+            # drive is detached does not silently change that working set.
+            seed_candidates = {item.path: item for item in items}
+            seed_candidates.update(
+                {item.path: item for item in self._import_catalog.values()}
+            )
             seeded = {
-                field: [item.path for item in items if self._matches_pool(item, field)]
+                field: [
+                    item.path
+                    for item in seed_candidates.values()
+                    if self._matches_pool(item, field)
+                ]
                 for field in MEDIA_POOL_FIELDS
             }
             self._save_pool(seeded)
 
-        by_path = {item.path: item for item in items}
+        by_path: dict[str, MediaItem] = {}
+        for item in items:
+            by_path.setdefault(item.path, item)
+        catalog_by_path: dict[str, MediaItem] = {}
+        for item in self._import_catalog.values():
+            catalog_by_path.setdefault(item.path, item)
         cleaned: dict[str, list[str]] = {}
         result: dict[str, list[str]] = {}
         for field, paths in self._pool_paths.items():
-            valid_paths = [
-                path
-                for path in paths
-                if path in by_path and self._matches_pool(by_path[path], field)
-            ]
-            cleaned[field] = valid_paths
-            result[field] = [by_path[path].id for path in valid_paths]
+            retained_paths: list[str] = []
+            visible_ids: list[str] = []
+            retained_path_set: set[str] = set()
+            for path in paths:
+                if path in retained_path_set:
+                    continue
+                visible = by_path.get(path)
+                if visible is not None and self._matches_pool(visible, field):
+                    retained_paths.append(path)
+                    visible_ids.append(visible.id)
+                    retained_path_set.add(path)
+                    continue
+                offline = catalog_by_path.get(path)
+                if offline is not None and self._matches_pool(offline, field):
+                    # Return the stable catalog id even while the file is unavailable. The UI can
+                    # then preserve it in a full pool update or explicitly clear it with [].
+                    retained_paths.append(path)
+                    visible_ids.append(offline.id)
+                    retained_path_set.add(path)
+            cleaned[field] = retained_paths
+            result[field] = visible_ids
         if cleaned != self._pool_paths:
             self._save_pool(cleaned)
         return result
@@ -487,22 +579,34 @@ class MediaService:
             )
         self.list_items()
         updated: dict[str, list[str]] = {}
+        result_ids: dict[str, list[str]] = {}
         for field in MEDIA_POOL_FIELDS:
             ids = list(dict.fromkeys(media_ids.get(field, [])))
             paths: list[str] = []
+            accepted_ids: list[str] = []
+            seen_paths: set[str] = set()
             for media_id in ids:
                 item = self._items.get(media_id)
                 if item is None:
-                    raise ValueError("That media item no longer exists")
+                    item = self._import_catalog.get(media_id)
+                    if item is None or Path(item.path).is_file():
+                        raise ValueError("That media item no longer exists")
                 if not self._matches_pool(item, field):
                     raise ValueError(f"Invalid media type for {field}")
+                if item.path in seen_paths:
+                    continue
                 paths.append(item.path)
+                accepted_ids.append(media_id)
+                seen_paths.add(item.path)
             updated[field] = paths
+            result_ids[field] = accepted_ids
         # Write first so a full disk or permissions error cannot make a failed PUT look
         # successful until the process restarts. The old in-memory and on-disk set both stay
         # intact when the atomic write does not land.
         self._save_pool(updated)
-        return self.media_pool()
+        # The ids above were validated against the inventory snapshot from list_items().
+        # Calling media_pool() here used to run that same full scan a second time immediately.
+        return result_ids
 
     def _load_imports(self) -> None:
         existed = self.path.exists()
@@ -525,11 +629,25 @@ class MediaService:
             if quarantined:
                 self._block_imports(f"{self.path.name} 之前损坏，原文件已保留为 {quarantined[-1]}")
             return
-        if not isinstance(raw, list):
+        migrated = False
+        if isinstance(raw, dict) and isinstance(raw.get("items"), list):
+            # Some early packaged builds wrapped the same records in an object. Accept the
+            # explicit records and rewrite the current list format.
+            raw = raw["items"]
+            migrated = True
+        elif not isinstance(raw, list):
             self._block_imports(f"{self.path.name} 格式无效：顶层内容应为列表")
             return
 
+        catalog: dict[str, MediaItem] = {}
+        catalog_id_by_path: dict[str, str] = {}
+        reserved_catalog_ids = {
+            str(entry.get("id"))
+            for entry in raw
+            if isinstance(entry, dict) and entry.get("id")
+        }
         loaded: dict[str, MediaItem] = {}
+        legacy_exports: dict[str, dict] = {}
         for entry in raw:
             if not isinstance(entry, dict) or not entry.get("id") or not entry.get("path"):
                 self._block_imports(f"{self.path.name} 格式无效：含有不完整的素材记录")
@@ -539,23 +657,145 @@ class MediaService:
             except (ValidationError, TypeError) as exc:
                 self._block_imports(f"{self.path.name} 格式无效：{exc}")
                 return
-            if item.metadata.get("source") != "local_import":
-                self._block_imports(f"{self.path.name} 格式无效：含有非导入素材记录")
+            try:
+                item_path = Path(item.path).expanduser().resolve()
+            except (OSError, RuntimeError, ValueError) as exc:
+                self._block_imports(f"{self.path.name} 格式无效：素材路径无效（{exc}）")
                 return
-            # Old builds could persist generated video as a local raw-video import. Physical
-            # provenance is authoritative: leave managed outputs for the corresponding scanner
-            # (or vault) instead of preserving a source identity the pool and jobs must reject.
-            # This changes no file and guesses no export grouping.
-            if (
-                item.kind == "video"
-                and item.metadata.get("role") == "raw_video"
-                and not self.is_automatic_source(item)
-            ):
+            resolved = str(item_path)
+            kind = self.infer_kind(item_path)
+            if kind == "unknown":
+                self._block_imports(
+                    f"{self.path.name} 格式无效：{item_path.name} 不是受支持的媒体文件"
+                )
+                return
+            if item.path != resolved or item.kind != kind:
+                item = item.model_copy(update={"path": resolved, "kind": kind})
+                migrated = True
+
+            source = item.metadata.get("source")
+            role = item.metadata.get("role")
+            managed_source = _managed_media_source(item_path)
+            discoverable_source = _discoverable_media_source(item_path)
+
+            # Only an explicit old export record is migrated. Preserve all grouping, variant,
+            # and subtitles fields verbatim; never infer a master/subtitle pair from filenames.
+            if source == "exports" or role == "export":
+                if not _is_flat_managed_export_file(item_path):
+                    self._block_imports(
+                        f"{self.path.name} 格式无效：明确的成片记录不在受管成片目录中"
+                    )
+                    return
+                if item_path.is_file():
+                    metadata = dict(item.metadata)
+                    metadata["source"] = "exports"
+                    metadata["role"] = "export"
+                    previous = legacy_exports.get(resolved)
+                    if previous is not None and previous != metadata:
+                        self._block_imports(
+                            f"{self.path.name} 格式无效：同一成片含有互相冲突的旧版记录"
+                        )
+                        return
+                    legacy_exports[resolved] = metadata
+                migrated = True
                 continue
-            # Drop clips the operator has since moved or deleted rather than showing a
-            # library row that cannot be played.
-            if Path(item.path).is_file():
+
+            # Generated/downloaded app-owned files are rediscovered by their authoritative
+            # scanners. Keeping old local-import identities would misclassify effects or TTS.
+            if discoverable_source is not None:
+                migrated = True
+                continue
+            if managed_source is not None:
+                if source not in {None, "", "local_import", "import", "external", "local"}:
+                    self._block_imports(f"{self.path.name} 格式无效：含有无法识别的素材来源")
+                    return
+                # Old builds could persist a cache, preview, or another non-scanned app-owned
+                # file as though it were an external import. It is unsafe to retain that identity,
+                # but blocking the whole catalog also strands every valid external reference and
+                # prevents the operator from repairing this entry with explicit copy mode. Drop
+                # only the stale record during migration; never touch the physical managed file.
+                migrated = True
+                LOGGER.warning(
+                    "Ignoring legacy imported-media reference %s in managed area %s; "
+                    "the physical file was left untouched",
+                    item_path.name,
+                    managed_source,
+                )
+                continue
+
+            if source not in {None, "", "local_import", "import", "external", "local"}:
+                self._block_imports(f"{self.path.name} 格式无效：含有无法识别的素材来源")
+                return
+
+            metadata = dict(item.metadata)
+            metadata["source"] = "local_import"
+            metadata["role"] = role_for_kind(kind)
+            if metadata != item.metadata:
+                item = item.model_copy(update={"metadata": metadata})
+                migrated = True
+            existing_id = catalog_id_by_path.get(resolved)
+            if existing_id is not None:
+                # Early builds could assign more than one identity to the same external file.
+                # Keep the first manifest identity deterministically. The pool is path-backed,
+                # so this repairs duplicate rows without changing the operator's selection.
+                migrated = True
+                LOGGER.warning(
+                    "Ignoring duplicate imported-media id %s for %s; keeping %s",
+                    item.id,
+                    item_path.name,
+                    existing_id,
+                )
+                continue
+            if item.id in catalog:
+                # A duplicated UUID must not make one otherwise-valid external path overwrite the
+                # other. Keep the first record's public identity and durably re-key each later
+                # path; the path-backed pool can then restore every original selection.
+                old_id = item.id
+                replacement_id = str(uuid4())
+                while replacement_id in reserved_catalog_ids or replacement_id in catalog:
+                    replacement_id = str(uuid4())
+                reserved_catalog_ids.add(replacement_id)
+                item = item.model_copy(update={"id": replacement_id})
+                migrated = True
+                LOGGER.warning(
+                    "Re-keying duplicate imported-media id %s for %s as %s",
+                    old_id,
+                    item_path.name,
+                    replacement_id,
+                )
+            catalog[item.id] = item
+            catalog_id_by_path[resolved] = item.id
+            # Offline references remain in the durable catalog but are hidden from the current
+            # inventory until their drive/path becomes available again.
+            if item_path.is_file():
                 loaded[item.id] = item
+
+        if migrated:
+            generated = dict(self._generated_metadata)
+            generated_changed = False
+            for export_path, metadata in legacy_exports.items():
+                current = generated.get(export_path)
+                if current is not None and current != metadata:
+                    self._block_imports(
+                        f"{self.path.name} 旧版成片记录与现有成片元数据冲突："
+                        f"{Path(export_path).name}"
+                    )
+                    return
+                if current is None:
+                    generated[export_path] = metadata
+                    generated_changed = True
+            try:
+                if legacy_exports:
+                    generated = self._validate_generated_metadata_payload(
+                        {"version": 1, "items": generated}
+                    )
+                    if generated_changed:
+                        self._save_generated_metadata(generated, required=True)
+                self._save_imports(catalog)
+            except (OSError, TypeError, ValueError, GeneratedMetadataPersistenceError) as exc:
+                self._block_imports(f"{self.path.name} 旧版记录迁移失败：{exc}")
+                return
+        self._import_catalog = catalog
         self._items.update(loaded)
 
     def _block_imports(self, problem: str) -> None:
@@ -563,12 +803,12 @@ class MediaService:
         self.media_library_problem = problem
         LOGGER.error("Could not load imported-media library: %s", problem)
 
-    def _save_imports(self, items: dict[str, MediaItem] | None = None) -> None:
+    def _save_imports(self, catalog: dict[str, MediaItem] | None = None) -> None:
         if self._imports_blocked:
             raise MediaLibraryPersistenceError(self.media_library_problem)
         payload = [
             item.model_dump(mode="json")
-            for item in (self._items if items is None else items).values()
+            for item in (self._import_catalog if catalog is None else catalog).values()
             if item.metadata.get("source") == "local_import"
         ]
         if not write_json(self.path, payload):
@@ -588,8 +828,8 @@ class MediaService:
             return None
         if self._pool_blocked:
             raise MediaPoolPersistenceError(self.media_pool_problem)
-        remaining = dict(self._items)
-        remaining.pop(media_id, None)
+        remaining_catalog = dict(self._import_catalog)
+        remaining_catalog.pop(media_id, None)
         updated_pool = {field: list(paths) for field, paths in self._pool_paths.items()}
         for field, paths in self._pool_paths.items():
             if item.path in paths:
@@ -599,7 +839,7 @@ class MediaService:
         if pool_changed:
             self._save_pool(updated_pool)
         try:
-            self._save_imports(remaining)
+            self._save_imports(remaining_catalog)
         except Exception as exc:
             if pool_changed:
                 try:
@@ -609,31 +849,26 @@ class MediaService:
                         f"{exc}；媒体池回滚失败：{rollback_exc}"
                     ) from exc
             raise
+        self._import_catalog.pop(media_id, None)
         self._items.pop(media_id, None)
         return item
 
     def forget_missing_imports(self) -> int:
-        """Drop imported entries whose file no longer exists. Returns how many went."""
-        gone = [
+        """Synchronize reference availability without deleting the durable catalog."""
+        unavailable = [
             item_id
             for item_id, item in self._items.items()
             if item.metadata.get("source") == "local_import" and not Path(item.path).is_file()
         ]
-        if gone:
-            remaining = {
-                item_id: item for item_id, item in self._items.items() if item_id not in gone
-            }
-            self._save_imports(remaining)
-            self._items = remaining
-        return len(gone)
+        for item_id in unavailable:
+            self._items.pop(item_id, None)
+        for item_id, item in self._import_catalog.items():
+            if item_id not in self._items and Path(item.path).is_file():
+                self._items[item_id] = item
+        return len(unavailable)
 
     def refresh_generated_media(self) -> None:
-        generated_sources = {
-            "data/downloads": GENERATED_DIRS["data"] / "downloads",
-            "data/tts": GENERATED_DIRS["data"] / "tts",
-            "data/seedance/effects": GENERATED_DIRS["data"] / "seedance" / "effects",
-            "exports": GENERATED_DIRS["exports"],
-        }
+        generated_sources = _discoverable_media_sources()
         discoverable_sources = {
             source: folder
             for source, folder in generated_sources.items()
@@ -713,8 +948,8 @@ class MediaService:
 
     def list_items(self) -> list[MediaItem]:
         self.refresh_generated_media()
-        # The vault hides imports whose file has gone, so without this Edit Studio would
-        # keep offering a clip that no longer exists.
+        # Hide unavailable references without deleting them from the durable catalog. A removable
+        # drive can then reconnect and restore the same media id on the next scan.
         self.forget_missing_imports()
         self._tag_cruise_points()
         return list(self._items.values())
@@ -753,10 +988,39 @@ class MediaService:
             return "image"
         return "unknown"
 
-    def import_path(self, raw_path: str) -> MediaItem:
+    def _registered_seedance_image(self, path: Path) -> MediaItem | None:
+        """Recover an explicitly recorded Seedance image outside the default scanner root."""
+        if self.infer_kind(path) != "image" or path.parent.name != "effects":
+            return None
+        for metadata_path in path.parent.glob("*.json"):
+            try:
+                payload = json.loads(metadata_path.read_text(encoding="utf-8"))
+                recorded = payload.get("output_path") or payload.get("video_path")
+                recorded_path = Path(str(recorded)).expanduser().resolve()
+            except (AttributeError, OSError, RuntimeError, TypeError, ValueError, json.JSONDecodeError):
+                continue
+            if recorded_path != path:
+                continue
+            metadata = {"source": "data/seedance/effects", "role": "seedance_effect"}
+            if payload.get("id") and metadata_path.stem == str(payload["id"]):
+                metadata["seedance_asset_id"] = str(payload["id"])
+            return self.register_generated_path(path, kind="image", metadata=metadata)
+        return None
+
+    def _prepare_import(
+        self,
+        raw_path: str,
+        storage_mode: str,
+    ) -> tuple[Path, str, MediaItem | None]:
         path = Path(raw_path).expanduser().resolve()
-        if not path.exists():
+        if not path.is_file():
             raise FileNotFoundError(raw_path)
+        if storage_mode not in {"reference", "copy"}:
+            raise ValueError("导入方式无效，请选择复制或仅引用")
+
+        kind = self.infer_kind(path)
+        if kind == "unknown":
+            raise ValueError(f"不支持此文件格式：{path.suffix or '无扩展名'}")
 
         if _is_managed_export_path(path):
             # A finished output may be selected later for manual fine tuning, but importing it
@@ -767,24 +1031,56 @@ class MediaService:
                 (item for item in self._items.values() if item.path == str(path)), None
             )
             if generated is not None:
-                return generated
+                return path, kind, generated
             if self._generated_metadata_blocked:
                 raise GeneratedMetadataPersistenceError(self.generated_metadata_problem)
             raise ValueError("成片只能用于手动微调，不能作为源视频素材导入")
+
+        managed_source = _managed_media_source(path)
+        if managed_source is not None:
+            # Selecting a file already owned by the app must not mint a conflicting local role.
+            self.refresh_generated_media()
+            generated = next(
+                (item for item in self._items.values() if item.path == str(path)), None
+            )
+            if generated is not None:
+                return path, kind, generated
+            seedance_image = self._registered_seedance_image(path)
+            if seedance_image is not None:
+                return path, kind, seedance_image
+            # A copy can safely flatten media from a cache/preview/nested app folder into the
+            # scanner-owned inbox. A reference cannot: no scanner would restore it on restart,
+            # while treating the app's caches as external input breaks source ownership.
+            if storage_mode == "reference":
+                raise ValueError("该文件位于不可引用的应用托管目录；请改为复制到应用媒体库")
         if self._imports_blocked:
             raise MediaLibraryPersistenceError(self.media_library_problem)
+
+        if storage_mode == "reference":
+            resolved = str(path)
+            existing = next(
+                (item for item in self._import_catalog.values() if item.path == resolved),
+                None,
+            )
+            if existing is not None:
+                # It may have been hidden while its drive was offline. The path exists now, so
+                # restore the same durable identity immediately.
+                self._items[existing.id] = existing
+                return path, kind, existing
+        return path, kind, None
+
+    def import_path(self, raw_path: str, storage_mode: str = "reference") -> MediaItem:
+        path, kind, existing = self._prepare_import(raw_path, storage_mode)
+        if existing is not None:
+            return existing
+        if storage_mode == "copy":
+            return self._copy_import_to_library(path)
 
         # Importing the same file twice used to mint a second id for one path. The vault
         # keys assets by path so it still showed one row, while Edit Studio lists items by
         # id and showed two — the same clip, selectable twice.
-        resolved = str(path)
-        existing = next((item for item in self._items.values() if item.path == resolved), None)
-        if existing is not None:
-            return existing
-
-        kind = self.infer_kind(path)
         item = MediaItem(
-            path=resolved,
+            path=str(path),
             kind=kind,
             metadata={"source": "local_import", "role": role_for_kind(kind)},
         )
@@ -794,11 +1090,134 @@ class MediaService:
             and not self.is_automatic_source(item)
         ):
             raise ValueError("应用生成的视频只能用于对应素材类型，不能作为源视频导入")
-        updated = dict(self._items)
-        updated[item.id] = item
-        self._save_imports(updated)
+        updated_catalog = dict(self._import_catalog)
+        updated_catalog[item.id] = item
+        self._save_imports(updated_catalog)
+        self._import_catalog[item.id] = item
         self._items[item.id] = item
         return item
+
+    async def import_path_async(
+        self,
+        raw_path: str,
+        storage_mode: str = "reference",
+    ) -> MediaItem:
+        """Import without blocking the event loop while a potentially large file is copied."""
+        async with self._import_lock:
+            path, _kind, existing = self._prepare_import(raw_path, storage_mode)
+            if existing is not None:
+                return existing
+            if storage_mode != "copy":
+                # Validation and catalog persistence are small and stay on the owning event loop.
+                return self.import_path(str(path), storage_mode)
+
+            copy_task = asyncio.create_task(asyncio.to_thread(self._copy_file_to_library, path))
+            try:
+                destination = await asyncio.shield(copy_task)
+            except asyncio.CancelledError:
+                # Cancelling an await cannot stop the worker thread. Hold the import lock until it
+                # finishes so another import cannot race for the same readable destination name.
+                # A completed but unacknowledged copy would otherwise become `name-2` on retry.
+                while not copy_task.done():
+                    try:
+                        await asyncio.shield(copy_task)
+                    except asyncio.CancelledError:
+                        # A second cancellation request must not release the name lock while the
+                        # worker thread can still publish a file behind it.
+                        continue
+                    except (OSError, ValueError):
+                        break
+                if not copy_task.cancelled():
+                    try:
+                        destination = copy_task.result()
+                    except (OSError, ValueError):
+                        # _copy_file_to_library already removes staging files on copy failure.
+                        LOGGER.debug(
+                            "Cancelled media import's worker also failed",
+                            exc_info=True,
+                        )
+                    else:
+                        try:
+                            destination.unlink(missing_ok=True)
+                        except OSError:
+                            # The bytes are durable but could not be rolled back. Register them so
+                            # the next inventory request cannot discover an unexplained orphan.
+                            LOGGER.warning(
+                                "Cancelled media import could not remove its completed copy; "
+                                "keeping it in the media library",
+                                exc_info=True,
+                            )
+                            self._recognize_copied_import(destination)
+                        else:
+                            resolved = str(destination.resolve())
+                            for item_id, item in list(self._items.items()):
+                                if item.path == resolved:
+                                    self._items.pop(item_id, None)
+                raise
+            return self._recognize_copied_import(destination)
+
+    def _copy_file_to_library(self, source: Path) -> Path:
+        """Copy bytes atomically without touching the in-memory media inventory."""
+        readable_name = _safe_local_import_name(source)
+        stem = Path(readable_name).stem
+        suffix = Path(readable_name).suffix
+        temporary: Path | None = None
+        try:
+            # Resolve the configured inbox before any mkdir/open. In particular, never write
+            # through a downloads symlink or junction which escapes the application root.
+            destination_dir = ensure_inside_root(GENERATED_DIRS["data"] / "downloads")
+            destination_dir.mkdir(parents=True, exist_ok=True)
+            destination_dir = ensure_inside_root(destination_dir)
+            destination = destination_dir / readable_name
+            counter = 2
+            while destination.exists():
+                destination = destination_dir / f"{stem}-{counter}{suffix}"
+                counter += 1
+
+            destination = ensure_inside_root(destination)
+            temporary = ensure_inside_root(
+                destination_dir / f".{destination.name}.{uuid4().hex}.part"
+            )
+            # A managed copy belongs to the day it was imported. Preserving the source mtime
+            # makes an old photo disappear into that historical day in the media calendar.
+            shutil.copyfile(source, temporary)
+            if temporary.stat().st_size != source.stat().st_size:
+                raise OSError("复制后的文件大小与原文件不一致")
+            temporary.replace(destination)
+        except RootPathError as exc:
+            LOGGER.warning("Refusing an unsafe managed-downloads path", exc_info=True)
+            raise ValueError("应用媒体库目录无效，无法安全复制文件") from exc
+        except OSError as exc:
+            if temporary is not None:
+                try:
+                    temporary.unlink(missing_ok=True)
+                except OSError:
+                    LOGGER.warning("Could not remove failed import staging file", exc_info=True)
+            LOGGER.exception("Could not copy local import into managed downloads")
+            raise OSError(
+                f"无法复制 {source.name} 到应用媒体库；请检查磁盘空间和文件权限"
+            ) from exc
+        return destination
+
+    def _recognize_copied_import(self, destination: Path) -> MediaItem:
+        """Publish a completed managed copy on the media service's owning thread."""
+        resolved_path = ensure_inside_root(destination)
+        resolved = str(resolved_path)
+        existing = next((item for item in self._items.values() if item.path == resolved), None)
+        if existing is not None:
+            return existing
+        kind = self.infer_kind(resolved_path)
+        copied = MediaItem(
+            path=resolved,
+            kind=kind,
+            metadata={"source": "data/downloads", "role": role_for_kind(kind)},
+        )
+        self._items[copied.id] = copied
+        return copied
+
+    def _copy_import_to_library(self, source: Path) -> MediaItem:
+        """Synchronous compatibility path for existing service callers and unit tests."""
+        return self._recognize_copied_import(self._copy_file_to_library(source))
 
     def repoint(self, media_id: str, new_path: str) -> MediaItem | None:
         """Point a library entry at a file that has been renamed on disk."""
@@ -843,7 +1262,7 @@ class MediaService:
             self._save_pool(updated_pool)
 
         if is_local_import:
-            imports_snapshot = dict(self._items)
+            imports_snapshot = dict(self._import_catalog)
             imports_snapshot[item.id] = candidate
             try:
                 self._save_imports(imports_snapshot)
@@ -861,6 +1280,8 @@ class MediaService:
                         ) from exc
                 raise
         item.path = new_path
+        if is_local_import:
+            self._import_catalog[item.id] = item
         return item
 
     def is_known_path(self, path: str) -> bool:
