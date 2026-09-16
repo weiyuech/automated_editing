@@ -168,6 +168,20 @@ class EditPlanner:
         else:
             width, height = self.source_frame(source_size)
             output_fit = "contain"
+        subtitle_track = self._subtitles(
+            request,
+            voiceover,
+            width,
+            height,
+            warnings,
+            voiceover_duration=voiceover_duration,
+        )
+        if subtitle_track is not None:
+            subtitle_mode = subtitle_track.timing_quality
+        elif voiceover is not None:
+            subtitle_mode = "narration_only"
+        else:
+            subtitle_mode = "none"
         return EditTimeline(
             title=request.title,
             clips=self._clips(placed),
@@ -178,7 +192,7 @@ class EditPlanner:
             music_evidence=(music_view["evidence"] if music_view else "none"),
             editorial_preset=request.editorial_preset or "smart",
             voiceover_path=voiceover.path if voiceover else None,
-            subtitles=self._subtitles(request, voiceover, width, height, warnings),
+            subtitles=subtitle_track,
             output_width=width,
             output_height=height,
             output_fit=output_fit,
@@ -214,6 +228,16 @@ class EditPlanner:
                     "loop": music_view["loop"],
                 } if music_view else {"evidence": "none"}),
                 "semantic_alignment": semantic_diagnostics,
+                "subtitles": {
+                    "requested": bool(request.subtitles),
+                    "mode": subtitle_mode,
+                    "label": {
+                        "exact": "精确字幕",
+                        "estimated": "估算字幕",
+                        "narration_only": "仅旁白",
+                        "none": "无旁白",
+                    }[subtitle_mode],
+                },
             },
             warnings=warnings,
         )
@@ -237,14 +261,13 @@ class EditPlanner:
         width: int,
         height: int,
         warnings: list[str],
+        voiceover_duration: float | None = None,
     ) -> SubtitleTrack | None:
         """Cues for the narration, or nothing plus a reason.
 
-        Subtitles are the spoken words, so there is nothing to write without a voiceover and
-        nothing to time it by without the provider's per-word timestamps. Every way this can
-        come back empty says which one it was: "no narration was chosen" and "the narration has
-        no timestamps" call for different actions from the operator, and a single silent
-        no-subtitles outcome would leave them guessing which had happened.
+        Exact provider timings are preferred. If they cannot be trusted, reviewed narration text
+        is estimated over the actual audio duration. Every way this can still come back empty
+        says why, while the narration itself remains in the finished video.
         """
         if not getattr(request, "subtitles", False):
             return None
@@ -258,10 +281,15 @@ class EditPlanner:
         if not metadata_path:
             metadata_path = str(Path(voiceover.path).with_suffix(".json"))
 
-        raw_words, problem = subtitles.load_words(metadata_path)
-        if problem:
-            warnings.append(f"字幕已跳过：{problem}")
+        raw_words, timing_quality, problem = subtitles.load_words_or_estimate(
+            metadata_path,
+            audio_duration_seconds=voiceover_duration,
+        )
+        if timing_quality is None:
+            warnings.append(f"字幕已跳过：{problem}；成片仍保留旁白")
             return None
+        if timing_quality == "estimated":
+            warnings.append("旁白逐字时间不够可靠，已生成估算字幕")
 
         font = self._subtitle_font(request, warnings)
         if font is None:
@@ -285,6 +313,7 @@ class EditPlanner:
             outline=style.outline,
             shadow=style.shadow,
             max_lines=style.max_lines,
+            timing_quality=timing_quality,
         )
 
     def _subtitle_font(self, request: EditJobRequest, warnings: list[str]) -> str | None:

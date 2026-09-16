@@ -16,6 +16,84 @@ class RobotMode(StrEnum):
     REAL = "real"
 
 
+class GimbalCommandDiagnostic(BaseModel):
+    """Latest camera-affecting command successfully written to the robot socket.
+
+    This is intentionally ephemeral and separate from heartbeat telemetry: sending a command
+    proves only that the application wrote it to the connection, not that the robot executed it.
+    """
+
+    context: str
+    sent_at: datetime = Field(default_factory=utc_now)
+    base_motion_intent: Literal["moving", "stationary", "unknown"] = "unknown"
+    payload: dict[str, Any] = Field(default_factory=dict)
+
+
+class GoalCommandDiagnostic(BaseModel):
+    """Latest accepted navigation goal written to the robot socket."""
+
+    context: str
+    sent_at: datetime = Field(default_factory=utc_now)
+    base_motion_intent: Literal["moving", "stationary", "unknown"] = "moving"
+    payload: dict[str, Any] = Field(default_factory=dict)
+
+
+class GoalCommandAttemptDiagnostic(BaseModel):
+    """Latest navigation goal write, including the robot's acknowledgement outcome.
+
+    This is separate from ``GoalCommandDiagnostic`` on purpose: a command can be written to
+    the WebSocket and then rejected, time out, or receive a reply for another point.  The UI
+    needs to show that attempt without treating it as the goal currently owned by the robot.
+    """
+
+    attempt_id: str = Field(default_factory=lambda: str(uuid4()))
+    context: str
+    sent_at: datetime = Field(default_factory=utc_now)
+    base_motion_intent: Literal["moving", "stationary", "unknown"] = "moving"
+    payload: dict[str, Any] = Field(default_factory=dict)
+    outcome: Literal[
+        "awaiting_reply",
+        "accepted",
+        "rejected",
+        "reply_timeout",
+        "reply_mismatch",
+        "reply_error",
+    ] = "awaiting_reply"
+    completed_at: datetime | None = None
+    error: str | None = None
+
+
+class RobotHeartbeatDiagnostic(BaseModel):
+    """Latest whitelisted hardware heartbeat plus independently sourced physical axes."""
+
+    sequence: int = 0
+    received_at: datetime = Field(default_factory=utc_now)
+    yaw: float | None = None
+    yaw_received_at: datetime | None = None
+    pitch: float | None = None
+    pitch_received_at: datetime | None = None
+    gimbal_mode: int | str | None = None
+    task_goal_status: str | None = None
+    task_goal_status_received_at: datetime | None = None
+    task_goal_status_identity: dict[str, Any] | None = None
+    navigation_goal_status: str | None = None
+    navigation_goal_status_received_at: datetime | None = None
+    navigation_goal_status_identity: dict[str, Any] | None = None
+    object_status: str | None = None
+    object_status_received_at: datetime | None = None
+    object_status_identity: dict[str, Any] | None = None
+    path_file: str | None = None
+    goal_id: int | None = None
+    payload: dict[str, Any] = Field(default_factory=dict)
+
+
+class RobotDiagnostics(BaseModel):
+    last_goal_attempt: GoalCommandAttemptDiagnostic | None = None
+    last_goal_command: GoalCommandDiagnostic | None = None
+    last_gimbal_command: GimbalCommandDiagnostic | None = None
+    last_heartbeat: RobotHeartbeatDiagnostic | None = None
+
+
 class RobotState(BaseModel):
     connected: bool = False
     adapter: RobotMode = RobotMode.REAL
@@ -51,6 +129,9 @@ class RobotState(BaseModel):
     media_sync_error: str | None = None
     last_command: str | None = None
     error: str | None = None
+    # Diagnostic provenance is namespaced so ordinary state fields keep their existing API.
+    # Nothing here is persisted; it is only the latest bounded command/heartbeat snapshot.
+    diagnostics: RobotDiagnostics = Field(default_factory=RobotDiagnostics)
     updated_at: datetime = Field(default_factory=utc_now)
 
 
@@ -198,6 +279,8 @@ class GimbalScanConfig(BaseModel):
 class CruisePoint(BaseModel):
     path_name: str = Field(min_length=1, max_length=200)
     goal_id: int = Field(ge=0)
+    # Legacy route compatibility only. CruiseService deliberately ignores this value: product
+    # policy makes every cruise point navigation-only and treats object_status as diagnostics.
     goal_object: str | None = Field(default=None, max_length=200)
 
 
@@ -624,6 +707,11 @@ class SubtitleTrack(BaseModel):
     primary_colour: str = "FFFFFF"
     outline_colour: str = "000000"
     max_lines: int = Field(default=2, ge=1, le=4)
+    # Exact means the provider supplied a usable spoken clock. Estimated means the reviewed
+    # narration was spread over the known audio duration because that clock was unavailable.
+    # Persisting this with the layer lets exports and later manual fine-tuning retain the truth
+    # without changing how either kind is rendered.
+    timing_quality: Literal["exact", "estimated"] = "exact"
 
 
 class EditTimeline(BaseModel):
@@ -938,6 +1026,7 @@ class TTSAsset(BaseModel):
     text: str = ""
     duration_ms: int = 0
     word_count: int = 0
+    timing_quality: Literal["exact", "estimated", "unavailable"] = "unavailable"
     created_at: datetime = Field(default_factory=utc_now)
 
 

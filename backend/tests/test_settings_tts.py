@@ -8,6 +8,7 @@ from uuid import uuid4
 import pytest
 from pydantic import ValidationError
 
+from automated_video_editing_backend.api.routes import build_router
 from automated_video_editing_backend.core.models import (
     AutomationSettingsUpdate,
     CameraworkConfig,
@@ -16,10 +17,12 @@ from automated_video_editing_backend.core.models import (
     SettingsUpdateRequest,
     TTSGenerateRequest,
 )
-from automated_video_editing_backend.api.routes import build_router
-from automated_video_editing_backend.services.admin_access import AdminAccessService
 from automated_video_editing_backend.core.paths import generated_path
-from automated_video_editing_backend.services.media import MediaService
+from automated_video_editing_backend.services.admin_access import AdminAccessService
+from automated_video_editing_backend.services.media import (
+    MediaPoolPersistenceError,
+    MediaService,
+)
 from automated_video_editing_backend.services.settings import SettingsService
 from automated_video_editing_backend.services.tts import TTSService
 
@@ -271,6 +274,9 @@ async def test_tts_generation_creates_audio_asset(monkeypatch, tmp_path):
         }
     })
     media = MediaService(path=Path(tempfile.mkdtemp()) / "media-library.json")
+    # Publishing a generated narration makes it available in the media library, but the
+    # operator's working pool changes only through the explicit media-pool endpoint.
+    media.update_media_pool({})
     service = TTSService(settings, media)
     service.usage_path = tmp_path / "usage.json"  # keep the daily counter out of real data/tts
 
@@ -286,15 +292,110 @@ async def test_tts_generation_creates_audio_asset(monkeypatch, tmp_path):
     try:
         assert result.asset.word_count == 1
         assert result.asset.duration_ms == 320
+        assert result.asset.timing_quality == "exact"
         assert result.media_item.kind == "audio"
         assert result.media_item.metadata["role"] == "tts_voice"
+        assert result.media_item.metadata["timing_quality"] == "exact"
         assert result.words[0]["word"] == "六和桥"
         assert result.words[0]["start_time"] == 0
         assert result.words[0]["end_time"] == 120
+        assert json.loads(Path(result.asset.metadata_path).read_text(encoding="utf-8"))[
+            "timing_quality"
+        ] == "exact"
+        assert media.media_pool()["voiceover_media_ids"] == []
     finally:
         Path(result.asset.audio_path).unlink(missing_ok=True)
         if result.asset.metadata_path:
             Path(result.asset.metadata_path).unlink(missing_ok=True)
+
+
+@pytest.mark.asyncio
+async def test_tts_first_generation_seeds_only_preexisting_narrations(
+    monkeypatch, tts_root
+):
+    import automated_video_editing_backend.services.media as media_module
+
+    managed = {
+        "data": tts_root / "data",
+        "cache": tts_root / "cache",
+        "logs": tts_root / "logs",
+        "exports": tts_root / "exports",
+        "previews": tts_root / "previews",
+    }
+    monkeypatch.setattr(media_module, "GENERATED_DIRS", managed)
+    narration_dir = managed["data"] / "tts"
+    narration_dir.mkdir(parents=True)
+    older = narration_dir / "older.mp3"
+    older.write_bytes(b"old-audio")
+
+    settings = SettingsService(path=tts_root / "settings.json")
+    settings.replace_for_development({
+        "tts": {
+            "enabled": True,
+            "app_id": "app-id",
+            "access_token": "access-token",
+            "voice_type": "BV001_streaming",
+            "cluster": "volcano_tts",
+        }
+    })
+    media = MediaService(path=tts_root / "media-library.json")
+    assert not media.pool_path.exists()
+    service = TTSService(settings, media)
+    service.tts_dir = narration_dir
+    service.usage_path = tts_root / "usage.json"
+
+    async def fake_request(_text):
+        return b"new-audio", {
+            "duration_ms": 200,
+            "words": [{"word": "新", "start_time": 0, "end_time": 200}],
+            "phonemes": [],
+        }
+
+    monkeypatch.setattr(service, "_request_sync_tts", fake_request)
+    result = await service.synthesize(
+        TTSGenerateRequest(title="new narration", text="新"),
+        "新",
+    )
+
+    pool_ids = media.media_pool()["voiceover_media_ids"]
+    pooled_paths = {media.get(media_id).path for media_id in pool_ids}
+    assert str(older.resolve()) in pooled_paths
+    assert result.media_item.id not in pool_ids
+    assert media.get(result.media_item.id) is result.media_item
+
+
+@pytest.mark.asyncio
+async def test_tts_refuses_generation_before_quota_when_pool_cannot_initialize(
+    monkeypatch, tmp_path
+):
+    settings = SettingsService(path=tmp_path / "settings.json")
+    settings.replace_for_development({
+        "tts": {
+            "enabled": True,
+            "app_id": "app-id",
+            "access_token": "access-token",
+            "voice_type": "BV001_streaming",
+            "cluster": "volcano_tts",
+        }
+    })
+    media = MediaService(path=tmp_path / "media-library.json")
+    service = TTSService(settings, media)
+
+    def broken_pool():
+        raise MediaPoolPersistenceError("媒体池无法保存")
+
+    def must_not_read_quota():
+        raise AssertionError("quota must not be touched before the pool is durable")
+
+    async def must_not_request(_text):
+        raise AssertionError("provider must not be called before the pool is durable")
+
+    monkeypatch.setattr(media, "ensure_media_pool_initialized", broken_pool)
+    monkeypatch.setattr(service, "quota", must_not_read_quota)
+    monkeypatch.setattr(service, "_request_sync_tts", must_not_request)
+
+    with pytest.raises(MediaPoolPersistenceError, match="媒体池无法保存"):
+        await service.synthesize(TTSGenerateRequest(text="一句旁白"), "一句旁白")
 
 
 @pytest.mark.asyncio
@@ -511,6 +612,12 @@ async def test_voiceover_daily_limit_counts_and_blocks(monkeypatch, tmp_path):
     try:
         first = await service.synthesize(TTSGenerateRequest(title="a", text="一"), "一")
         assert (first.quota.used, first.quota.remaining) == (1, 1)
+        assert first.words == []
+        assert first.asset.timing_quality == "unavailable"
+        assert first.media_item.metadata["timing_quality"] == "unavailable"
+        assert json.loads(Path(first.asset.metadata_path).read_text(encoding="utf-8"))[
+            "timing_quality"
+        ] == "unavailable"
         made.append(first)
         second = await service.synthesize(TTSGenerateRequest(title="b", text="二"), "二")
         assert (second.quota.used, second.quota.remaining) == (2, 0)

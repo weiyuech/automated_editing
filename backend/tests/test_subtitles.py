@@ -933,6 +933,7 @@ def test_a_future_export_survives_restart_and_can_be_recut_from_its_master(
         primary_colour="FFF4CC",
         outline_colour="101010",
         max_lines=2,
+        timing_quality="estimated",
     )
     timeline = EditTimeline(
         title="restart source",
@@ -993,7 +994,7 @@ def test_a_future_export_survives_restart_and_can_be_recut_from_its_master(
         assert payload["cues"] == [cue.model_dump() for cue in expected.cues]
         for field in (
             "font", "size", "side_margin", "bottom_margin", "outline", "shadow",
-            "primary_colour", "outline_colour", "max_lines",
+            "primary_colour", "outline_colour", "max_lines", "timing_quality",
         ):
             assert payload[field] == getattr(expected, field)
 
@@ -1001,7 +1002,7 @@ def test_a_future_export_survives_restart_and_can_be_recut_from_its_master(
             field: payload[field]
             for field in (
                 "cues", "font", "size", "side_margin", "bottom_margin", "outline", "shadow",
-                "primary_colour", "outline_colour", "max_lines",
+                "primary_colour", "outline_colour", "max_lines", "timing_quality",
             )
         })
         recut_delivery = tmp_path / "微调成片.mp4"
@@ -1025,6 +1026,7 @@ def test_a_future_export_survives_restart_and_can_be_recut_from_its_master(
         assert recut_master == str(tmp_path / "微调成片 母版.mp4")
         assert renderer.read_subtitle_sidecar(recut_delivery)["cues"] == payload["cues"]
         assert renderer.read_subtitle_sidecar(recut_master)["cues"] == payload["cues"]
+        assert renderer.read_subtitle_sidecar(recut_master)["timing_quality"] == "estimated"
 
         def frame_at(path: str | Path, name: str):
             frame = tmp_path / f"{name}.png"
@@ -1132,6 +1134,116 @@ def test_word_timings_that_cannot_be_used_are_told_apart(tmp_path):
     assert "逐字时间戳" in problem
 
 
+def test_missing_word_clock_is_estimated_from_reviewed_text_and_audio_duration(tmp_path):
+    sidecar = tmp_path / "voice.json"
+    sidecar.write_text(json.dumps({
+        "text": "欢迎来到六和桥。请看新品体验台！",
+        "duration_ms": 4800,
+        "words": [],
+    }, ensure_ascii=False), encoding="utf-8")
+
+    words, quality, problem = subtitles.load_words_or_estimate(sidecar)
+
+    assert quality == "estimated"
+    assert "逐字时间戳" in problem
+    assert "".join(word["word"] for word in words) == "欢迎来到六和桥。请看新品体验台！"
+    assert words[0]["start_time"] == 0
+    assert words[-1]["end_time"] == 4800
+    assert all(
+        first["start_time"] <= first["end_time"] <= second["end_time"]
+        and first["start_time"] <= second["start_time"]
+        for first, second in itertools.pairwise(words)
+    )
+    cues = subtitles.cues_from_words(words, subtitles.SubtitleStyle(), 1280, 720)
+    assert [cue.text for cue in cues] == ["欢迎来到六和桥", "请看新品体验台"]
+    assert cues[-1].end == pytest.approx(4.8)
+
+
+def test_probed_audio_duration_enables_estimation_when_sidecar_has_no_duration(tmp_path):
+    sidecar = tmp_path / "voice.json"
+    sidecar.write_text(json.dumps({
+        "text": "这是已经确认的旁白",
+        "words": [],
+    }, ensure_ascii=False), encoding="utf-8")
+
+    words, quality, problem = subtitles.load_words_or_estimate(
+        sidecar,
+        audio_duration_seconds=2.75,
+    )
+
+    assert quality == "estimated"
+    assert problem is not None
+    assert "".join(word["word"] for word in words) == "这是已经确认的旁白"
+    assert words[-1]["end_time"] == 2750
+
+
+def test_invalid_utf8_sidecar_fails_safely_without_becoming_subtitle_text(tmp_path):
+    sidecar = tmp_path / "voice.json"
+    sidecar.write_bytes(b"\xff\xfe\x00")
+
+    words, quality, problem = subtitles.load_words_or_estimate(
+        sidecar,
+        audio_duration_seconds=2.0,
+    )
+
+    assert words == []
+    assert quality is None
+    assert "无法读取" in problem
+
+
+def test_boolean_duration_cannot_create_an_estimated_subtitle_clock(tmp_path):
+    sidecar = tmp_path / "voice.json"
+    sidecar.write_text(json.dumps({
+        "text": "已经确认的旁白",
+        "duration_ms": True,
+        "words": [],
+    }, ensure_ascii=False), encoding="utf-8")
+
+    words, quality, problem = subtitles.load_words_or_estimate(
+        sidecar,
+        audio_duration_seconds=True,
+    )
+
+    assert words == []
+    assert quality is None
+    assert "无法取得旁白时长" in problem
+
+
+def test_persisted_estimate_is_rebuilt_over_the_actual_audio_duration(tmp_path):
+    sidecar = tmp_path / "voice.json"
+    sidecar.write_text(json.dumps({
+        "text": "完整旁白不能提前消失",
+        "duration_ms": 1200,
+        "timing_quality": "estimated",
+        "words": subtitles.estimate_source_timing("完整旁白不能提前消失", 1200),
+    }, ensure_ascii=False), encoding="utf-8")
+
+    words, quality, problem = subtitles.load_words_or_estimate(
+        sidecar,
+        audio_duration_seconds=3.6,
+    )
+
+    assert quality == "estimated"
+    assert problem is None
+    assert "".join(word["word"] for word in words) == "完整旁白不能提前消失"
+    assert words[0]["start_time"] == 0
+    assert words[-1]["end_time"] == 3600
+
+
+def test_estimation_never_uses_provider_labels_and_requires_reviewed_text(tmp_path):
+    sidecar = tmp_path / "voice.json"
+    sidecar.write_text(json.dumps({
+        "duration_ms": 900,
+        "words": [{"word": "六合桥", "end_time": 700}],
+    }, ensure_ascii=False), encoding="utf-8")
+
+    words, quality, problem = subtitles.load_words_or_estimate(sidecar)
+
+    assert words == []
+    assert quality is None
+    assert "已确认的旁白文字" in problem
+
+
 def test_a_word_without_timing_is_dropped_rather_than_defaulted():
     """A record defaulted to 0.0 does not look broken — it looks like a word said at the start,
     and it drags the cue that contains it back to the beginning of the video."""
@@ -1165,7 +1277,7 @@ def test_sidecar_restores_reviewed_characters_without_changing_provider_timing(t
 
 def test_reordered_equal_length_labels_use_safe_proportional_timing():
     source = "今天经过六和桥"
-    words = subtitles.restore_source_spelling([
+    words, quality = subtitles.restore_source_spelling_with_quality([
         {"word": "今经过天", "start_time": 100, "end_time": 700},
         {"word": "六合桥", "start_time": 720, "end_time": 1300},
     ], source)
@@ -1176,10 +1288,45 @@ def test_reordered_equal_length_labels_use_safe_proportional_timing():
     assert [word["word"] for word in words] == list(source)
     assert words[0]["start_time"] == 100
     assert words[-1]["end_time"] == 1300
+    assert quality == "estimated"
     assert all(
         first["start_time"] <= first["end_time"] <= second["end_time"]
         for first, second in itertools.pairwise(words)
     )
+
+
+@pytest.mark.parametrize(
+    "raw_words",
+    [
+        [
+            {"word": "甲", "start_time": True, "end_time": 300},
+            {"word": "乙", "start_time": 500, "end_time": 900},
+        ],
+        [
+            {"word": "甲", "start_time": -100, "end_time": 300},
+            {"word": "乙", "start_time": 500, "end_time": 900},
+        ],
+        [
+            {"word": "甲", "start_time": 100, "end_time": 100},
+            {"word": "乙", "start_time": 500, "end_time": 900},
+        ],
+        [
+            {"word": "甲", "start_time": 0, "end_time": 600},
+            {"word": "乙", "start_time": 500, "end_time": 900},
+        ],
+    ],
+    ids=["boolean", "negative", "zero_length", "overlap"],
+)
+def test_damaged_provider_clocks_are_never_labeled_exact(raw_words):
+    words, quality = subtitles.restore_source_spelling_with_quality(
+        raw_words,
+        "甲乙",
+        duration_ms=1000,
+    )
+
+    assert quality != "exact"
+    if words:
+        assert "".join(word["word"] for word in words) == "甲乙"
 
 
 def test_missing_provider_character_is_aligned_to_neighbouring_token():
@@ -1342,7 +1489,11 @@ def test_the_planner_builds_cues_from_a_real_tts_sidecar(tmp_path, fonts_present
     join between them — where the sidecar lives, and in what shape — is the part that rots."""
     import json
 
-    from automated_video_editing_backend.core.models import EditJobRequest, MediaItem
+    from automated_video_editing_backend.core.models import (
+        AnalysisResult,
+        EditJobRequest,
+        MediaItem,
+    )
     from automated_video_editing_backend.services.timeline import EditPlanner
 
     audio = tmp_path / "旁白-001.mp3"
@@ -1350,7 +1501,12 @@ def test_the_planner_builds_cues_from_a_real_tts_sidecar(tmp_path, fonts_present
     sidecar = audio.with_suffix(".json")
     # The shape tts.py writes.
     sidecar.write_text(
-        json.dumps({"text": NARRATION, "duration_ms": 8000, "words": _words()},
+        json.dumps({
+            "text": NARRATION,
+            "duration_ms": 8000,
+            "timing_quality": "exact",
+            "words": _words(),
+        },
                    ensure_ascii=False),
         encoding="utf-8",
     )
@@ -1366,6 +1522,7 @@ def test_the_planner_builds_cues_from_a_real_tts_sidecar(tmp_path, fonts_present
 
     assert warnings == []
     assert track is not None and len(track.cues) >= 2
+    assert track.timing_quality == "exact"
     assert track.font == "smiley_sans"
     assert track.size == subtitles.SIZE_PRESETS["large"]
     assert "机器人" in track.cues[0].text
@@ -1374,6 +1531,103 @@ def test_the_planner_builds_cues_from_a_real_tts_sidecar(tmp_path, fonts_present
     unlinked = MediaItem(id="v2", name=audio.name, path=str(audio), kind="audio",
                          metadata={"role": "tts_voice"})
     assert EditPlanner()._subtitles(request, unlinked, 1280, 720, []) is not None
+
+    video = MediaItem(id="video", path=str(tmp_path / "video.mp4"), kind="video")
+    analysis = AnalysisResult(media_id=video.id, scenes=[{"start": 0, "end": 10}])
+    exact_timeline = EditPlanner().plan(
+        request.model_copy(update={"media_ids": [video.id]}),
+        [video],
+        [analysis],
+        None,
+        voiceover,
+        voiceover_duration=8.0,
+    )
+    assert exact_timeline.planning_diagnostics["subtitles"] == {
+        "requested": True,
+        "mode": "exact",
+        "label": "精确字幕",
+    }
+
+
+def test_planner_marks_estimated_subtitles_and_keeps_narration_when_estimation_is_impossible(
+    tmp_path, fonts_present,
+):
+    from automated_video_editing_backend.core.models import (
+        AnalysisResult,
+        EditJobRequest,
+        MediaItem,
+    )
+    from automated_video_editing_backend.services.timeline import EditPlanner
+
+    audio = tmp_path / "旁白.mp3"
+    audio.write_bytes(b"not really audio")
+    sidecar = audio.with_suffix(".json")
+    sidecar.write_text(json.dumps({
+        "text": "欢迎来到六和桥。这里是新品体验台。",
+        "words": [],
+    }, ensure_ascii=False), encoding="utf-8")
+    voiceover = MediaItem(
+        id="estimated",
+        path=str(audio),
+        kind="audio",
+        metadata={"role": "tts_voice", "metadata_path": str(sidecar)},
+    )
+    request = EditJobRequest(title="t", output_name="t.mp4", subtitles=True)
+    warnings: list[str] = []
+
+    track = EditPlanner()._subtitles(
+        request, voiceover, 1280, 720, warnings, voiceover_duration=4.2,
+    )
+
+    assert track is not None
+    assert track.timing_quality == "estimated"
+    assert "".join(cue.text for cue in track.cues) == "欢迎来到六和桥这里是新品体验台"
+    assert track.cues[-1].end == pytest.approx(4.2)
+    assert any("估算字幕" in warning for warning in warnings)
+
+    video = MediaItem(id="video", path=str(tmp_path / "video.mp4"), kind="video")
+    analysis = AnalysisResult(media_id=video.id, scenes=[{"start": 0, "end": 6}])
+    estimated_timeline = EditPlanner().plan(
+        request,
+        [video],
+        [analysis],
+        None,
+        voiceover,
+        voiceover_duration=4.2,
+    )
+    assert estimated_timeline.planning_diagnostics["subtitles"] == {
+        "requested": True,
+        "mode": "estimated",
+        "label": "估算字幕",
+    }
+
+    sidecar.write_text(json.dumps({"words": []}), encoding="utf-8")
+    narration_only_warnings: list[str] = []
+    unavailable = EditPlanner()._subtitles(
+        request,
+        voiceover,
+        1280,
+        720,
+        narration_only_warnings,
+        voiceover_duration=4.2,
+    )
+    assert unavailable is None
+    assert any("成片仍保留旁白" in warning for warning in narration_only_warnings)
+
+    narration_only_timeline = EditPlanner().plan(
+        request,
+        [video],
+        [analysis],
+        None,
+        voiceover,
+        voiceover_duration=4.2,
+    )
+    assert narration_only_timeline.subtitles is None
+    assert narration_only_timeline.planning_diagnostics["subtitles"] == {
+        "requested": True,
+        "mode": "narration_only",
+        "label": "仅旁白",
+    }
 
 
 def test_an_ffmpeg_without_libass_refuses_instead_of_dropping_the_text(tmp_path, monkeypatch):

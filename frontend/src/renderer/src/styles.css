@@ -283,6 +283,20 @@ p { margin: 6px 0 0; color: var(--text-muted); }
 .camera-settings-section { border-top: 1px solid var(--border); margin-top: 8px; padding-top: 18px; scroll-margin-top: 24px; }
 .camera-settings-section > div:first-child { margin-bottom: 12px; }
 .camera-settings-section > div:first-child strong { color: var(--text); font-size: 15px; }
+.camera-diagnostics-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.diagnostic-verdict { flex: none; padding: 4px 9px; border: 1px solid var(--border); border-radius: 999px; color: var(--text-muted); background: rgba(255, 255, 255, .48); font-size: 11px; font-weight: 700; }
+.diagnostic-verdict.success { color: var(--teal); border-color: rgba(39, 143, 138, .34); background: rgba(39, 143, 138, .08); }
+.diagnostic-verdict.moving { color: var(--purple-strong); border-color: rgba(113, 86, 255, .34); background: rgba(113, 86, 255, .08); }
+.diagnostic-verdict.warning { color: var(--amber); border-color: rgba(217, 151, 55, .38); background: rgba(217, 151, 55, .09); }
+.diagnostic-verdict.danger { color: var(--rose); border-color: rgba(221, 92, 101, .34); background: rgba(221, 92, 101, .08); }
+.camera-diagnostic-compare { overflow: hidden; border: 1px solid var(--border); border-radius: 10px; background: rgba(143, 91, 216, .04); }
+.camera-diagnostic-compare > div { display: grid; grid-template-columns: 76px repeat(2, minmax(0, 1fr)); align-items: center; gap: 14px; min-width: 0; padding: 9px 13px; border-top: 1px solid rgba(143, 91, 216, .12); }
+.camera-diagnostic-compare > div:first-child { border-top: 0; }
+.camera-diagnostic-compare-head { background: rgba(143, 91, 216, .055); }
+.camera-diagnostic-compare span { color: var(--text-muted); font-size: 11px; }
+.camera-diagnostic-compare strong { min-width: 0; color: var(--text-soft); font-size: 12px; font-weight: 700; }
+.camera-diagnostic-compare-head span { color: var(--text-soft); font-weight: 700; }
+.camera-diagnostic-compare .muted { color: var(--text-muted); }
 .compact-field { padding: 8px 9px; }
 .timeline-head,
 
@@ -478,7 +492,7 @@ p { margin: 6px 0 0; color: var(--text-muted); }
 .cruise-add { display: grid; grid-template-columns: minmax(0, 1.1fr) 120px minmax(0, 1.3fr) auto; gap: 10px; align-items: center; }
 .cruise-save { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 10px; align-items: center; }
 .form-hint { margin: 0; color: var(--text-muted); font-size: 12px; line-height: 1.65; }
-.cruise-table .table-row { grid-template-columns: 64px minmax(180px, 1fr) minmax(140px, 1fr) 230px; align-items: center; }
+.cruise-table .table-row { grid-template-columns: 64px minmax(220px, 1fr) 230px; align-items: center; }
 .cruise-run-table .table-row { grid-template-columns: 64px minmax(180px, 1fr) minmax(130px, 1fr) minmax(150px, 1fr); align-items: center; }
 .cruise-route {
   display: flex; align-items: center; justify-content: space-between; gap: 12px;
@@ -763,6 +777,7 @@ p { margin: 6px 0 0; color: var(--text-muted); }
 @media (max-width: 900px) {
   .framing-layout { grid-template-columns: 1fr; }
   .framing-preview-shell { min-height: 220px; }
+  .camera-diagnostic-compare > div { grid-template-columns: 56px repeat(2, minmax(0, 1fr)); gap: 8px; }
 }
 
 /* 媒体库: a finished video and its subtitle-free master shown as one openable line. */

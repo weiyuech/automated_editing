@@ -1,13 +1,17 @@
 {
   "name": "automated-video-editing-frontend",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "private": true,
+  "packageManager": "pnpm@11.0.0",
+  "engines": {
+    "node": ">=22.13.0"
+  },
   "type": "module",
   "main": "out/main/index.js",
   "scripts": {
     "dev": "electron-vite dev",
     "build": "electron-vite build",
-    "test:main": "node --test tests/main-path-policy.test.mjs",
+    "test:main": "node --test tests/*.test.mjs",
     "preview": "electron-vite preview",
     "dist:win": "electron-vite build && electron-builder --win nsis --x64 --publish never",
     "dist:win:external": "electron-vite build && electron-builder --config electron-builder.external.json --win nsis --x64 --publish never"

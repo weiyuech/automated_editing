@@ -25,7 +25,7 @@ class FakeRobot:
     def heartbeat_yaw(self):
         return self.state.yaw
 
-    async def sweep_camera(self, target_yaw, yaw_speed):
+    async def sweep_camera(self, target_yaw, yaw_speed, *, context="camera_sweep"):
         self.sweeps.append((target_yaw, yaw_speed))
         self.state.yaw = target_yaw
         return self.state
@@ -110,7 +110,7 @@ async def test_framing_preview_is_not_downloaded_before_the_camera_restores():
             super().__init__()
             self.restore_attempts = 0
 
-        async def sweep_camera(self, target_yaw, yaw_speed):
+        async def sweep_camera(self, target_yaw, yaw_speed, *, context="camera_sweep"):
             if target_yaw == 12:
                 self.restore_attempts += 1
                 raise ConnectionError("gimbal restore failed")

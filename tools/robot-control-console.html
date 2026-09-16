@@ -1,264 +1,1099 @@
 <!doctype html>
-<html lang="zh">
+<html lang="zh-CN">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>机器人控制测试台</title>
+<title>机器人拍摄运镜测试台</title>
 <style>
 :root{
-  --bg:#f8f7ff; --bg-deep:#eef0ff; --surface:rgba(255,255,255,.66);
-  --border:rgba(89,94,214,.18); --border-strong:rgba(91,78,223,.34);
+  --bg:#f8f7ff; --bg-deep:#eef0ff; --surface:rgba(255,255,255,.68);
+  --border:rgba(89,94,214,.18); --border-strong:rgba(91,78,223,.38);
   --text:#211a43; --text-soft:#514977; --text-muted:#756b9d;
   --purple:#785cff; --purple-strong:#5539d9; --periwinkle:#6682ff; --lilac:#b58bff;
-  --lavender:#f7f3ff; --teal:#2f9e7d; --rose:#c44973; --amber:#9a690e;
+  --teal:#2f9e7d; --rose:#c44973; --amber:#9a690e;
 }
 *{ box-sizing:border-box; }
-body{ margin:0; background:linear-gradient(180deg,var(--bg),var(--bg-deep)); color:var(--text);
-  font-family:-apple-system,system-ui,"PingFang SC","Microsoft YaHei",sans-serif; padding:20px; line-height:1.5; }
-h1{ font-size:20px; margin:0; color:var(--purple-strong); }
-.sub{ color:var(--text-muted); font-size:13px; margin:2px 0 16px; }
-.layout{ display:grid; grid-template-columns:minmax(0,1fr) minmax(0,1fr); gap:14px; align-items:start; }
-@media(max-width:860px){ .layout{ grid-template-columns:1fr; } }
-.panel{ background:linear-gradient(145deg,rgba(255,255,255,.7),rgba(244,242,255,.55)); border:1px solid var(--border);
-  border-radius:10px; padding:14px; backdrop-filter:blur(10px); box-shadow:0 12px 30px rgba(82,70,170,.08); margin-bottom:14px; }
-.panel h2{ font-size:12px; letter-spacing:.08em; text-transform:uppercase; color:var(--text-muted); margin:0 0 12px; font-weight:800; }
-label{ font-size:12px; color:var(--text-muted); font-weight:700; }
-input,select,textarea,button{ font-family:inherit; font-size:14px; }
-input,select,textarea{ width:100%; border:1px solid var(--border); background:rgba(255,255,255,.7); color:var(--text);
-  border-radius:7px; padding:9px 10px; }
-input:focus,select:focus,textarea:focus{ outline:none; border-color:var(--border-strong); }
-button{ border:1px solid var(--border); background:rgba(255,255,255,.6); color:var(--text); border-radius:7px;
-  padding:9px 14px; cursor:pointer; font-weight:700; }
-button:hover{ border-color:var(--border-strong); background:rgba(245,242,255,.9); }
-button.primary{ background:linear-gradient(135deg,var(--periwinkle),var(--purple) 54%,var(--lilac)); border-color:var(--border-strong);
-  color:#fffaff; }
-button:disabled{ opacity:.5; cursor:not-allowed; }
+body{
+  margin:0; padding:20px; min-height:100vh;
+  background:linear-gradient(180deg,var(--bg),var(--bg-deep)); color:var(--text);
+  font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;
+  line-height:1.5;
+}
+h1{ margin:0; color:var(--purple-strong); font-size:21px; }
+.sub{ margin:3px 0 16px; color:var(--text-muted); font-size:13px; }
+.layout{ display:grid; grid-template-columns:minmax(0,1.35fr) minmax(310px,.65fr); gap:14px; align-items:start; }
+@media(max-width:900px){ .layout{ grid-template-columns:1fr; } }
+.panel{
+  margin-bottom:14px; padding:14px; border:1px solid var(--border); border-radius:10px;
+  background:linear-gradient(145deg,rgba(255,255,255,.74),rgba(244,242,255,.58));
+  box-shadow:0 12px 30px rgba(82,70,170,.08); backdrop-filter:blur(10px);
+}
+.panel h2{ margin:0 0 12px; color:var(--text-muted); font-size:12px; font-weight:800; letter-spacing:.08em; text-transform:uppercase; }
 .row{ display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
-.field{ display:flex; flex-direction:column; gap:4px; }
-.triple{ display:grid; grid-template-columns:56px 1fr 1fr 1fr; gap:8px; align-items:center; margin-bottom:8px; }
-.triple > span{ color:var(--text-soft); font-weight:800; font-size:13px; }
-.axis-head{ display:grid; grid-template-columns:56px 1fr 1fr 1fr; gap:8px; margin-bottom:4px; }
-.axis-head span{ font-size:11px; color:var(--text-muted); text-align:center; }
-.axis-head span:first-child{ text-align:left; }
-.hint{ font-size:11px; color:var(--text-muted); margin:4px 0 0; }
-.dot{ width:9px; height:9px; border-radius:50%; background:#c3c3d6; display:inline-block; }
-.dot.on{ background:var(--teal); box-shadow:0 0 8px rgba(47,158,125,.6); }
+.spacer{ flex:1; }
+label{ color:var(--text-muted); font-size:12px; font-weight:700; }
+input,button{ font:inherit; font-size:14px; }
+input{
+  width:100%; padding:9px 10px; border:1px solid var(--border); border-radius:7px;
+  background:rgba(255,255,255,.74); color:var(--text); font-variant-numeric:tabular-nums;
+}
+input:focus{ outline:none; border-color:var(--border-strong); box-shadow:0 0 0 2px rgba(120,92,255,.08); }
+input:disabled{ background:rgba(238,237,247,.6); color:var(--text-muted); }
+button{
+  padding:9px 14px; border:1px solid var(--border); border-radius:7px; cursor:pointer;
+  background:rgba(255,255,255,.68); color:var(--text); font-weight:700;
+}
+button:hover{ border-color:var(--border-strong); background:rgba(245,242,255,.94); }
+button.primary{
+  border-color:var(--border-strong); color:#fffaff;
+  background:linear-gradient(135deg,var(--periwinkle),var(--purple) 54%,var(--lilac));
+}
+button.danger{ border-color:rgba(196,73,115,.28); color:var(--rose); }
+button:disabled{ opacity:.48; cursor:not-allowed; }
+.dot{ display:inline-block; width:9px; height:9px; border-radius:50%; background:#c3c3d6; }
+.dot.on{ background:var(--teal); box-shadow:0 0 8px rgba(47,158,125,.58); }
 .dot.err{ background:var(--rose); }
 .dot.wait{ background:var(--amber); }
-.status-strip{ display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:8px; }
-.status-strip div{ border:1px solid var(--border); border-radius:8px; background:rgba(255,255,255,.5); padding:8px 10px; }
-.status-strip span{ display:block; font-size:11px; color:var(--text-muted); }
-.status-strip strong{ font-size:15px; font-variant-numeric:tabular-nums; }
-pre.preview{ background:rgba(30,22,60,.05); border:1px solid var(--border); border-radius:7px; padding:8px 10px; margin:8px 0 0;
-  font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:12px; white-space:pre-wrap; word-break:break-all; color:var(--text-soft); }
-.log{ height:420px; overflow:auto; background:rgba(30,22,60,.04); border:1px solid var(--border); border-radius:8px; padding:8px;
-  font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:12px; }
-.log .line{ padding:4px 6px; border-bottom:1px solid rgba(89,94,214,.08); white-space:pre-wrap; word-break:break-all; }
-.log .t{ color:var(--text-muted); }
+.hint{ margin:5px 0 0; color:var(--text-muted); font-size:12px; }
+.direction-note{ padding:9px 11px; border-left:3px solid rgba(120,92,255,.48); background:rgba(120,92,255,.05); }
+.tabs{ display:flex; gap:8px; margin-bottom:14px; border-bottom:1px solid var(--border); }
+.tab{
+  margin-bottom:-1px; padding:9px 16px; border:0; border-bottom:2px solid transparent;
+  border-radius:7px 7px 0 0; background:transparent; color:var(--text-muted);
+}
+.tab.active{ border-bottom-color:var(--purple); background:rgba(120,92,255,.07); color:var(--purple-strong); }
+.tab-panel[hidden]{ display:none; }
+.form-grid{ display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:10px; }
+@media(max-width:620px){ .form-grid{ grid-template-columns:1fr; } }
+.field{ display:flex; flex-direction:column; gap:4px; }
+.group{
+  margin:12px 0; padding:12px; border:1px solid var(--border); border-radius:9px;
+  background:rgba(255,255,255,.38);
+}
+.group-title{ display:block; margin-bottom:8px; color:var(--text-soft); font-size:13px; font-weight:800; }
+.status-line{ min-height:22px; margin:10px 0 0; font-size:13px; color:var(--text-soft); }
+.status-line.success{ color:var(--teal); }
+.status-line.warn{ color:var(--amber); }
+.status-line.error{ color:var(--rose); }
+.actual-grid{ display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:10px; }
+.actual-card{
+  padding:13px; border:1px solid var(--border); border-radius:9px;
+  background:linear-gradient(145deg,rgba(255,255,255,.68),rgba(120,92,255,.045));
+}
+.actual-card span{ display:block; color:var(--text-muted); font-size:12px; }
+.actual-card strong{ display:block; margin-top:3px; font-size:25px; font-variant-numeric:tabular-nums; }
+.compare{
+  display:grid; grid-template-columns:58px 1fr 1fr; gap:0; overflow:hidden;
+  border:1px solid var(--border); border-radius:9px; font-variant-numeric:tabular-nums;
+}
+.compare > div{ padding:9px 10px; border-bottom:1px solid var(--border); }
+.compare > div:nth-last-child(-n+3){ border-bottom:0; }
+.compare .head{ background:rgba(120,92,255,.055); color:var(--text-muted); font-size:11px; font-weight:700; }
+.compare .axis{ color:var(--text-soft); font-size:13px; font-weight:800; }
+.compare .value{ color:var(--text); text-align:right; }
+.mode-pill{
+  display:inline-flex; align-items:center; min-height:25px; padding:3px 9px; border-radius:999px;
+  background:rgba(120,92,255,.09); color:var(--purple-strong); font-size:12px; font-weight:800;
+}
+details{ border-top:1px solid var(--border); margin-top:12px; padding-top:10px; }
+summary{ cursor:pointer; color:var(--text-muted); font-size:12px; font-weight:700; }
+.log{
+  height:220px; margin-top:8px; padding:8px; overflow:auto; border:1px solid var(--border); border-radius:8px;
+  background:rgba(30,22,60,.04); font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:11px;
+}
+.log .line{ padding:4px 5px; border-bottom:1px solid rgba(89,94,214,.08); white-space:pre-wrap; word-break:break-all; }
+.log .time{ color:var(--text-muted); }
 .log .send{ color:var(--purple-strong); }
 .log .recv{ color:var(--teal); }
 .log .sys{ color:var(--amber); }
 .log .err{ color:var(--rose); }
-.tag{ font-weight:800; margin-right:6px; }
-.spacer{ flex:1; }
-.mb8{ margin-bottom:8px; }
 </style>
 </head>
 <body>
-  <h1>机器人控制测试台</h1>
+  <h1>机器人拍摄运镜测试台</h1>
+  <p class="sub">只验证水平与俯仰指令；所有云台指令固定使用 mode 1。</p>
 
-  <!-- 连接 -->
   <div class="panel">
-    <h2>连接</h2>
+    <h2>连接机器人</h2>
     <div class="row">
       <span class="dot" id="dot"></span>
       <strong id="connText" style="min-width:78px">未连接</strong>
-      <input id="url" placeholder="ws://机器人IP:端口/…" style="flex:1; min-width:220px">
+      <input id="url" placeholder="ws://机器人IP:端口/…" style="flex:1;min-width:220px">
       <button class="primary" id="btnConn">连接</button>
       <button id="btnDisc" disabled>断开</button>
     </div>
     <p class="hint" id="connErr"></p>
+    <p class="hint">直连测试前请退出其他机器人控制程序，避免同一机器人连接被重复占用。</p>
   </div>
 
   <div class="layout">
-    <!-- 左列：指令 -->
-    <div>
-      <!-- 云台控制 -->
+    <main class="panel">
+      <div class="tabs" role="tablist" aria-label="运镜测试方式">
+        <button class="tab active" id="tabManual" role="tab" aria-selected="true" aria-controls="manualPanel">镜头控制</button>
+        <button class="tab" id="tabAuto" role="tab" aria-selected="false" aria-controls="autoPanel">自动运镜（巡游）</button>
+      </div>
+
+      <section class="tab-panel" id="manualPanel" role="tabpanel" aria-labelledby="tabManual">
+        <p class="hint direction-note">水平负数＝向右，正数＝向左；俯仰负数＝向上，正数＝向下。起始角优先采用心跳实测值；没有完整心跳时采用上一目标，首次按 0°。</p>
+        <div class="group">
+          <span class="group-title">发送目标位置</span>
+          <div class="form-grid">
+            <label class="field">目标水平角（−90°～90°）
+              <input id="manualYaw" type="number" min="-90" max="90" step="1" value="0">
+            </label>
+            <label class="field">水平速度（2～5°/秒）
+              <input id="manualYawSpeed" type="number" min="2" max="5" step="1" value="5">
+            </label>
+            <label class="field">目标俯仰角（−60°～15°）
+              <input id="manualPitch" type="number" min="-60" max="15" step="1" value="0">
+            </label>
+            <label class="field">俯仰速度（2～5°/秒）
+              <input id="manualPitchSpeed" type="number" min="2" max="5" step="1" value="5">
+            </label>
+          </div>
+        </div>
+        <div class="row">
+          <button class="primary" id="manualSend">发送水平＋俯仰</button>
+          <button id="manualCenter">回到 0° / 0°</button>
+        </div>
+        <p class="status-line" id="manualStatus">连接后即可发送；心跳用于核对实际位置。</p>
+      </section>
+
+      <section class="tab-panel" id="autoPanel" role="tabpanel" aria-labelledby="tabAuto" hidden>
+        <p class="hint direction-note">复现正式应用的巡游行进逻辑：50% 单次运镜、30% 左右往返、20% 回锚点；已经在锚点时不会原地等待。</p>
+        <div class="group">
+          <span class="group-title">锚点</span>
+          <div class="form-grid">
+            <label class="field">锚点水平角（−90°～90°）
+              <input class="auto-input" id="anchorYaw" type="number" min="-90" max="90" step="1" value="0">
+            </label>
+            <label class="field">锚点俯仰角（−60°～15°）
+              <input class="auto-input" id="anchorPitch" type="number" min="-60" max="15" step="1" value="0">
+            </label>
+          </div>
+          <div class="row" style="margin-top:8px"><button id="useActualAnchor">使用当前实测角度</button></div>
+        </div>
+
+        <div class="group">
+          <span class="group-title">允许范围（绝对角度）</span>
+          <div class="form-grid">
+            <label class="field">水平右边界（−90°～90°）
+              <input class="auto-input" id="yawMin" type="number" min="-90" max="90" step="1" value="-60">
+            </label>
+            <label class="field">水平左边界（−90°～90°）
+              <input class="auto-input" id="yawMax" type="number" min="-90" max="90" step="1" value="60">
+            </label>
+            <label class="field">俯仰上边界（−60°～15°）
+              <input class="auto-input" id="pitchMin" type="number" min="-60" max="15" step="1" value="-15">
+            </label>
+            <label class="field">俯仰下边界（−60°～15°）
+              <input class="auto-input" id="pitchMax" type="number" min="-60" max="15" step="1" value="15">
+            </label>
+          </div>
+        </div>
+
+        <div class="group">
+          <span class="group-title">速度范围</span>
+          <div class="form-grid">
+            <label class="field">最慢（2～5°/秒）
+              <input class="auto-input" id="speedMin" type="number" min="2" max="5" step="1" value="2">
+            </label>
+            <label class="field">最快（2～5°/秒）
+              <input class="auto-input" id="speedMax" type="number" min="2" max="5" step="1" value="5">
+            </label>
+          </div>
+        </div>
+
+        <div class="row" style="margin-bottom:8px">
+          <button id="saveAutoConfig">保存自动运镜设置</button>
+          <span class="mode-pill" id="configState">尚未保存</span>
+        </div>
+        <div class="row">
+          <button class="primary" id="autoStart">开始模拟行进</button>
+          <button id="autoArrive" disabled>模拟到达点位</button>
+          <button class="danger" id="autoStop" disabled>停止并回锚点</button>
+        </div>
+        <p class="status-line" id="autoStatus">保存设置后，开始前会先回锚点；模拟到达后也会回锚点。</p>
+      </section>
+    </main>
+
+    <aside>
       <div class="panel">
-        <h2>云台控制 · gimbal_control</h2>
-        <div class="field mb8" style="max-width:180px">
-          <label>mode（模式）</label>
-          <input id="g_mode" type="number" step="1" value="0">
+        <h2>心跳实测位置</h2>
+        <div class="actual-grid">
+          <div class="actual-card"><span>实际水平角</span><strong id="actualYaw">–</strong></div>
+          <div class="actual-card"><span>实际俯仰角</span><strong id="actualPitch">–</strong></div>
         </div>
-        <p class="hint">start=起始角，end=目标角，speed=每秒多少度。文档未定义 mode 各值含义——可试 0/1/2 观察是否会“锁定/随动”。</p>
+        <p class="hint" id="heartbeatHint">尚未收到有效的云台心跳。</p>
+      </div>
 
-        <div class="axis-head"><span></span><span>start</span><span>speed</span><span>end</span></div>
-        <div class="triple"><span>偏航</span>
-          <input id="g_yaw_start" type="number" step="0.1" value="0">
-          <input id="g_yaw_speed" type="number" step="0.1" value="5">
-          <input id="g_yaw_end" type="number" step="0.1" value="0"></div>
-        <div class="triple"><span>俯仰</span>
-          <input id="g_pitch_start" type="number" step="0.1" value="0">
-          <input id="g_pitch_speed" type="number" step="0.1" value="0">
-          <input id="g_pitch_end" type="number" step="0.1" value="0"></div>
-        <div class="triple"><span>变焦</span>
-          <input id="g_zoom_start" type="number" step="0.1" value="1">
-          <input id="g_zoom_speed" type="number" step="0.1" value="0">
-          <input id="g_zoom_end" type="number" step="0.1" value="1"></div>
-
-        <div class="row mb8">
-          <button id="p_center">归中 (0°)</button>
-          <button id="p_goto">去到 end（从当前角）</button>
-          <button id="p_sweep">扫视 ±45°</button>
+      <div class="panel">
+        <h2>发送目标与实测偏差</h2>
+        <div class="compare">
+          <div class="head"></div><div class="head" style="text-align:right">发送目标</div><div class="head" style="text-align:right">实测偏差</div>
+          <div class="axis">水平</div><div class="value" id="targetYaw">–</div><div class="value" id="errorYaw">–</div>
+          <div class="axis">俯仰</div><div class="value" id="targetPitch">–</div><div class="value" id="errorPitch">–</div>
         </div>
-        <pre class="preview" id="g_preview"></pre>
         <div class="row" style="margin-top:10px">
-          <button class="primary" id="g_send">发送云台指令</button>
+          <span class="mode-pill" id="targetKind">尚未发送</span>
+          <span class="status-line" id="targetStatus" style="margin:0">等待目标。</span>
         </div>
+        <details>
+          <summary>通信记录（心跳仅显示状态变化）</summary>
+          <div class="row" style="margin-top:8px"><span class="spacer"></span><button id="logClear">清空</button></div>
+          <div class="log" id="log"></div>
+        </details>
       </div>
-
-    </div>
-
-    <!-- 右列：状态 + 日志 -->
-    <div>
-      <div class="panel">
-        <h2>当前状态（来自心跳）</h2>
-        <div class="status-strip">
-          <div><span>偏航</span><strong id="st_yaw">–</strong></div>
-          <div><span>俯仰</span><strong id="st_pitch">–</strong></div>
-          <div><span>电量</span><strong id="st_batt">–</strong></div>
-          <div><span>录制</span><strong id="st_rec">–</strong></div>
-        </div>
-        <p class="hint" id="st_extra"></p>
-      </div>
-
-      <div class="panel">
-        <h2>实时日志 <span class="hint" style="text-transform:none">（<span class="send">→ 发送</span> / <span class="recv">← 接收</span>）</span></h2>
-        <div class="row mb8">
-          <label class="row" style="gap:6px"><input type="checkbox" id="hbFilter" style="width:auto"> 隐藏纯心跳</label>
-          <span class="spacer"></span>
-          <button id="log_pause">暂停</button>
-          <button id="log_clear">清空</button>
-        </div>
-        <div class="log" id="log"></div>
-      </div>
-    </div>
+    </aside>
   </div>
 
 <script>
 (function(){
   "use strict";
-  var ws = null, paused = false, lastYaw = null, lastPitch = null;
+
+  var MODE = 1;
+  var POSE_TOLERANCE = 2;
+  var POSE_STABLE_SAMPLES = 2;
+  var LEG_MARGIN_SECONDS = 0.6;
+  var HEARTBEAT_MAX_AGE_MS = 5000;
+  var CONNECTION_NOTICE_MS = 5000;
+  var MODE_WEIGHTS = [["wander", 50], ["pingpong", 30], ["anchor", 20]];
+  var OPPOSITE_PROBABILITY = 0.80;
+  var OPPOSITE_DISTANCE = [0.60, 0.90];
+  var OUTWARD_DISTANCE = [0.10, 0.30];
+  var CENTER_DISTANCE = [0.40, 0.80];
+  // Direction selection only; targets still use the complete configured yaw range.
+  var DIRECTION_ROOM_DEG = 10;
+  var CONFIG_STORAGE_KEY = "robot_camerawork_yaw_pitch_v1";
+
+  var ws = null;
+  var connectionNoticeTimer = null;
+  var lastYaw = null;
+  var lastPitch = null;
+  var lastYawAt = 0;
+  var lastPitchAt = 0;
+  var estimatedYaw = 0;
+  var estimatedPitch = 0;
+  var yawRevision = 0;
+  var pitchRevision = 0;
+  var heartbeatDiagnostic = "";
+  var currentTarget = null;
+  var autoRunning = false;
+  var autoBusy = false;
+  var autoToken = 0;
+  var manualToken = 0;
+  var activeAutoConfig = null;
+  var autoConfigured = false;
   var $ = function(id){ return document.getElementById(id); };
 
-  // ---- connection ----
-  var savedUrl = localStorage.getItem("robot_ws_url");
-  if (savedUrl) $("url").value = savedUrl;
-
-  function setDot(cls, text){ $("dot").className = "dot" + (cls ? " " + cls : ""); $("connText").textContent = text; }
-
-  function connect(){
-    var url = $("url").value.trim();
-    $("connErr").textContent = "";
-    if(!url){ $("connErr").textContent = "请先填写机器人 ws:// 地址。"; return; }
-    localStorage.setItem("robot_ws_url", url);
-    try { ws = new WebSocket(url); }
-    catch(e){ $("connErr").textContent = "地址无效：" + e.message; return; }
-    setDot("wait", "连接中…"); $("btnConn").disabled = true;
-    ws.onopen = function(){ setDot("on", "已连接"); $("btnDisc").disabled = false; logLine("sys", "sys", "WebSocket 已连接 " + url); };
-    ws.onmessage = function(ev){ onMessage(ev.data); };
-    ws.onerror = function(){ $("connErr").textContent = "连接出错（检查地址、机器人是否在线、是否同一网络）。"; };
-    ws.onclose = function(ev){
-      setDot(ev.wasClean ? "" : "err", "未连接"); $("btnConn").disabled = false; $("btnDisc").disabled = true; ws = null;
-      logLine("sys", "err", "连接已关闭 (code " + ev.code + ")");
+  function setConnectionState(kind, text){
+    $("dot").className = "dot" + (kind ? " " + kind : "");
+    $("connText").textContent = text;
+  }
+  // Keep the original console's numeric OPEN check for older embedded browsers.
+  function isSocketOpen(){ return Boolean(ws && ws.readyState === 1); }
+  function hasFreshYaw(){ return Number.isFinite(lastYaw) && Date.now() - lastYawAt <= HEARTBEAT_MAX_AGE_MS; }
+  function hasFreshPitch(){ return Number.isFinite(lastPitch) && Date.now() - lastPitchAt <= HEARTBEAT_MAX_AGE_MS; }
+  function hasFreshPose(){
+    return hasFreshYaw() && hasFreshPitch();
+  }
+  function commandStartPose(){
+    return {
+      yaw: hasFreshYaw() ? lastYaw : estimatedYaw,
+      pitch: hasFreshPitch() ? lastPitch : estimatedPitch
     };
   }
-  function disconnect(){ if(ws){ ws.close(); } }
+  function poseRevisions(){ return { yaw:yawRevision, pitch:pitchRevision }; }
 
-  function sendObj(obj){
-    if(!ws || ws.readyState !== 1){ $("connErr").textContent = "尚未连接，无法发送。"; logLine("sys","err","未连接，发送被忽略"); return; }
-    var text = JSON.stringify(obj);
-    ws.send(text);
-    logLine("→", "send", pretty(obj));
+  function resetPose(){
+    lastYaw = null;
+    lastPitch = null;
+    lastYawAt = 0;
+    lastPitchAt = 0;
+    estimatedYaw = 0;
+    estimatedPitch = 0;
+    yawRevision = 0;
+    pitchRevision = 0;
+    heartbeatDiagnostic = "";
+    currentTarget = null;
+    renderActualPose();
+    renderComparison();
+    $("targetKind").textContent = "尚未发送";
+    setTargetStatus("等待目标。", "");
   }
 
-  // ---- gimbal ----
-  function num(id){ var v = parseFloat($(id).value); return isFinite(v) ? v : 0; }
-  function buildGimbal(){
-    return { gimbal_control: {
-      mode: Math.round(num("g_mode")),
-      yaw_start: num("g_yaw_start"), yaw_speed: num("g_yaw_speed"), yaw_end: num("g_yaw_end"),
-      pitch_start: num("g_pitch_start"), pitch_speed: num("g_pitch_speed"), pitch_end: num("g_pitch_end"),
-      zoom_start: num("g_zoom_start"), zoom_speed: num("g_zoom_speed"), zoom_end: num("g_zoom_end")
-    }};
+  function connect(){
+    if(ws) return;
+    var url = $("url").value.trim();
+    $("connErr").textContent = "";
+    if(!url){ $("connErr").textContent = "请先填写机器人 WebSocket 地址。"; return; }
+    if(typeof WebSocket === "undefined"){
+      $("connErr").textContent = "当前浏览器不支持 WebSocket，请用 Chrome、Edge 或 Safari 打开此 HTML 文件。";
+      return;
+    }
+    storageSet("robot_ws_url", url);
+    manualToken += 1;
+    resetPose();
+    var socket;
+    try { socket = new WebSocket(url); }
+    catch(error){ $("connErr").textContent = "地址无效：" + error.message; return; }
+    ws = socket;
+    var opened = false;
+    // Match the original console: let the browser finish the handshake. A slow
+    // network or a permission prompt must not turn a valid connection into a failure.
+    connectionNoticeTimer = window.setTimeout(function(){
+      connectionNoticeTimer = null;
+      if(ws !== socket || socket.readyState !== 0) return;
+      $("connErr").textContent = "仍在等待机器人握手，页面会继续连接。请检查浏览器是否有待处理的网络访问提示；也可取消后重试。";
+      logLine("连接", "sys", "握手超过 5 秒，继续等待；可点击取消连接。");
+    }, CONNECTION_NOTICE_MS);
+    setConnectionState("wait", "连接中…");
+    $("url").disabled = true;
+    $("btnConn").disabled = true;
+    $("btnDisc").disabled = false;
+    $("btnDisc").textContent = "取消连接";
+    logLine("连接", "sys", "正在连接 " + url);
+    var incoming = Promise.resolve();
+    socket.onopen = function(){
+      if(ws !== socket){ try { socket.close(); } catch(error){} return; }
+      opened = true;
+      window.clearTimeout(connectionNoticeTimer);
+      connectionNoticeTimer = null;
+      $("connErr").textContent = "";
+      setConnectionState("on", "已连接");
+      $("btnDisc").disabled = false;
+      $("btnDisc").textContent = "断开";
+      logLine("连接", "sys", "WebSocket 已连接 " + url);
+      renderActualPose();
+      refreshButtons();
+    };
+    socket.onmessage = function(event){
+      incoming = incoming.then(function(){ return decodeIncoming(event.data); }).then(function(text){
+        if(ws === socket) onMessage(text);
+      }).catch(function(){
+        if(ws === socket) logHeartbeatDiagnostic("收到消息，但无法读取其中的 JSON 文本。");
+      });
+    };
+    socket.onerror = function(){
+      if(ws === socket) $("connErr").textContent = "连接出错，请检查机器人地址、网络、浏览器网络权限，以及是否有其他控制程序占用连接。";
+    };
+    socket.onclose = function(event){
+      if(ws !== socket) return;
+      var normalClose = event.code === 1000 || event.code === 1001 || event.code === 1005;
+      var failed = !opened || !event.wasClean || !normalClose;
+      releaseConnection(socket, failed);
+      if(failed){
+        $("connErr").textContent = (opened ? "连接已中断" : "机器人握手未完成") + "（code " + event.code + "）" +
+          (event.reason ? "：" + event.reason : "。请检查地址、网络、浏览器网络权限，以及是否有其他控制程序占用连接。") +
+          " 可点击连接重试。";
+      }
+      logLine("断开", failed ? "err" : "sys", "连接已关闭 (code " + event.code + ")" + (event.reason ? " " + event.reason : ""));
+    };
   }
-  function refreshGimbalPreview(){ $("g_preview").textContent = pretty(buildGimbal()); }
 
-  // presets mirror robot.py: set_camera_angle (start=current yaw, speed 5) / sweep_camera
-  function presetCenter(){ $("g_yaw_start").value = (lastYaw==null?0:lastYaw); $("g_yaw_speed").value = 5; $("g_yaw_end").value = 0; refreshGimbalPreview(); }
-  function presetGoto(){ $("g_yaw_start").value = (lastYaw==null?0:lastYaw); if(!parseFloat($("g_yaw_speed").value)) $("g_yaw_speed").value = 5; refreshGimbalPreview(); }
-  function presetSweep(){ $("g_yaw_start").value = -45; $("g_yaw_speed").value = 5; $("g_yaw_end").value = 45; refreshGimbalPreview(); }
+  function releaseConnection(socket, failed){
+    if(ws !== socket) return;
+    window.clearTimeout(connectionNoticeTimer);
+    connectionNoticeTimer = null;
+    ws = null;
+    setConnectionState(failed ? "err" : "", "未连接");
+    $("url").disabled = false;
+    $("btnConn").disabled = false;
+    $("btnDisc").disabled = true;
+    $("btnDisc").textContent = "断开";
+    $("connErr").textContent = "";
+    cancelAutomatic("连接已断开，自动运镜已经停止；无法确认是否回到锚点。", false);
+    manualToken += 1;
+    resetPose();
+    refreshButtons();
+  }
 
-  // ---- incoming (parsing aligned with robot.py _apply_protocol_state) ----
+  function disconnect(){
+    if(!ws) return;
+    var socket = ws;
+    if(socket.readyState !== 1){
+      releaseConnection(socket, false);
+      try { socket.close(); } catch(error){}
+      logLine("断开", "sys", "已取消连接，可重新连接。");
+      return;
+    }
+    if((autoRunning || autoBusy) && activeAutoConfig){
+      var config = activeAutoConfig;
+      autoRunning = false;
+      autoBusy = false;
+      autoToken += 1;
+      var pose = commandStartPose();
+      var start = {
+        yaw: clamp(pose.yaw, config.yawMin, config.yawMax),
+        pitch: clamp(pose.pitch, config.pitchMin, config.pitchMax)
+      };
+      sendGimbal(config.anchorYaw, config.anchorPitch, config.speedMax, config.speedMax, "断开前发送锚点", start);
+      activeAutoConfig = null;
+      setAutoInputsDisabled(false);
+      setAutoStatus("已尽力发送锚点；连接断开后无法继续确认实际位置。", "warn");
+      window.setTimeout(function(){
+        if(socket.readyState === 0 || socket.readyState === 1) socket.close();
+      }, 200);
+      return;
+    }
+    socket.close();
+  }
+
+  function sendObject(object, visibleObject){
+    if(!isSocketOpen()){
+      $("connErr").textContent = "尚未连接，无法发送。";
+      logLine("未发送", "err", "机器人尚未连接");
+      return false;
+    }
+    try { ws.send(JSON.stringify(object)); }
+    catch(error){
+      $("connErr").textContent = "指令发送失败：" + error.message;
+      logLine("未发送", "err", error.message);
+      return false;
+    }
+    logLine("发送", "send", pretty(visibleObject || object));
+    return true;
+  }
+
+  function sendGimbal(targetYaw, targetPitch, yawSpeed, pitchSpeed, kind, startOverride){
+    var fallback = commandStartPose();
+    var startYaw = startOverride && Number.isFinite(startOverride.yaw) ? startOverride.yaw : fallback.yaw;
+    var startPitch = startOverride && Number.isFinite(startOverride.pitch) ? startOverride.pitch : fallback.pitch;
+    var command = {
+      gimbal_control: {
+        mode: MODE,
+        yaw_start: round1(startYaw), yaw_speed: yawSpeed, yaw_end: targetYaw,
+        pitch_start: round1(startPitch), pitch_speed: pitchSpeed, pitch_end: targetPitch,
+        zoom_start: 1, zoom_speed: 0, zoom_end: 1
+      }
+    };
+    var visibleCommand = {
+      gimbal_control: {
+        mode: MODE,
+        yaw_start: round1(startYaw), yaw_speed: yawSpeed, yaw_end: targetYaw,
+        pitch_start: round1(startPitch), pitch_speed: pitchSpeed, pitch_end: targetPitch
+      }
+    };
+    if(!sendObject(command, visibleCommand)) return false;
+    estimatedYaw = targetYaw;
+    estimatedPitch = targetPitch;
+    currentTarget = { yaw: targetYaw, pitch: targetPitch, kind: kind };
+    $("targetKind").textContent = kind;
+    setTargetStatus(hasFreshPose() ? "已发送，等待实际位置。" : "已发送；等待实测心跳，暂按预计行程。", "warn");
+    renderComparison();
+    return true;
+  }
+
+  function decodeIncoming(data){
+    if(typeof data === "string") return Promise.resolve(data);
+    if(typeof Blob !== "undefined" && data instanceof Blob){
+      if(typeof data.text === "function") return data.text();
+      return new Promise(function(resolve, reject){
+        var reader = new FileReader();
+        reader.onload = function(){ resolve(String(reader.result || "")); };
+        reader.onerror = reject;
+        reader.readAsText(data, "utf-8");
+      });
+    }
+    var bytes = null;
+    if(typeof ArrayBuffer !== "undefined" && data instanceof ArrayBuffer) bytes = new Uint8Array(data);
+    else if(typeof ArrayBuffer !== "undefined" && ArrayBuffer.isView && ArrayBuffer.isView(data)) bytes = new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+    if(bytes){
+      if(typeof TextDecoder !== "undefined") return Promise.resolve(new TextDecoder("utf-8").decode(bytes));
+      if(typeof Blob !== "undefined") return decodeIncoming(new Blob([bytes]));
+    }
+    return Promise.reject(new Error("unsupported WebSocket message type"));
+  }
+
   function onMessage(raw){
-    var text = (typeof raw === "string") ? raw : "[binary]";
-    var obj = null; try { obj = JSON.parse(text); } catch(e){}
-    var isHeartbeat = obj && (obj.gimbal || obj.system || obj.map || obj.navigation || obj.naviagtion || obj.task);
-    if(!(paused || ($("hbFilter").checked && isHeartbeat && !hasReply(obj)))){
-      logLine("←", "recv", obj ? pretty(obj) : text);
-    }
-    if(!obj) return;
-    var g = obj.gimbal;
-    if(g && typeof g === "object"){
-      if("yaw" in g){ lastYaw = toNum(g.yaw); $("st_yaw").textContent = fmt(lastYaw) + "°"; }
-      if("pitch" in g){ lastPitch = toNum(g.pitch); $("st_pitch").textContent = fmt(lastPitch) + "°"; }
-      if("record_status" in g){ $("st_rec").textContent = (g.record_status === "recording") ? "录制中" : "未录制"; }
-    }
-    var sys = obj.system;
-    if(sys && typeof sys === "object"){
-      if("battery" in sys){ $("st_batt").textContent = sys.battery + "%"; }
-      if("status" in sys){ $("st_extra").textContent = "system.status: " + sys.status; }
-    }
-    var nav = obj.navigation || obj.naviagtion; // firmware typo, handled like the app
-    var task = obj.task;
-    var bits = [];
-    if(nav && nav.goal_status) bits.push("nav:" + nav.goal_status);
-    if(task && task.goal_status) bits.push("task:" + task.goal_status);
-    if(bits.length) $("st_extra").textContent = ($("st_extra").textContent || "") + "  " + bits.join("  ");
-  }
-  function hasReply(obj){ for(var k in obj){ if(k.indexOf("robot_")===0) return true; } return false; }
+    var object = null;
+    try { object = JSON.parse(typeof raw === "string" ? raw : ""); }
+    catch(error){ logHeartbeatDiagnostic("收到消息，但无法解析为 JSON。"); return; }
 
-  // ---- log ----
-  function logLine(tag, cls, body){
-    if(paused && cls !== "sys" && cls !== "err") return;
-    var el = document.createElement("div");
-    el.className = "line";
-    var t = new Date().toLocaleTimeString();
-    el.innerHTML = '<span class="t">'+t+'</span> <span class="tag '+cls+'">'+esc(tag)+'</span>';
-    var pre = document.createElement("span"); pre.className = cls; pre.textContent = body; el.appendChild(pre);
-    var log = $("log"); log.appendChild(el);
-    while(log.childNodes.length > 400) log.removeChild(log.firstChild);
-    log.scrollTop = log.scrollHeight;
+    var gimbal = object && object.gimbal;
+    var yawUpdated = false;
+    var pitchUpdated = false;
+    if(gimbal && typeof gimbal === "object"){
+      if(Object.prototype.hasOwnProperty.call(gimbal, "yaw")){
+        var yaw = toNumber(gimbal.yaw);
+        if(yaw !== null){ lastYaw = yaw; lastYawAt = Date.now(); yawRevision += 1; yawUpdated = true; }
+      }
+      if(Object.prototype.hasOwnProperty.call(gimbal, "pitch")){
+        var pitch = toNumber(gimbal.pitch);
+        if(pitch !== null){ lastPitch = pitch; lastPitchAt = Date.now(); pitchRevision += 1; pitchUpdated = true; }
+      }
+      if(yawUpdated || pitchUpdated){
+        renderActualPose();
+        renderComparison();
+        refreshButtons();
+      }
+    }
+
+    var isHeartbeat = object && (object.gimbal || object.system || object.map || object.navigation || object.naviagtion || object.task);
+    if(isHeartbeat){
+      if(!gimbal || typeof gimbal !== "object") logHeartbeatDiagnostic("已收到心跳，但其中没有云台位置。");
+      else if(yawUpdated && pitchUpdated) logHeartbeatDiagnostic("已收到完整 yaw/pitch 心跳。");
+      else if(yawUpdated) logHeartbeatDiagnostic("已收到 yaw，正在等待 pitch。");
+      else if(pitchUpdated) logHeartbeatDiagnostic("已收到 pitch，正在等待 yaw。");
+      else logHeartbeatDiagnostic("已收到云台心跳，但 yaw/pitch 无效或缺失。");
+    }
+
+    var replies = {};
+    Object.keys(object || {}).forEach(function(key){ if(key.indexOf("robot_") === 0) replies[key] = object[key]; });
+    if(Object.keys(replies).length) logLine("接收", "recv", pretty(replies));
   }
 
-  // ---- helpers ----
-  function pretty(o){ try { return JSON.stringify(o, null, 2); } catch(e){ return String(o); } }
-  function esc(s){ return String(s).replace(/[&<>]/g, function(c){ return {'&':'&amp;','<':'&lt;','>':'&gt;'}[c]; }); }
-  function toNum(v){ var n = parseFloat(v); return isFinite(n) ? n : null; }
-  function fmt(n){ return (n==null) ? "–" : (Math.round(n*10)/10); }
+  function logHeartbeatDiagnostic(message){
+    if(message === heartbeatDiagnostic) return;
+    heartbeatDiagnostic = message;
+    logLine("心跳", "sys", message);
+  }
 
-  // ---- wiring ----
+  function renderActualPose(){
+    $("actualYaw").textContent = hasFreshYaw() ? formatAngle(lastYaw) : "–";
+    $("actualPitch").textContent = hasFreshPitch() ? formatAngle(lastPitch) : "–";
+    if(hasFreshPose()) $("heartbeatHint").textContent = "位置来自机器人最新心跳。";
+    else if(isSocketOpen() && (!Number.isFinite(lastYaw) || !Number.isFinite(lastPitch))) $("heartbeatHint").textContent = "WebSocket 已连接，正在等待完整的 yaw/pitch 心跳。";
+    else if(isSocketOpen()) $("heartbeatHint").textContent = "WebSocket 仍连接；超过 5 秒的实测值已经隐藏。";
+    else $("heartbeatHint").textContent = "尚未连接机器人。";
+  }
+
+  function renderComparison(){
+    if(!currentTarget){
+      ["targetYaw", "targetPitch", "errorYaw", "errorPitch"].forEach(function(id){ $(id).textContent = "–"; });
+      return;
+    }
+    $("targetYaw").textContent = formatAngle(currentTarget.yaw);
+    $("targetPitch").textContent = formatAngle(currentTarget.pitch);
+    $("errorYaw").textContent = hasFreshYaw() ? formatSigned(lastYaw - currentTarget.yaw) : "–";
+    $("errorPitch").textContent = hasFreshPitch() ? formatSigned(lastPitch - currentTarget.pitch) : "–";
+  }
+
+  function setTargetStatus(text, kind){
+    $("targetStatus").textContent = text;
+    $("targetStatus").className = "status-line" + (kind ? " " + kind : "");
+  }
+
+  function waitForPose(targetYaw, targetPitch, budgetSeconds, isCanceled, afterRevisions){
+    return new Promise(function(resolve){
+      var deadline = Date.now() + Math.max(300, budgetSeconds * 1000);
+      var seenYawRevision = afterRevisions && Number.isFinite(afterRevisions.yaw) ? afterRevisions.yaw : yawRevision;
+      var seenPitchRevision = afterRevisions && Number.isFinite(afterRevisions.pitch) ? afterRevisions.pitch : pitchRevision;
+      var pendingYaw = false;
+      var pendingPitch = false;
+      var stable = 0;
+      var receivedCompletePose = false;
+      function check(){
+        if(isCanceled && isCanceled()){ resolve("canceled"); return; }
+        if(!isSocketOpen()){ resolve("canceled"); return; }
+        if(yawRevision > seenYawRevision){ seenYawRevision = yawRevision; pendingYaw = true; }
+        if(pitchRevision > seenPitchRevision){ seenPitchRevision = pitchRevision; pendingPitch = true; }
+        if(pendingYaw && pendingPitch && hasFreshPose()){
+          pendingYaw = false;
+          pendingPitch = false;
+          receivedCompletePose = true;
+          if(
+            Math.abs(lastYaw - targetYaw) <= POSE_TOLERANCE &&
+            Math.abs(lastPitch - targetPitch) <= POSE_TOLERANCE
+          ){
+            stable += 1;
+            if(stable >= POSE_STABLE_SAMPLES){
+              setTargetStatus("连续两次心跳进入 ±2°，已到达。", "success");
+              resolve("reached");
+              return;
+            }
+          } else {
+            stable = 0;
+          }
+        }
+        if(Date.now() >= deadline){
+          if(!receivedCompletePose){
+            setTargetStatus("没有收到新的完整 yaw/pitch 心跳；已按预计行程继续。", "warn");
+            resolve("estimated");
+            return;
+          }
+          setTargetStatus("等待结束，实际位置仍未稳定进入 ±2°。", "warn");
+          resolve("timeout");
+          return;
+        }
+        window.setTimeout(check, 100);
+      }
+      check();
+    });
+  }
+
+  function sendManual(targetYaw, targetPitch, yawSpeed, pitchSpeed, kind){
+    var validation = validateManual(targetYaw, targetPitch, yawSpeed, pitchSpeed);
+    if(validation){ setManualStatus(validation, "error"); return; }
+    manualToken += 1;
+    var token = manualToken;
+    var start = commandStartPose();
+    var startYaw = start.yaw;
+    var startPitch = start.pitch;
+    var startRevisions = poseRevisions();
+    if(!sendGimbal(targetYaw, targetPitch, yawSpeed, pitchSpeed, kind)){
+      setManualStatus("指令发送失败。", "error");
+      return;
+    }
+    setManualStatus(hasFreshPose() ? "指令已发送，正在用心跳核对实际位置。" : "指令已发送；没有完整心跳，按预计行程等待。", "warn");
+    var travel = Math.max(Math.abs(targetYaw - startYaw), Math.abs(targetPitch - startPitch));
+    var speed = Math.min(yawSpeed, pitchSpeed);
+    waitForPose(targetYaw, targetPitch, travel / speed + LEG_MARGIN_SECONDS, function(){ return token !== manualToken; }, startRevisions)
+      .then(function(result){
+        if(token !== manualToken) return;
+        if(result === "reached") setManualStatus("实测位置已到达目标范围。", "success");
+        else if(result === "timeout") setManualStatus("实测位置与发送目标仍有偏差，请查看右侧。", "warn");
+        else if(result === "estimated") setManualStatus("未收到完整实测心跳；指令已发送，并已按预计行程等待。", "warn");
+        else if(result === "canceled" && !isSocketOpen()) setManualStatus("连接已断开。", "error");
+      });
+  }
+
+  function validateManual(yaw, pitch, yawSpeed, pitchSpeed){
+    if(!isSocketOpen()) return "请先连接机器人。";
+    if(!Number.isFinite(yaw) || yaw < -90 || yaw > 90) return "目标水平角必须在 −90°～90°。";
+    if(!Number.isFinite(pitch) || pitch < -60 || pitch > 15) return "目标俯仰角必须在 −60°～15°。";
+    if(!isWholeSpeed(yawSpeed) || !isWholeSpeed(pitchSpeed)) return "速度必须是 2～5 之间的整数。";
+    return "";
+  }
+
+  function setManualStatus(text, kind){
+    $("manualStatus").textContent = text;
+    $("manualStatus").className = "status-line" + (kind ? " " + kind : "");
+  }
+
+  function readAutoConfig(){
+    return {
+      anchorYaw: numberFrom("anchorYaw"), anchorPitch: numberFrom("anchorPitch"),
+      yawMin: numberFrom("yawMin"), yawMax: numberFrom("yawMax"),
+      pitchMin: numberFrom("pitchMin"), pitchMax: numberFrom("pitchMax"),
+      speedMin: numberFrom("speedMin"), speedMax: numberFrom("speedMax")
+    };
+  }
+
+  function validateAutoGeometry(config){
+    var angles = [config.anchorYaw, config.anchorPitch, config.yawMin, config.yawMax, config.pitchMin, config.pitchMax];
+    if(angles.some(function(value){ return !Number.isInteger(value); })) return "所有水平和俯仰角度都必须是整数。";
+    if(config.yawMin < -90 || config.yawMax > 90 || config.yawMax <= config.yawMin) return "水平范围必须在 −90°～90°，且左边界大于右边界。";
+    if(config.pitchMin < -60 || config.pitchMax > 15 || config.pitchMax <= config.pitchMin) return "俯仰范围必须在 −60°～15°，且下边界大于上边界。";
+    if(config.anchorYaw < config.yawMin || config.anchorYaw > config.yawMax) return "锚点水平角必须位于水平范围内。";
+    if(config.anchorPitch < config.pitchMin || config.anchorPitch > config.pitchMax) return "锚点俯仰角必须位于俯仰范围内。";
+    if(!isWholeSpeed(config.speedMin) || !isWholeSpeed(config.speedMax) || config.speedMax < config.speedMin) return "速度范围必须是 2～5 的整数，且最快不能小于最慢。";
+    return "";
+  }
+
+  function validateAutoRuntime(config){
+    var geometryError = validateAutoGeometry(config);
+    if(geometryError) return geometryError;
+    if(!autoConfigured) return "请先保存自动运镜设置。";
+    if(!isSocketOpen()) return "请先连接机器人。";
+    return "";
+  }
+
+  function saveAutoConfig(){
+    var config = readAutoConfig();
+    var validation = validateAutoGeometry(config);
+    if(validation){ setAutoStatus(validation, "error"); return; }
+    var persisted = storageSet(CONFIG_STORAGE_KEY, JSON.stringify(config));
+    autoConfigured = true;
+    $("configState").textContent = persisted ? "已保存" : "本次已确认";
+    setAutoStatus(persisted ? "自动运镜设置已保存。" : "浏览器未允许本地保存；本次测试仍可使用。", persisted ? "success" : "warn");
+    refreshButtons();
+  }
+
+  function markAutoDirty(){
+    if(autoRunning) return;
+    autoConfigured = false;
+    $("configState").textContent = "有未保存修改";
+    setAutoStatus("设置已修改，请保存后开始模拟行进。", "warn");
+    refreshButtons();
+  }
+
+  function loadAutoConfig(){
+    var raw = storageGet(CONFIG_STORAGE_KEY);
+    if(!raw) return;
+    try {
+      var config = JSON.parse(raw);
+      if(validateAutoGeometry(config)) return;
+      $("anchorYaw").value = config.anchorYaw;
+      $("anchorPitch").value = config.anchorPitch;
+      $("yawMin").value = config.yawMin;
+      $("yawMax").value = config.yawMax;
+      $("pitchMin").value = config.pitchMin;
+      $("pitchMax").value = config.pitchMax;
+      $("speedMin").value = config.speedMin;
+      $("speedMax").value = config.speedMax;
+      autoConfigured = true;
+      $("configState").textContent = "已保存";
+      setAutoStatus("已载入保存的自动运镜设置。", "success");
+    } catch(error){
+      storageRemove(CONFIG_STORAGE_KEY);
+    }
+  }
+
+  function startAutomatic(){
+    var config = readAutoConfig();
+    var validation = validateAutoRuntime(config);
+    if(validation){ setAutoStatus(validation, "error"); return; }
+    manualToken += 1;
+    autoToken += 1;
+    var token = autoToken;
+    autoRunning = true;
+    autoBusy = true;
+    activeAutoConfig = config;
+    setAutoInputsDisabled(true);
+    refreshButtons();
+    runAutomatic(token, config);
+  }
+
+  async function runAutomatic(token, config){
+    setAutoStatus("正在回到锚点，然后开始模拟行进。", "warn");
+    var anchorResult = await returnToAnchor(config, token, "开始前回锚点", function(){ return isAutoTokenActive(token); });
+    if(!isAutoTokenActive(token)) return;
+    setAutoStatus(anchorResult === "estimated" ?
+      "正在模拟巡游行进；无完整心跳，按预计行程执行水平＋俯仰运镜。" :
+      "正在模拟巡游行进，持续执行水平＋俯仰运镜。", anchorResult === "estimated" ? "warn" : "success");
+
+    while(isAutoTokenActive(token)){
+      var mode = pickCameraworkMode();
+      var pose = commandStartPose();
+      var currentYaw = clamp(pose.yaw, config.yawMin, config.yawMax);
+      var currentPitch = clamp(pose.pitch, config.pitchMin, config.pitchMax);
+      var targets;
+      var anchorFallback = false;
+      if(mode === "anchor"){
+        if(Math.abs(currentYaw - config.anchorYaw) <= POSE_TOLERANCE && Math.abs(currentPitch - config.anchorPitch) <= POSE_TOLERANCE){
+          targets = [wanderPose(currentYaw, config)];
+          anchorFallback = true;
+        }
+        else targets = [[config.anchorYaw, config.anchorPitch]];
+      } else if(mode === "pingpong") targets = pingpongPoses(currentYaw, config);
+      else targets = [wanderPose(currentYaw, config)];
+
+      var label = mode === "anchor" ? "20% 回锚点" : (mode === "pingpong" ? "30% 左右往返" : "50% 单次运镜");
+      if(anchorFallback) label = "20% 已在锚点，继续单次运镜";
+      for(var index = 0; index < targets.length && isAutoTokenActive(token); index += 1){
+        var speed = randomInteger(config.speedMin, config.speedMax);
+        await moveAutoTarget(targets[index][0], targets[index][1], speed, label, token, config, mode !== "anchor" || anchorFallback);
+      }
+    }
+  }
+
+  async function moveAutoTarget(targetYaw, targetPitch, speed, kind, token, config, separateTarget){
+    if(!isAutoTokenActive(token)) return "canceled";
+    var pose = commandStartPose();
+    var startYaw = clamp(pose.yaw, config.yawMin, config.yawMax);
+    var startPitch = clamp(pose.pitch, config.pitchMin, config.pitchMax);
+    if(separateTarget){
+      var target = separateCameraworkTarget(targetYaw, targetPitch, startYaw, startPitch, config);
+      targetYaw = target[0];
+      targetPitch = target[1];
+    }
+    var startRevisions = poseRevisions();
+    if(!sendGimbal(targetYaw, targetPitch, speed, speed, kind, { yaw:startYaw, pitch:startPitch })){
+      cancelAutomatic("指令发送失败，自动运镜已经停止。", false);
+      return "canceled";
+    }
+    var travel = Math.max(Math.abs(targetYaw - startYaw), Math.abs(targetPitch - startPitch));
+    var result = await waitForPose(targetYaw, targetPitch, travel / speed + LEG_MARGIN_SECONDS, function(){ return !isAutoTokenActive(token); }, startRevisions);
+    return result;
+  }
+
+  function simulateArrival(){
+    if(!autoRunning || !activeAutoConfig) return;
+    var config = activeAutoConfig;
+    autoRunning = false;
+    autoBusy = true;
+    autoToken += 1;
+    var token = autoToken;
+    setAutoStatus("已模拟到达点位，正在回锚点。", "warn");
+    setAutoInputsDisabled(true);
+    refreshButtons();
+    returnToAnchor(config, token, "到达后回锚点", function(){ return token === autoToken && isSocketOpen(); }).then(function(result){
+      if(token !== autoToken) return;
+      activeAutoConfig = null;
+      autoBusy = false;
+      setAutoInputsDisabled(false);
+      refreshButtons();
+      if(result === "reached") setAutoStatus("已到达锚点；yaw/pitch 停留测试完成。", "success");
+      else if(result === "estimated") setAutoStatus("锚点指令已发送；没有完整心跳，已按预计行程完成。", "warn");
+      else if(result === "canceled") setAutoStatus("连接已断开，无法继续回到锚点。", "error");
+      else setAutoStatus("已经发送锚点，但实测位置仍有偏差。", "warn");
+    });
+  }
+
+  function cancelAutomatic(message, returnAnchor){
+    var config = activeAutoConfig || readAutoConfig();
+    autoRunning = false;
+    autoToken += 1;
+    var token = autoToken;
+    activeAutoConfig = null;
+    if(returnAnchor && isSocketOpen() && !validateAutoGeometry(config)){
+      autoBusy = true;
+      setAutoInputsDisabled(true);
+      refreshButtons();
+      setAutoStatus(message + " 正在回锚点。", "warn");
+      returnToAnchor(config, token, "停止后回锚点", function(){ return token === autoToken && isSocketOpen(); }).then(function(result){
+        if(token !== autoToken) return;
+        autoBusy = false;
+        setAutoInputsDisabled(false);
+        refreshButtons();
+        if(result === "reached") setAutoStatus("自动运镜已停止并回到锚点。", "success");
+        else if(result === "estimated") setAutoStatus("自动运镜已停止；锚点指令已发送，并已按预计行程等待。", "warn");
+        else if(result === "canceled") setAutoStatus("连接已断开，无法继续回到锚点。", "error");
+        else setAutoStatus("已停止；锚点指令已发送，但实测仍有偏差。", "warn");
+      });
+    } else {
+      autoBusy = false;
+      setAutoInputsDisabled(false);
+      refreshButtons();
+      setAutoStatus(message, returnAnchor ? "warn" : "error");
+    }
+  }
+
+  async function returnToAnchor(config, token, kind, stillValid){
+    var lastResult = "timeout";
+    for(var attempt = 0; attempt < 2; attempt += 1){
+      if(!stillValid()) return "canceled";
+      var pose = commandStartPose();
+      var startYaw = clamp(pose.yaw, config.yawMin, config.yawMax);
+      var startPitch = clamp(pose.pitch, config.pitchMin, config.pitchMax);
+      var startRevisions = poseRevisions();
+      if(!sendGimbal(config.anchorYaw, config.anchorPitch, config.speedMax, config.speedMax, kind, { yaw:startYaw, pitch:startPitch })) return "canceled";
+      var travel = Math.max(Math.abs(config.anchorYaw - startYaw), Math.abs(config.anchorPitch - startPitch));
+      var result = await waitForPose(config.anchorYaw, config.anchorPitch, travel / config.speedMax + LEG_MARGIN_SECONDS, function(){ return token !== autoToken || !stillValid(); }, startRevisions);
+      if(result === "reached" || result === "estimated" || result === "canceled") return result;
+      lastResult = result;
+      if(attempt === 0) setTargetStatus("第一次未确认到达，正在重试锚点。", "warn");
+    }
+    return lastResult;
+  }
+
+  function pickCameraworkMode(){
+    var roll = Math.random() * 100;
+    var cumulative = 0;
+    for(var index = 0; index < MODE_WEIGHTS.length; index += 1){
+      cumulative += MODE_WEIGHTS[index][1];
+      if(roll <= cumulative) return MODE_WEIGHTS[index][0];
+    }
+    return "wander";
+  }
+
+  function adaptiveYawTarget(current, config){
+    var low = config.yawMin;
+    var high = config.yawMax;
+    current = clamp(current, low, high);
+    if(current > 0){
+      var rightwardRoom = current - low;
+      var fartherLeftRoom = high - current;
+      var goOpposite = rightwardRoom > DIRECTION_ROOM_DEG && (fartherLeftRoom <= DIRECTION_ROOM_DEG || Math.random() < OPPOSITE_PROBABILITY);
+      if(goOpposite) return Math.round(clamp(current - Math.max(1, randomRange(OPPOSITE_DISTANCE) * rightwardRoom), low, high));
+      return Math.round(clamp(current + Math.max(1, randomRange(OUTWARD_DISTANCE) * fartherLeftRoom), low, high));
+    }
+    if(current < 0){
+      var leftwardRoom = high - current;
+      var fartherRightRoom = current - low;
+      var goOtherSide = leftwardRoom > DIRECTION_ROOM_DEG && (fartherRightRoom <= DIRECTION_ROOM_DEG || Math.random() < OPPOSITE_PROBABILITY);
+      if(goOtherSide) return Math.round(clamp(current + Math.max(1, randomRange(OPPOSITE_DISTANCE) * leftwardRoom), low, high));
+      return Math.round(clamp(current - Math.max(1, randomRange(OUTWARD_DISTANCE) * fartherRightRoom), low, high));
+    }
+    var rightRoom = current - low;
+    var leftRoom = high - current;
+    var chooseRight = rightRoom > DIRECTION_ROOM_DEG && (leftRoom <= DIRECTION_ROOM_DEG || Math.random() < .5);
+    if(chooseRight) return Math.round(clamp(current - Math.max(1, randomRange(CENTER_DISTANCE) * rightRoom), low, high));
+    return Math.round(clamp(current + Math.max(1, randomRange(CENTER_DISTANCE) * leftRoom), low, high));
+  }
+
+  function wanderPose(currentYaw, config){
+    return [adaptiveYawTarget(currentYaw, config), randomInteger(config.pitchMin, config.pitchMax)];
+  }
+
+  function separateCameraworkTarget(targetYaw, targetPitch, currentYaw, currentPitch, config){
+    currentYaw = clamp(currentYaw, config.yawMin, config.yawMax);
+    currentPitch = clamp(currentPitch, config.pitchMin, config.pitchMax);
+    var yaw = Math.round(clamp(targetYaw, config.yawMin, config.yawMax));
+    var pitch = Math.round(clamp(targetPitch, config.pitchMin, config.pitchMax));
+    var yawMid = (config.yawMin + config.yawMax) / 2;
+    var pitchMid = (config.pitchMin + config.pitchMax) / 2;
+    var yawChangesHalf = (yaw >= yawMid) !== (currentYaw >= yawMid);
+    function acceptable(candidate){
+      return yawChangesHalf || ((candidate >= pitchMid) !== (currentPitch >= pitchMid));
+    }
+    if(!acceptable(pitch)){
+      // Crossing either midpoint is sufficient; the opposite pitch endpoint changes half.
+      var choices = [];
+      for(var candidate = config.pitchMin; candidate <= config.pitchMax; candidate += 1){
+        if(acceptable(candidate)) choices.push(candidate);
+      }
+      pitch = choices[randomInteger(0, choices.length - 1)];
+    }
+    return [yaw, pitch];
+  }
+
+  function pingpongPoses(currentYaw, config){
+    var midpoint = (config.yawMin + config.yawMax) / 2;
+    var quarter = (config.yawMax - config.yawMin) * .25;
+    var rightHigh = Math.min(0, midpoint - quarter);
+    if(rightHigh <= config.yawMin) rightHigh = config.yawMin + quarter;
+    var leftLow = Math.max(0, midpoint + quarter);
+    if(leftLow >= config.yawMax) leftLow = config.yawMax - quarter;
+    var right = [Math.round(randomBetween(config.yawMin, rightHigh)), randomInteger(config.pitchMin, config.pitchMax)];
+    var left = [Math.round(randomBetween(leftLow, config.yawMax)), randomInteger(config.pitchMin, config.pitchMax)];
+    if(currentYaw > 0) return [right, left];
+    if(currentYaw < 0) return [left, right];
+    return Math.random() < .5 ? [right, left] : [left, right];
+  }
+
+  function setAutoStatus(text, kind){
+    $("autoStatus").textContent = text;
+    $("autoStatus").className = "status-line" + (kind ? " " + kind : "");
+  }
+  function setAutoInputsDisabled(disabled){
+    Array.prototype.forEach.call(document.querySelectorAll(".auto-input"), function(input){ input.disabled = disabled; });
+    $("saveAutoConfig").disabled = disabled;
+    $("useActualAnchor").disabled = disabled || !hasFreshPose();
+  }
+  function isAutoTokenActive(token){ return autoRunning && token === autoToken && isSocketOpen(); }
+
+  function refreshButtons(){
+    var ready = isSocketOpen();
+    $("manualSend").disabled = !ready || autoRunning || autoBusy;
+    $("manualCenter").disabled = !ready || autoRunning || autoBusy;
+    $("autoStart").disabled = !ready || autoRunning || autoBusy || !autoConfigured;
+    $("autoArrive").disabled = !autoRunning;
+    $("autoStop").disabled = !autoRunning;
+    $("useActualAnchor").disabled = autoRunning || autoBusy || !hasFreshPose();
+  }
+
+  function switchTab(name){
+    var manual = name === "manual";
+    if(manual && autoRunning){
+      cancelAutomatic("正在停止自动运镜。", true);
+      return;
+    }
+    if(manual && autoBusy){
+      setAutoStatus("正在回到锚点，请完成后再切换。", "warn");
+      return;
+    }
+    $("manualPanel").hidden = !manual;
+    $("autoPanel").hidden = manual;
+    $("tabManual").classList.toggle("active", manual);
+    $("tabAuto").classList.toggle("active", !manual);
+    $("tabManual").setAttribute("aria-selected", String(manual));
+    $("tabAuto").setAttribute("aria-selected", String(!manual));
+  }
+
+  function logLine(label, kind, body){
+    var line = document.createElement("div");
+    line.className = "line";
+    var time = document.createElement("span");
+    time.className = "time";
+    time.textContent = new Date().toLocaleTimeString() + " ";
+    var tag = document.createElement("strong");
+    tag.className = kind;
+    tag.textContent = label + " ";
+    var content = document.createElement("span");
+    content.className = kind;
+    content.textContent = body;
+    line.appendChild(time); line.appendChild(tag); line.appendChild(content);
+    $("log").appendChild(line);
+    while($("log").childNodes.length > 200) $("log").removeChild($("log").firstChild);
+    $("log").scrollTop = $("log").scrollHeight;
+  }
+
+  function numberFrom(id){
+    var text = $(id).value.trim();
+    if(text === "") return NaN;
+    return Number(text);
+  }
+  function toNumber(value){
+    if(value === null || typeof value === "boolean") return null;
+    if(typeof value === "string" && value.trim() === "") return null;
+    var result = Number(value);
+    return Number.isFinite(result) ? result : null;
+  }
+  function isWholeSpeed(value){ return Number.isInteger(value) && value >= 2 && value <= 5; }
+  function clamp(value, low, high){ return Math.min(high, Math.max(low, value)); }
+  function randomBetween(low, high){ return low + Math.random() * (high - low); }
+  function randomRange(range){ return randomBetween(range[0], range[1]); }
+  function randomInteger(low, high){ return Math.floor(randomBetween(low, high + 1)); }
+  function round1(value){ return Math.round(value * 10) / 10; }
+  function formatAngle(value){ return Number.isFinite(value) ? round1(value).toFixed(1) + "°" : "–"; }
+  function formatSigned(value){
+    if(!Number.isFinite(value)) return "–";
+    var rounded = round1(value);
+    return (rounded > 0 ? "+" : "") + rounded.toFixed(1) + "°";
+  }
+  function pretty(value){ try { return JSON.stringify(value, null, 2); } catch(error){ return String(value); } }
+
+  function storageGet(key){ try { return window.localStorage.getItem(key); } catch(error){ return null; } }
+  function storageSet(key, value){
+    try { window.localStorage.setItem(key, value); return true; }
+    catch(error){ return false; }
+  }
+  function storageRemove(key){ try { window.localStorage.removeItem(key); } catch(error){} }
+
+  function bestEffortAnchorBeforeUnload(){
+    if(!(autoRunning || autoBusy) || !activeAutoConfig || !isSocketOpen()) return;
+    var config = activeAutoConfig;
+    var pose = commandStartPose();
+    var command = {
+      gimbal_control: {
+        mode: MODE,
+        yaw_start: round1(clamp(pose.yaw, config.yawMin, config.yawMax)),
+        yaw_speed: config.speedMax,
+        yaw_end: config.anchorYaw,
+        pitch_start: round1(clamp(pose.pitch, config.pitchMin, config.pitchMax)),
+        pitch_speed: config.speedMax,
+        pitch_end: config.anchorPitch,
+        zoom_start: 1,
+        zoom_speed: 0,
+        zoom_end: 1
+      }
+    };
+    try { ws.send(JSON.stringify(command)); } catch(error){}
+    autoRunning = false;
+    autoBusy = false;
+    autoToken += 1;
+  }
+
+  var savedUrl = storageGet("robot_ws_url");
+  if(savedUrl) $("url").value = savedUrl;
+  loadAutoConfig();
+
   $("btnConn").onclick = connect;
   $("btnDisc").onclick = disconnect;
-  $("g_send").onclick = function(){ sendObj(buildGimbal()); };
-  $("p_center").onclick = presetCenter;
-  $("p_goto").onclick = presetGoto;
-  $("p_sweep").onclick = presetSweep;
-  $("log_clear").onclick = function(){ $("log").innerHTML = ""; };
-  $("log_pause").onclick = function(){ paused = !paused; $("log_pause").textContent = paused ? "继续" : "暂停"; };
-  ["g_mode","g_yaw_start","g_yaw_speed","g_yaw_end","g_pitch_start","g_pitch_speed","g_pitch_end","g_zoom_start","g_zoom_speed","g_zoom_end"]
-    .forEach(function(id){ $(id).addEventListener("input", refreshGimbalPreview); });
-  refreshGimbalPreview();
+  $("tabManual").onclick = function(){ switchTab("manual"); };
+  $("tabAuto").onclick = function(){ switchTab("auto"); };
+  $("manualSend").onclick = function(){
+    sendManual(numberFrom("manualYaw"), numberFrom("manualPitch"), numberFrom("manualYawSpeed"), numberFrom("manualPitchSpeed"), "镜头控制");
+  };
+  $("manualCenter").onclick = function(){
+    $("manualYaw").value = 0;
+    $("manualPitch").value = 0;
+    sendManual(0, 0, numberFrom("manualYawSpeed"), numberFrom("manualPitchSpeed"), "回到 0° / 0°");
+  };
+  $("useActualAnchor").onclick = function(){
+    if(!hasFreshPose()) return;
+    $("anchorYaw").value = Math.round(lastYaw);
+    $("anchorPitch").value = Math.round(lastPitch);
+    markAutoDirty();
+  };
+  $("saveAutoConfig").onclick = saveAutoConfig;
+  $("autoStart").onclick = startAutomatic;
+  $("autoArrive").onclick = simulateArrival;
+  $("autoStop").onclick = function(){ cancelAutomatic("自动运镜已停止。", true); };
+  $("logClear").onclick = function(){ $("log").innerHTML = ""; };
+  Array.prototype.forEach.call(document.querySelectorAll(".auto-input"), function(input){ input.addEventListener("input", markAutoDirty); });
+  window.addEventListener("pagehide", bestEffortAnchorBeforeUnload);
+
+  window.setInterval(function(){
+    if(Number.isFinite(lastYaw) || Number.isFinite(lastPitch)) renderActualPose();
+    refreshButtons();
+  }, 500);
+
+  refreshButtons();
+  renderActualPose();
+  renderComparison();
 })();
 </script>
 </body>

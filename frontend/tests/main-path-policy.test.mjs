@@ -301,3 +301,14 @@ test('pool inventory retains offline ids, explains the empty state, and keeps al
   assert.match(appSource, /已入池 \{\{ mediaPool\.voiceover_media_ids\.length }}/)
   assert.match(appSource, /已入池 \{\{ mediaPool\.effect_media_ids\.length }}/)
 })
+
+test('generating a voiceover leaves pool membership and selection to explicit user actions', () => {
+  const start = appSource.indexOf('async function generateVoiceover()')
+  const end = appSource.indexOf('\nfunction moveCalendar(', start)
+  assert.ok(start >= 0 && end > start, 'generateVoiceover source must be present')
+  const generateSource = appSource.slice(start, end)
+
+  assert.doesNotMatch(generateSource, /addItemToMediaPool|saveMediaPool|selectedAutomationVoiceoverIds/)
+  assert.match(generateSource, /需要使用时，请在旁白池点击“从媒体库添加”/)
+  assert.match(appSource, /async function addPendingItemsToPool\(\)/)
+})

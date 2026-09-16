@@ -569,6 +569,17 @@ class MediaService:
             self._save_pool(cleaned)
         return result
 
+    def ensure_media_pool_initialized(self) -> None:
+        """Persist the pre-existing working set before publishing a new generated asset.
+
+        Older releases treated every compatible library item as pooled, so the first pool read
+        performs a one-time compatibility seed.  A generator must cross that boundary before it
+        creates a discoverable file; otherwise its brand-new output is mistaken for an older
+        item and silently enters the working set.
+        """
+        if not self._pool_initialized:
+            self.media_pool()
+
     def update_media_pool(self, media_ids: dict[str, list[str]]) -> dict[str, list[str]]:
         """Replace the working set without deleting anything from the media library."""
         if self._pool_blocked:

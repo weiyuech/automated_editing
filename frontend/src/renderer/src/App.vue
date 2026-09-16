@@ -223,11 +223,40 @@
                 <span class="axis-nospeed">大幅运镜不会提高速度</span>
               </div>
               <div class="button-row">
-                <button :disabled="robot.yaw == null || robot.pitch == null" @click="useCurrentCameraworkAnchor">使用当前水平/俯仰</button>
+                <button :disabled="!heartbeatPoseFresh" @click="useCurrentCameraworkAnchor">使用当前水平/俯仰</button>
                 <button class="primary" :disabled="cameraworkSaving || Boolean(cameraworkWarning)" @click="saveCameraworkPreference">保存自动运镜设置</button>
               </div>
               <p v-if="cameraworkWarning" class="inline-status danger">{{ cameraworkWarning }}</p>
               <p v-if="cameraworkStatus" class="inline-status" :class="cameraworkStatusKind">{{ cameraworkStatus }}</p>
+            </div>
+
+            <div class="camera-settings-section camera-diagnostics">
+              <div class="camera-diagnostics-head">
+                <strong>拍摄诊断</strong>
+                <span class="diagnostic-verdict" :class="heartbeatFreshnessView.tone">{{ heartbeatFreshnessView.label }}</span>
+              </div>
+              <div class="camera-diagnostic-compare">
+                <div class="camera-diagnostic-compare-head">
+                  <span></span>
+                  <span>应用下发</span>
+                  <span>机器人心跳</span>
+                </div>
+                <div>
+                  <span>水平</span>
+                  <strong>{{ appTargetLabel('yaw') }}</strong>
+                  <strong>{{ heartbeatAxisLabel('yaw') }}</strong>
+                </div>
+                <div>
+                  <span>俯仰</span>
+                  <strong>{{ appTargetLabel('pitch') }}</strong>
+                  <strong>{{ heartbeatAxisLabel('pitch') }}</strong>
+                </div>
+                <div>
+                  <span>变焦</span>
+                  <strong>{{ appZoomTargetLabel }}</strong>
+                  <span class="muted">不回传</span>
+                </div>
+              </div>
             </div>
           </div>
         </Panel>
@@ -284,23 +313,21 @@
                   <option v-for="name in cruisePaths" :key="name" :value="name">{{ name }}</option>
                 </select>
                 <input v-model.number="cruiseNewGoalId" class="field compact-field" type="number" min="0" step="1" placeholder="目标点编号" />
-                <input v-model="cruiseNewGoalObject" class="field compact-field" placeholder="对准物体（留空＝不对准）" />
                 <button class="primary" :disabled="!canAddCruisePoint" @click="addCruisePoint">加入清单</button>
               </div>
             </div>
             <p class="form-hint">
-              目标点编号需手动填写。用「试跑」单独跑一个点、不录制，可以确认编号是否有效。留空「对准物体」表示只导航、不等待云台对准。
+              目标点编号需手动填写。用「试跑」单独跑一个点、不录制，可以确认编号是否有效。巡游只按导航到点，不等待目标物识别或对准。
             </p>
 
             <div v-if="cruisePoints.length === 0" class="empty">
               清单还是空的。上面每按一次「加入清单」就往下面这张表里追加一行，机器人会按这个顺序依次拍。
             </div>
             <div v-else class="table cruise-table scroll-list">
-              <div class="table-row header"><span>顺序</span><span>路径文件 / 目标点</span><span>对准物体</span><span>操作</span></div>
+              <div class="table-row header"><span>顺序</span><span>路径文件 / 目标点</span><span>操作</span></div>
               <div v-for="(point, index) in cruisePoints" :key="index" class="table-row">
                 <span>{{ index + 1 }}</span>
                 <span>{{ point.path_name }} · #{{ point.goal_id }}</span>
-                <span>{{ point.goal_object || '不对准（仅导航）' }}</span>
                 <span class="asset-actions">
                   <button :disabled="isCruiseBusy || cruiseRunning" @click="testCruisePoint(point)">试跑</button>
                   <button :disabled="index === 0" @click="moveCruisePoint(index, -1)">上移</button>
@@ -1587,6 +1614,13 @@ import {
   resolveCaptureStoppedMedia
 } from './capture-policy.js'
 import {
+  HEARTBEAT_FRESH_MS,
+  gimbalCommandValues,
+  hasFreshHeartbeatPose,
+  heartbeatFreshness,
+  timestampAge
+} from './robot-diagnostics.js'
+import {
   eligibleMediaIds,
   formatMediaImportOutcome,
   isMediaPoolEligible,
@@ -1646,7 +1680,6 @@ const cruisePaths = ref([])
 const cruisePoints = ref([])
 const cruiseNewPath = ref('')
 const cruiseNewGoalId = ref(1)
-const cruiseNewGoalObject = ref('')
 const cruiseDwellMin = ref(5)
 const cruiseDwellMax = ref(10)
 const cruiseAutoCamerawork = ref(false)
@@ -2706,7 +2739,9 @@ function connectWs() {
       log(`错误：${message}`)
       return
     }
-    if (!ignoredCaptureLifecycle && !['PONG'].includes(msg.type)) log(eventLabel(msg.type))
+    // Robot state can arrive at heartbeat frequency. The live diagnostic cards show it; adding
+    // every sample to the human event list would bury captures, failures and cruise boundaries.
+    if (!ignoredCaptureLifecycle && !['PONG', 'ROBOT_STATE'].includes(msg.type)) log(eventLabel(msg.type))
   }
   ws.value = socket
 }
@@ -2968,6 +3003,49 @@ const cameraworkWarning = computed(() => {
 // A recording cruise needs sole ownership of the recording. Internal no-record trial sessions
 // are filtered by capture-policy; the cruiseRunning exclusion leaves only a manual session here.
 const manualCaptureActive = computed(() => Boolean(activeSession.value) && !cruiseRunning.value)
+
+const lastGimbalCommand = computed(() => robot.value.diagnostics?.last_gimbal_command || null)
+const lastHeartbeat = computed(() => robot.value.diagnostics?.last_heartbeat || null)
+const lastGimbalValues = computed(() => gimbalCommandValues(lastGimbalCommand.value))
+const heartbeatFreshnessView = computed(() =>
+  heartbeatFreshness(lastHeartbeat.value, robot.value.connected, nowTs.value)
+)
+const heartbeatPoseFresh = computed(() =>
+  hasFreshHeartbeatPose(lastHeartbeat.value, robot.value.connected, nowTs.value)
+)
+const appZoomTargetLabel = computed(() => {
+  const values = lastGimbalValues.value
+  return commandRangeLabel(values?.zoomStart, values?.zoomEnd, '×')
+})
+
+function compactNumber(value) {
+  const number = Number(value)
+  if (!Number.isFinite(number)) return '—'
+  return Number.isInteger(number) ? String(number) : number.toFixed(1).replace(/\.0$/, '')
+}
+
+function commandRangeLabel(start, end, unit) {
+  if (start == null && end == null) return '—'
+  if (start == null || end == null || Number(start) === Number(end)) {
+    return `${compactNumber(end ?? start)}${unit}`
+  }
+  return `${compactNumber(start)}${unit} → ${compactNumber(end)}${unit}`
+}
+
+function appTargetLabel(axis) {
+  const values = lastGimbalValues.value
+  return commandRangeLabel(values?.[`${axis}Start`], values?.[`${axis}End`], '°')
+}
+
+function heartbeatAxisLabel(axis) {
+  const heartbeat = lastHeartbeat.value
+  const value = heartbeat?.[axis]
+  if (value == null) return '未回报'
+  const age = timestampAge(heartbeat?.[`${axis}_received_at`], nowTs.value)
+  if (!robot.value.connected || age == null || age > HEARTBEAT_FRESH_MS) return '未实时回报'
+  return `${compactNumber(value)}°`
+}
+
 const canStartCruise = computed(() =>
   cruisePoints.value.length > 0 && !cruiseRunning.value && !isCruiseBusy.value
   && !framingTestBusy.value && !framingTest.value.running
@@ -3049,7 +3127,7 @@ async function testCruisePoint(point) {
       body: JSON.stringify({
         title: `试跑 ${point.path_name}#${point.goal_id}`,
         map_name: cruiseMap.value || null,
-        points: [{ path_name: point.path_name, goal_id: point.goal_id, goal_object: point.goal_object || null }],
+        points: [{ path_name: point.path_name, goal_id: point.goal_id, goal_object: null }],
         record: false,
         dwell_min_seconds: 0,
         dwell_max_seconds: 0,
@@ -3125,7 +3203,7 @@ function addCruisePoint() {
   cruisePoints.value.push({
     path_name: cruiseNewPath.value,
     goal_id: Number(cruiseNewGoalId.value),
-    goal_object: cruiseNewGoalObject.value.trim() || null
+    goal_object: null
   })
   cruiseNewGoalId.value = Number(cruiseNewGoalId.value) + 1
 }
@@ -3146,7 +3224,7 @@ function buildCruiseRequest() {
     points: cruisePoints.value.map((point) => ({
       path_name: point.path_name,
       goal_id: point.goal_id,
-      goal_object: point.goal_object || null
+      goal_object: null
     })),
     record: true,
     dwell_min_seconds: Number(cruiseDwellMin.value),
@@ -3164,7 +3242,9 @@ function buildCruiseRequest() {
 
 function applyCruiseRequest(request) {
   cruiseMap.value = request.map_name || ''
-  cruisePoints.value = (request.points || []).map((point) => ({ ...point }))
+  // Old saved routes may still contain goal_object. Keep cruise navigation-only when loading
+  // them so legacy data cannot silently restore robot-owned alignment.
+  cruisePoints.value = (request.points || []).map((point) => ({ ...point, goal_object: null }))
   cruiseDwellMin.value = request.dwell_min_seconds
   cruiseDwellMax.value = request.dwell_max_seconds
   cruiseAutoCamerawork.value = Boolean(request.auto_camerawork)
@@ -3435,9 +3515,10 @@ function markCameraworkDirty() {
 }
 
 function useCurrentCameraworkAnchor() {
-  if (robot.value.yaw == null || robot.value.pitch == null) return
-  cameraworkForm.value.anchor_yaw = Math.round(Number(robot.value.yaw))
-  cameraworkForm.value.anchor_pitch = Math.round(Number(robot.value.pitch))
+  const heartbeat = lastHeartbeat.value
+  if (!heartbeatPoseFresh.value || heartbeat?.yaw == null || heartbeat?.pitch == null) return
+  cameraworkForm.value.anchor_yaw = Math.round(Number(heartbeat.yaw))
+  cameraworkForm.value.anchor_pitch = Math.round(Number(heartbeat.pitch))
   markCameraworkDirty()
 }
 
@@ -3833,12 +3914,6 @@ async function addPendingItemsToPool() {
   if (await saveMediaPool({ ...mediaPool.value, [field]: ids }, `已加入媒体池 ${added} 个素材。`)) closeMediaLibrary()
 }
 
-async function addItemToMediaPool(kind, id) {
-  const field = MEDIA_POOL_FIELDS[kind]
-  if (!field || mediaPool.value[field].includes(id)) return true
-  return saveMediaPool({ ...mediaPool.value, [field]: [...mediaPool.value[field], id] })
-}
-
 async function removeFromMediaPool(kind, id) {
   const field = MEDIA_POOL_FIELDS[kind]
   if (!field) return
@@ -4127,7 +4202,8 @@ async function loadTuneSubtitles(mediaId) {
     if (info.track?.cues?.length) {
       tuneSubtitles.value = info.track
       tuneSubtitleNoteKind.value = 'muted'
-      tuneSubtitleNote.value = `已带上原字幕 ${info.track.cues.length} 句，渲染时会重新压到新画面上。`
+      const subtitleLabel = info.track.timing_quality === 'estimated' ? '估算字幕' : '原字幕'
+      tuneSubtitleNote.value = `已带上${subtitleLabel} ${info.track.cues.length} 句，渲染时会重新压到新画面上。`
     }
   } catch (err) {
     if (requestId !== tuneSubtitleRequestId || tuneBed.value?.source_path !== expectedBedPath) return
@@ -5106,17 +5182,8 @@ async function generateVoiceover() {
       })
     })
     await Promise.all([refreshMedia(), refreshVault(), refreshTtsAssets()])
-    // Tick the new voiceover into the pool, so generating one is enough to use it. Without
-    // this you would generate a narration and silently render without it.
-    const newId = result.media_item?.id
-    if (newId && await addItemToMediaPool('voiceover', newId)) {
-      if (!selectedAutomationVoiceoverIds.value.includes(newId)
-          && selectedAutomationVoiceoverIds.value.length < MAX_AUTOMATION_ITEMS) {
-        selectedAutomationVoiceoverIds.value.push(newId)
-      }
-    }
     voiceoverStatusKind.value = 'success'
-    voiceoverStatus.value = `已创建 ${result.asset.name}，可在自动剪辑工作台的旁白池中选用。`
+    voiceoverStatus.value = `已创建 ${result.asset.name}，并保存到媒体库。需要使用时，请在旁白池点击“从媒体库添加”。`
   } catch (err) {
     voiceoverStatusKind.value = 'danger'
     voiceoverStatus.value = `旁白生成失败：${humanError(err.message)}`

@@ -392,6 +392,7 @@ class RenderService:
             "primary_colour": track.primary_colour,
             "outline_colour": track.outline_colour,
             "max_lines": track.max_lines,
+            "timing_quality": track.timing_quality,
             "cues": [
                 {"start": cue.start, "end": cue.end, "text": cue.text}
                 for cue in cues
@@ -410,7 +411,7 @@ class RenderService:
         path = self.subtitle_sidecar_path(output_path)
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
+        except (OSError, UnicodeError, json.JSONDecodeError):
             return None
         if not isinstance(data, dict):
             return None

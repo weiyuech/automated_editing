@@ -5,10 +5,12 @@ from __future__ import annotations
 import hashlib
 import re
 import shutil
+import tomllib
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-DESTINATION = ROOT / "Automated-Video-Editing-0.1.5-External-Media-Tools-Source"
+VERSION = tomllib.loads((ROOT / "backend/pyproject.toml").read_text(encoding="utf-8"))["project"]["version"]
+DESTINATION = ROOT / f"Automated-Video-Editing-{VERSION}-External-Media-Tools-Source"
 
 FILES = {
     "SOURCE_DELIVERY_README.md": "README.md",
@@ -24,6 +26,8 @@ FILES = {
     "frontend/build/icon.png": "frontend/build/icon.png",
     "frontend/build/icon.svg": "frontend/build/icon.svg",
     "frontend/build/external-media-tools.json": "frontend/build/external-media-tools.json",
+    "tools/robot-control-console.html": "tools/robot-control-console.html",
+    "tools/tests/robot-control-console.test.mjs": "tools/tests/robot-control-console.test.mjs",
 }
 
 TREES = (
@@ -118,6 +122,10 @@ def build_delivery() -> None:
 
     for name in SCRIPT_FILES:
         copy_file(ROOT / "scripts" / name, DESTINATION / "scripts" / name)
+
+    # Electron Builder resolves this original filename from its configuration. Retain it as
+    # well as the reader-facing THIRD_PARTY_NOTICES.md so the delivery can actually rebuild.
+    copy_file(ROOT / "THIRD_PARTY_NOTICES_EXTERNAL.md", DESTINATION / "THIRD_PARTY_NOTICES_EXTERNAL.md")
 
 
 def audit_delivery() -> list[Path]:

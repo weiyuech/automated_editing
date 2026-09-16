@@ -96,13 +96,17 @@ class FramingTestService:
                 # the test endpoint. If this restore fails, the outer finally makes one last
                 # best-effort restore and the disposable preview is not accepted.
                 await self.robot.sweep_camera(
-                    float(original_yaw), self.PREPOSITION_SPEED_DEG_S
+                    float(original_yaw), self.PREPOSITION_SPEED_DEG_S,
+                    context="framing_test",
                 )
                 returned_to_start = True
             return await self._download(url)
 
         try:
-            await self.robot.sweep_camera(self.LEFT_YAW, self.PREPOSITION_SPEED_DEG_S)
+            await self.robot.sweep_camera(
+                self.LEFT_YAW, self.PREPOSITION_SPEED_DEG_S,
+                context="framing_test",
+            )
             await self._await_yaw(self.LEFT_YAW, timeout_s=3.5)
 
             recording = await self.robot.start_recording()
@@ -110,7 +114,10 @@ class FramingTestService:
                 raise RuntimeError(recording.error or "机器人未确认开始录制")
             recording_started = True
 
-            await self.robot.sweep_camera(self.RIGHT_YAW, self.SWEEP_SPEED_DEG_S)
+            await self.robot.sweep_camera(
+                self.RIGHT_YAW, self.SWEEP_SPEED_DEG_S,
+                context="framing_test",
+            )
             await asyncio.sleep(self.RECORD_SECONDS)
 
             stopped, preview_path = await self.robot.stop_recording_with_download(
@@ -134,7 +141,8 @@ class FramingTestService:
             if original_yaw is not None and not returned_to_start:
                 with suppress(Exception):
                     await self.robot.sweep_camera(
-                        float(original_yaw), self.PREPOSITION_SPEED_DEG_S
+                        float(original_yaw), self.PREPOSITION_SPEED_DEG_S,
+                        context="framing_test",
                     )
 
         if preview_path is None:

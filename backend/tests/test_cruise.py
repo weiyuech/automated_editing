@@ -65,30 +65,57 @@ async def test_arrival_ignores_the_previous_goal_settled_heartbeat():
     with pytest.raises(TimeoutError):
         await adapter.wait_for_arrival(timeout_s=0.05)
 
-    await adapter._handle_message(heartbeat("going"))
-    await adapter._handle_message(heartbeat("done"))
+    await adapter._handle_message(heartbeat("going", goal_id=2))
+    await adapter._handle_message(heartbeat("done", goal_id=2))
     assert await adapter.wait_for_arrival(timeout_s=0.05) == "done"
 
 
 @pytest.mark.asyncio
-async def test_arrival_waits_for_alignment_only_when_goal_object_is_set():
-    with_object = armed_adapter()
-    with_object._arm_goal_tracking(
+async def test_current_goal_with_full_identity_can_report_done_without_a_going_frame():
+    adapter = armed_adapter()
+    adapter._arm_goal_tracking(RobotGoalCommand(path_name="path1", goal_id=2))
+
+    await adapter._handle_message(heartbeat("done", goal_id=2))
+
+    assert await adapter.wait_for_arrival(timeout_s=0.05) == "done"
+
+
+@pytest.mark.asyncio
+async def test_identityless_initial_done_still_requires_a_non_done_transition():
+    adapter = armed_adapter()
+    adapter._arm_goal_tracking(RobotGoalCommand(path_name="path1", goal_id=2))
+
+    await adapter._handle_message(json.dumps({"task": {"goal_status": "done"}}))
+    with pytest.raises(TimeoutError):
+        await adapter.wait_for_arrival(timeout_s=0.05)
+
+    await adapter._handle_message(json.dumps({"task": {"goal_status": "going"}}))
+    await adapter._handle_message(json.dumps({"task": {"goal_status": "done"}}))
+    assert await adapter.wait_for_arrival(timeout_s=0.05) == "done"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("object_status", [None, "going", "done", "failed", "faild"])
+async def test_object_status_is_diagnostic_only_and_never_blocks_arrival(object_status):
+    adapter = armed_adapter()
+    adapter._arm_goal_tracking(
         RobotGoalCommand(path_name="path1", goal_id=1, goal_object="car")
     )
-    await with_object._handle_message(heartbeat("going"))
-    await with_object._handle_message(heartbeat("done", object_status="going"))
-    with pytest.raises(TimeoutError):
-        await with_object.wait_for_arrival(timeout_s=0.05)
-    await with_object._handle_message(heartbeat("done", object_status="done"))
-    assert await with_object.wait_for_arrival(timeout_s=0.05) == "done"
+    await adapter._handle_message(heartbeat("going", object_status="going", goal_id=1))
+    done = json.loads(heartbeat("done", object_status=object_status, goal_id=1))
+    if object_status is None:
+        done["task"].pop("object_status")
+    await adapter._handle_message(json.dumps(done))
+    assert await adapter.wait_for_arrival(timeout_s=0.05) == "done"
 
-    without_object = armed_adapter()
-    without_object._arm_goal_tracking(RobotGoalCommand(path_name="path1", goal_id=1))
-    await without_object._handle_message(heartbeat("going"))
-    # Same 'still aligning' heartbeat, but this point never asked for alignment.
-    await without_object._handle_message(heartbeat("done", object_status="going"))
-    assert await without_object.wait_for_arrival(timeout_s=0.05) == "done"
+
+@pytest.mark.asyncio
+async def test_navigation_failure_still_fails_when_object_status_is_done():
+    adapter = armed_adapter()
+    adapter._arm_goal_tracking(RobotGoalCommand(path_name="path1", goal_id=1))
+    await adapter._handle_message(heartbeat("going", goal_id=1))
+    await adapter._handle_message(heartbeat("failed", object_status="done", goal_id=1))
+    assert await adapter.wait_for_arrival(timeout_s=0.05) == "failed"
 
 
 @pytest.mark.asyncio
@@ -155,7 +182,7 @@ class FakeAdapter:
         await asyncio.sleep(0)
         return "failed" if self._pending.goal_id in self.fail_ids else "done"
 
-    async def sweep_camera(self, target_yaw, yaw_speed):
+    async def sweep_camera(self, target_yaw, yaw_speed, *, context="camera_sweep"):
         self.sweeps.append((target_yaw, yaw_speed))
         self.state.yaw = target_yaw
         return self.state
@@ -173,7 +200,7 @@ class FakeAdapter:
     def heartbeat_revision(self):
         return self.gimbal_revision
 
-    async def set_gimbal(self, command):
+    async def set_gimbal(self, command, *, context="manual"):
         self.gimbal_commands.append(command)
         self.state.yaw = command.yaw_end
         self.state.pitch = command.pitch_end
@@ -265,6 +292,21 @@ async def test_cruise_records_once_and_marks_each_arrival():
     assert [marker.label for marker in run.markers] == ["path1#1", "path1#2"]
     assert len(capture.list_sessions()[0].markers) == 2
     assert run.media_url == "robot://cruise.mp4"
+
+
+@pytest.mark.asyncio
+async def test_legacy_goal_object_is_stripped_before_cruise_dispatch():
+    cruise, adapter, _ = build_cruise()
+    request = cruise_request(
+        points=[CruisePoint(path_name="path1", goal_id=1, goal_object="car")]
+    )
+
+    run = await cruise.start(request)
+    await cruise._task
+
+    assert run.status == "succeeded"
+    assert run.segments[0].goal_object is None
+    assert adapter.goals[0].goal_object is None
 
 
 @pytest.mark.asyncio

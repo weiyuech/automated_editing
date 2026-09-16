@@ -36,6 +36,8 @@ _CW_OPPOSITE_PROB = 0.80
 _CW_OPPOSITE_DISTANCE = (0.60, 0.90)
 _CW_OUTWARD_DISTANCE = (0.10, 0.30)
 _CW_CENTER_DISTANCE = (0.40, 0.80)
+# Direction selection only; targets still use the complete configured yaw range.
+_CW_DIRECTION_ROOM_DEG = 10.0
 _CW_LEG_MARGIN = 0.6
 _CW_ZOOM_SETTLE_SECONDS = 1.0
 _CW_POSE_TOLERANCE_DEG = 2.0
@@ -55,8 +57,8 @@ class CruiseService:
     """Drives the robot through an ordered list of points while a single recording runs.
 
     Deliberately narrower than a live-tour engine: no knowledge base, no narration, no
-    repeat count. Points carry no goal_object by default, so the robot is never asked to
-    align its gimbal on arrival and never stalls waiting for object recognition.
+    repeat count. Every point is dispatched navigation-only, so legacy goal_object data can
+    never make shooting wait for object recognition or hand camera ownership to the robot.
     """
 
     def __init__(
@@ -107,6 +109,9 @@ class CruiseService:
         if camerawork is not None and not camerawork.configured:
             raise ValueError("Automatic camerawork is not configured; save it in 镜头设置 first")
 
+        # Product invariant: cruise is navigation-only. ``goal_object`` remains accepted in
+        # stored/API data for backward compatibility, but an old route must never re-enable
+        # robot-owned object alignment or make shooting wait on object recognition.
         run = CruiseRun(
             title=request.title,
             map_name=request.map_name,
@@ -116,7 +121,7 @@ class CruiseService:
                     index=index,
                     path_name=point.path_name,
                     goal_id=point.goal_id,
-                    goal_object=point.goal_object,
+                    goal_object=None,
                 )
                 for index, point in enumerate(request.points)
             ],
@@ -317,7 +322,7 @@ class CruiseService:
                 RobotGoalCommand(
                     path_name=segment.path_name,
                     goal_id=segment.goal_id,
-                    goal_object=segment.goal_object,
+                    goal_object=None,
                 )
             )
         except ConnectionError:
@@ -455,11 +460,19 @@ class CruiseService:
         if abs(target - center) < scan.settle_tolerance_deg:
             return False
 
-        await self.robot.sweep_camera(target, scan.yaw_speed_deg_s)
+        await self.robot.sweep_camera(
+            target,
+            scan.yaw_speed_deg_s,
+            context="cruise_stationary_scan",
+        )
         await self._await_yaw(target, scan)
         if self._cancel.is_set():
             return False
-        await self.robot.sweep_camera(center, scan.yaw_speed_deg_s)
+        await self.robot.sweep_camera(
+            center,
+            scan.yaw_speed_deg_s,
+            context="cruise_stationary_scan",
+        )
         await self._await_yaw(center, scan)
         return True
 
@@ -505,8 +518,8 @@ class CruiseService:
         if current > 0:  # physically left
             inward_room = current - low
             outward_room = high - current
-            choose_opposite = inward_room > 0.1 and (
-                outward_room <= 0.1 or random.random() < _CW_OPPOSITE_PROB
+            choose_opposite = inward_room > _CW_DIRECTION_ROOM_DEG and (
+                outward_room <= _CW_DIRECTION_ROOM_DEG or random.random() < _CW_OPPOSITE_PROB
             )
             if choose_opposite:
                 distance = max(1.0, random.uniform(*_CW_OPPOSITE_DISTANCE) * inward_room)
@@ -517,8 +530,8 @@ class CruiseService:
         if current < 0:  # physically right
             inward_room = high - current
             outward_room = current - low
-            choose_opposite = inward_room > 0.1 and (
-                outward_room <= 0.1 or random.random() < _CW_OPPOSITE_PROB
+            choose_opposite = inward_room > _CW_DIRECTION_ROOM_DEG and (
+                outward_room <= _CW_DIRECTION_ROOM_DEG or random.random() < _CW_OPPOSITE_PROB
             )
             if choose_opposite:
                 distance = max(1.0, random.uniform(*_CW_OPPOSITE_DISTANCE) * inward_room)
@@ -530,8 +543,8 @@ class CruiseService:
         # direction equally, but still demand a visible medium/large sweep rather than jitter.
         right_room = current - low
         left_room = high - current
-        choose_right = right_room > 0.1 and (
-            left_room <= 0.1 or random.random() < 0.5
+        choose_right = right_room > _CW_DIRECTION_ROOM_DEG and (
+            left_room <= _CW_DIRECTION_ROOM_DEG or random.random() < 0.5
         )
         if choose_right:
             distance = max(1.0, random.uniform(*_CW_CENTER_DISTANCE) * (current - low))
@@ -546,6 +559,43 @@ class CruiseService:
             self._adaptive_yaw_target(current_yaw, config),
             random.randint(config.pitch_min, config.pitch_max),
         )
+
+    def _separate_camerawork_target(
+        self,
+        target: tuple[float, float],
+        current_yaw: float,
+        current_pitch: float,
+        config: CameraworkConfig,
+    ) -> tuple[float, float]:
+        """Keep the selected yaw, and choose a pitch in a different angular region.
+
+        Regions are the four halves of the user's yaw/pitch rectangle, not protocol-zero
+        quadrants. A point on a dividing line belongs to the greater-value half. This filter
+        runs before each random leg, including the second ping-pong leg; anchors bypass it.
+        Crossing either dividing line is sufficient; no minimum travel distance is imposed.
+        """
+        current_yaw = _clamp(current_yaw, config.yaw_min, config.yaw_max)
+        current_pitch = _clamp(current_pitch, config.pitch_min, config.pitch_max)
+        yaw = round(_clamp(target[0], config.yaw_min, config.yaw_max))
+        pitch = round(_clamp(target[1], config.pitch_min, config.pitch_max))
+        yaw_mid = (config.yaw_min + config.yaw_max) / 2.0
+        pitch_mid = (config.pitch_min + config.pitch_max) / 2.0
+        yaw_changes_half = (yaw >= yaw_mid) != (current_yaw >= yaw_mid)
+
+        def acceptable(candidate: int) -> bool:
+            return yaw_changes_half or (
+                (candidate >= pitch_mid) != (current_pitch >= pitch_mid)
+            )
+
+        if not acceptable(pitch):
+            # Valid profiles have distinct integer pitch bounds. The opposite pitch endpoint
+            # always changes half, so this is nonempty even for a one-degree pitch range.
+            choices = [
+                candidate for candidate in range(config.pitch_min, config.pitch_max + 1)
+                if acceptable(candidate)
+            ]
+            pitch = random.choice(choices)
+        return yaw, pitch
 
     def _pingpong_poses(
         self, current_yaw: float, config: CameraworkConfig,
@@ -617,13 +667,15 @@ class CruiseService:
             yaw = self.robot.heartbeat_yaw()
             pitch = self._heartbeat_pitch()
             revision = self._heartbeat_revision()
-            if revision is not None:
-                observed = True
-            fresh = revision is None or last_revision is None or revision > last_revision
+            # A pose is usable only when the adapter reports a new complete yaw+pitch
+            # heartbeat sample. Treating ``revision is None`` as fresh would repeatedly
+            # count cached split-axis values at startup and could falsely confirm arrival.
+            fresh = revision is not None and (
+                last_revision is None or revision > last_revision
+            )
             if fresh and yaw is not None and pitch is not None:
                 observed = True
-                if revision is not None:
-                    last_revision = revision
+                last_revision = revision
                 if (
                     abs(yaw - target_yaw) <= _CW_POSE_TOLERANCE_DEG
                     and abs(pitch - target_pitch) <= _CW_POSE_TOLERANCE_DEG
@@ -646,24 +698,26 @@ class CruiseService:
         """One slow transit move to a fresh yaw/pitch target; zoom remains fixed.
 
         A failed gimbal command must never break the cruise, so anything short of a lost
-        connection is swallowed. The wait is time-based (travel ÷ speed), because only yaw has
-        heartbeat progress and a diagonal leg must allow its pitch component to land too.
+        connection is swallowed. Fresh yaw/pitch feedback can confirm arrival; otherwise the
+        travel ÷ speed budget allows both axes time to move before the next command.
         """
         start_yaw = self._current_yaw(config)
         start_pitch = self._current_pitch(config)
         target_yaw, target_pitch = target
-        heartbeat_revision = self._heartbeat_revision()
         command = GimbalMoveRequest(
             yaw_start=start_yaw, yaw_end=target_yaw, yaw_speed=speed,
             pitch_start=start_pitch, pitch_end=target_pitch, pitch_speed=speed,
             zoom_start=self._cw_zoom, zoom_end=self._cw_zoom,
         )
         try:
-            await self.robot.set_gimbal(command)
+            await self.robot.set_gimbal(command, context="cruise_moving")
         except ConnectionError:
             raise
         except Exception:
             return
+        # Capture the boundary after the command is written so no pre-command heartbeat can
+        # be mistaken for feedback to this target.
+        heartbeat_revision = self._heartbeat_revision()
         self._cw_yaw = target_yaw
         self._cw_pitch = target_pitch
         travel = max(abs(target_yaw - start_yaw), abs(target_pitch - start_pitch))
@@ -690,6 +744,7 @@ class CruiseService:
             mode = self._pick_camerawork_mode()
             current_yaw = self._current_yaw(config)
             current_pitch = self._current_pitch(config)
+            separate_target = mode != "anchor"
             if mode == "anchor":
                 if (
                     abs(current_yaw - config.anchor_yaw) <= _CW_POSE_TOLERANCE_DEG
@@ -697,6 +752,7 @@ class CruiseService:
                 ):
                     # Returning to where we already are would recreate the removed static hold.
                     targets = [self._camerawork_pose(current_yaw, config)]
+                    separate_target = True
                 else:
                     targets = [(config.anchor_yaw, config.anchor_pitch)]
             elif mode == "pingpong":
@@ -711,6 +767,10 @@ class CruiseService:
                     or stop_requested.is_set()
                 ):
                     break
+                if separate_target:
+                    target = self._separate_camerawork_target(
+                        target, self._current_yaw(config), self._current_pitch(config), config,
+                    )
                 speed = random.randint(config.speed_min, config.speed_max)
                 await self._camerawork_leg(target, speed, deadline, config)
 
@@ -732,13 +792,16 @@ class CruiseService:
 
         zoom_target = self._parked_zoom_target(config)
         try:
-            await self.robot.set_gimbal(GimbalMoveRequest(
-                yaw_start=config.anchor_yaw, yaw_end=config.anchor_yaw,
-                yaw_speed=config.speed_min,
-                pitch_start=config.anchor_pitch, pitch_end=config.anchor_pitch,
-                pitch_speed=config.speed_min,
-                zoom_start=self._cw_zoom, zoom_end=zoom_target,
-            ))
+            await self.robot.set_gimbal(
+                GimbalMoveRequest(
+                    yaw_start=config.anchor_yaw, yaw_end=config.anchor_yaw,
+                    yaw_speed=config.speed_min,
+                    pitch_start=config.anchor_pitch, pitch_end=config.anchor_pitch,
+                    pitch_speed=config.speed_min,
+                    zoom_start=self._cw_zoom, zoom_end=zoom_target,
+                ),
+                context="cruise_stationary_zoom",
+            )
         except ConnectionError:
             raise
         except Exception:
@@ -754,17 +817,23 @@ class CruiseService:
     async def _return_to_anchor(self, config: CameraworkConfig, *, wait: bool = True) -> bool:
         """Command the complete resting pose and confirm physical yaw/pitch when available."""
         attempts = 2 if wait else 1
+        ever_observed_conflict = False
         for attempt in range(attempts):
             start_yaw = self._current_yaw(config)
             start_pitch = self._current_pitch(config)
             start_zoom = self._cw_zoom
             speed = config.speed_max
+            await self.robot.set_gimbal(
+                GimbalMoveRequest(
+                    yaw_start=start_yaw, yaw_end=config.anchor_yaw, yaw_speed=speed,
+                    pitch_start=start_pitch, pitch_end=config.anchor_pitch, pitch_speed=speed,
+                    zoom_start=start_zoom, zoom_end=config.anchor_zoom,
+                ),
+                context="cruise_stationary_anchor",
+            )
+            # This boundary must be taken after the command reaches the adapter. It excludes
+            # any heartbeat that raced in before the new target was actually written.
             heartbeat_revision = self._heartbeat_revision()
-            await self.robot.set_gimbal(GimbalMoveRequest(
-                yaw_start=start_yaw, yaw_end=config.anchor_yaw, yaw_speed=speed,
-                pitch_start=start_pitch, pitch_end=config.anchor_pitch, pitch_speed=speed,
-                zoom_start=start_zoom, zoom_end=config.anchor_zoom,
-            ))
             self._cw_yaw = config.anchor_yaw
             self._cw_pitch = config.anchor_pitch
             self._cw_zoom = config.anchor_zoom
@@ -789,7 +858,9 @@ class CruiseService:
                     await self._sleep_or_cancel(remaining_zoom)
             if reached:
                 return True
-            if not observed:
+            if observed:
+                ever_observed_conflict = True
+            if not observed and not ever_observed_conflict:
                 # Compatibility fallback for robots that do not expose both axes: the complete
                 # conservative travel budget elapsed without a conflicting physical reading.
                 return True

@@ -29,6 +29,71 @@ class DummyEvents:
         return None
 
 
+def test_voiceover_duration_prefers_actual_probe_without_mutating_sidecars(tmp_path):
+    class DurationRenderer:
+        def __init__(self):
+            self.calls = 0
+
+        def probe_duration(self, _path):
+            self.calls += 1
+            return 4.25
+
+    renderer = DurationRenderer()
+    service = JobService(DummyEvents(), None, None, None, renderer)
+    estimated = MediaItem(
+        path=str(tmp_path / "estimated.mp3"),
+        kind="audio",
+        metadata={"duration_ms": 1200, "timing_quality": "estimated"},
+    )
+    exact = MediaItem(
+        path=str(tmp_path / "exact.mp3"),
+        kind="audio",
+        metadata={"duration_ms": 1200, "timing_quality": "exact"},
+    )
+
+    assert service._audio_duration(estimated) == 4.25
+    assert service._audio_duration(exact) == 4.25
+    assert renderer.calls == 2
+
+    without_probe = JobService(DummyEvents(), None, None, None, None)
+    assert without_probe._audio_duration(estimated) == 1.2
+
+    malformed = tmp_path / "malformed.json"
+    malformed.write_text("{not json", encoding="utf-8")
+    damaged = MediaItem(
+        path=str(tmp_path / "damaged.mp3"),
+        kind="audio",
+        metadata={"metadata_path": str(malformed), "duration_ms": 1200},
+    )
+    assert service._audio_duration(damaged) == 4.25
+    assert malformed.read_text(encoding="utf-8") == "{not json"
+    assert not list(tmp_path.glob("malformed.json.corrupt-*"))
+
+    cached_audio = tmp_path / "cached.mp3"
+    cached_audio.write_bytes(b"stable-audio")
+    cached = MediaItem(path=str(cached_audio), kind="audio")
+    calls_before_cache = renderer.calls
+    assert service._audio_duration(cached) == 4.25
+    assert service._audio_duration(cached) == 4.25
+    assert renderer.calls == calls_before_cache + 1
+
+
+def test_voiceover_duration_rejects_boolean_and_non_finite_metadata(tmp_path):
+    audio = tmp_path / "voice.mp3"
+    audio.write_bytes(b"audio")
+    sidecar = audio.with_suffix(".json")
+    sidecar.write_text(json.dumps({"duration_ms": 2400}), encoding="utf-8")
+    service = JobService(DummyEvents(), None, None, None, None)
+
+    for invalid in (True, False, float("nan"), float("inf"), -1, 0):
+        item = MediaItem(
+            path=str(audio),
+            kind="audio",
+            metadata={"metadata_path": str(sidecar), "duration_ms": invalid},
+        )
+        assert service._audio_duration(item) == 2.4
+
+
 def test_three_sources_are_dealt_four_three_three_across_ten_outputs():
     service = JobService(DummyEvents(), None, None, None, None)
 

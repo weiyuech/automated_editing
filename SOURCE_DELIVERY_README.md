@@ -1,11 +1,15 @@
 # Automated Video Editing — external media tools source delivery
 
-Version: 0.1.5
+Version: 0.1.6
 
 This directory contains the application source, tests, build manifests, authored interface
 assets, and third-party notices for the external media tools edition.  It contains no version
 control database, commit history, local settings, credentials, dependency caches, downloaded
 models or fonts, compiled backend, installer, user media, logs, or exports.
+
+The robot camerawork and arrival logic are described in `docs/cruise_capture.md`.
+The standalone robot console is `tools/robot-control-console.html`; its regression checks
+run with `node --test tools/tests/robot-control-console.test.mjs`.
 
 ## Prerequisites
 

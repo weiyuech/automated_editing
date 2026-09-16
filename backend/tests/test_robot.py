@@ -7,6 +7,9 @@ from automated_video_editing_backend.core.diagnostics import safe_url
 from automated_video_editing_backend.core.events import EventHub
 from automated_video_editing_backend.core.models import (
     CameraAngle,
+    GimbalCommandDiagnostic,
+    GimbalMoveRequest,
+    GoalCommandAttemptDiagnostic,
     MediaItem,
     MoveCommand,
     RobotGoalCommand,
@@ -61,11 +64,12 @@ async def test_hardware_adapter_uses_documented_websocket_protocol():
             elif "get_path_list" in payload:
                 await adapter._handle_message(json.dumps({"robot_path_list": ["path1"]}))
             elif "set_goal" in payload:
+                requested = payload["set_goal"]
                 await adapter._handle_message(json.dumps({
                     "robot_goal": {
-                        "path_file": "path1",
-                        "goal_id": 3,
-                        "goal_object": "car",
+                        "path_file": requested["path_name"],
+                        "goal_id": requested["goal_id"],
+                        "goal_object": requested["goal_object"],
                         "goal_check": "true",
                     }
                 }))
@@ -112,6 +116,24 @@ async def test_hardware_adapter_uses_documented_websocket_protocol():
             RobotGoalCommand(path_name="path1", goal_id=3, goal_object="car")
         )
         assert goal["goal_check"] == "true"
+        camera_command = adapter.state.diagnostics.last_gimbal_command
+        assert camera_command is not None
+        assert camera_command.context == "goal_object_alignment"
+        assert camera_command.base_motion_intent == "moving"
+        assert camera_command.payload == {
+            "set_goal": {"path_name": "path1", "goal_id": 3, "goal_object": "car"}
+        }
+        navigation_goal = await adapter.set_goal(
+            RobotGoalCommand(path_name="path1", goal_id=4, goal_object="")
+        )
+        assert navigation_goal["goal_check"] == "true"
+        navigation_command = adapter.state.diagnostics.last_goal_command
+        assert navigation_command is not None
+        assert navigation_command.context == "cruise_navigation_goal"
+        assert navigation_command.payload == {
+            "set_goal": {"path_name": "path1", "goal_id": 4, "goal_object": ""}
+        }
+        assert adapter.state.diagnostics.last_gimbal_command is None
         state = await adapter.start_recording()
         assert state.recording is True
         photo = await adapter.capture_photo()
@@ -125,6 +147,9 @@ async def test_hardware_adapter_uses_documented_websocket_protocol():
         assert {
             "set_goal": {"path_name": "path1", "goal_id": 3, "goal_object": "car"}
         } in received
+        assert {
+            "set_goal": {"path_name": "path1", "goal_id": 4, "goal_object": ""}
+        } in received
         assert {"video_record": {"start": 0, "resolution": 4}} in received
         assert {"video_record": {"stop": 0}} in received
         assert {"take_photo": {"counter": 1, "gap": 0}} in received
@@ -132,6 +157,553 @@ async def test_hardware_adapter_uses_documented_websocket_protocol():
         assert adapter.state.battery == 85
     finally:
         await adapter.disconnect()
+
+
+class _GoalAttemptEventHub(EventHub):
+    def __init__(self):
+        super().__init__()
+        self.robot_states = []
+
+    async def publish(self, event_type, data=None):
+        if event_type == "ROBOT_STATE":
+            self.robot_states.append(data or {})
+        await super().publish(event_type, data)
+
+
+def _goal_attempt_adapter(events=None):
+    adapter = HardwareRobotAdapter(events or EventHub(), "ws://robot.local:8765")
+    adapter.state.connected = True
+    adapter.state.connection_status = "connected"
+
+    async def fake_connect():
+        return adapter.state
+
+    adapter.connect = fake_connect
+    return adapter
+
+
+async def _accept_diagnostic_goal(adapter, command):
+    class EchoingSocket:
+        async def send(self, message):
+            requested = json.loads(message)["set_goal"]
+            await adapter._handle_message(json.dumps({
+                "robot_goal": {
+                    "path_file": requested["path_name"],
+                    "goal_id": requested["goal_id"],
+                    "goal_object": requested["goal_object"],
+                    "goal_check": "true",
+                }
+            }))
+
+    adapter._socket = EchoingSocket()
+    return await adapter.set_goal(command)
+
+
+def _published_goal_attempt_outcomes(events):
+    outcomes = []
+    for state in events.robot_states:
+        attempt = state.get("diagnostics", {}).get("last_goal_attempt")
+        if attempt:
+            outcomes.append(attempt.get("outcome"))
+    return outcomes
+
+
+@pytest.mark.asyncio
+async def test_goal_attempt_is_observable_after_write_while_awaiting_reply_then_accepted():
+    events = _GoalAttemptEventHub()
+    adapter = _goal_attempt_adapter(events)
+    written = asyncio.Event()
+    sent_payload = None
+
+    class DelayedReplySocket:
+        async def send(self, message):
+            nonlocal sent_payload
+            sent_payload = json.loads(message)
+            written.set()
+
+    adapter._socket = DelayedReplySocket()
+    command = RobotGoalCommand(path_name="path-a", goal_id=1)
+    request = asyncio.create_task(adapter.set_goal(command))
+    try:
+        await written.wait()
+        await asyncio.sleep(0)
+        attempt = adapter.state.diagnostics.last_goal_attempt
+        assert attempt is not None
+        assert attempt.context == "cruise_navigation_goal"
+        assert attempt.base_motion_intent == "moving"
+        assert attempt.payload == {
+            "set_goal": {"path_name": "path-a", "goal_id": 1, "goal_object": None}
+        }
+        assert attempt.outcome == "awaiting_reply"
+        assert attempt.completed_at is None
+        assert attempt.error is None
+        assert "awaiting_reply" in _published_goal_attempt_outcomes(events)
+
+        await adapter._handle_message(json.dumps({
+            "robot_goal": {
+                "path_file": "path-a",
+                "goal_id": 1,
+                "goal_object": None,
+                "goal_check": "true",
+            }
+        }))
+        result = await request
+    finally:
+        if not request.done():
+            await adapter._handle_message(json.dumps({
+                "robot_goal": {
+                    "path_file": "path-a", "goal_id": 1,
+                    "goal_object": None, "goal_check": "true",
+                }
+            }))
+            try:
+                await request
+            except Exception:
+                pass
+
+    assert sent_payload == {
+        "set_goal": {"path_name": "path-a", "goal_id": 1, "goal_object": None}
+    }
+    assert result["goal_check"] == "true"
+    accepted = adapter.state.diagnostics.last_goal_attempt
+    assert accepted is not None
+    assert accepted.attempt_id == attempt.attempt_id
+    assert accepted.outcome == "accepted"
+    assert accepted.completed_at is not None
+    assert accepted.error is None
+    assert adapter.state.diagnostics.last_goal_command is not None
+    assert adapter.state.diagnostics.last_goal_command.payload == accepted.payload
+    assert "accepted" in _published_goal_attempt_outcomes(events)
+
+
+@pytest.mark.asyncio
+async def test_rejected_goal_attempt_is_visible_without_replacing_last_accepted_goal():
+    events = _GoalAttemptEventHub()
+    adapter = _goal_attempt_adapter(events)
+    await _accept_diagnostic_goal(
+        adapter,
+        RobotGoalCommand(path_name="path-a", goal_id=1),
+    )
+    previous_attempt = adapter.state.diagnostics.last_goal_attempt
+    previous_command = adapter.state.diagnostics.last_goal_command
+
+    class RejectingSocket:
+        async def send(self, message):
+            requested = json.loads(message)["set_goal"]
+            await adapter._handle_message(json.dumps({
+                "robot_goal": {
+                    "path_file": requested["path_name"],
+                    "goal_id": requested["goal_id"],
+                    "goal_object": requested["goal_object"],
+                    "goal_check": "false",
+                    "message": "point not found",
+                }
+            }))
+
+    adapter._socket = RejectingSocket()
+    result = await adapter.set_goal(RobotGoalCommand(path_name="path-b", goal_id=2))
+
+    rejected = adapter.state.diagnostics.last_goal_attempt
+    assert previous_attempt is not None
+    assert rejected is not None
+    assert rejected.attempt_id != previous_attempt.attempt_id
+    assert rejected.payload["set_goal"]["goal_id"] == 2
+    assert rejected.outcome == "rejected"
+    assert rejected.completed_at is not None
+    assert rejected.error == "point not found"
+    assert result["goal_check"] == "false"
+    assert adapter.state.diagnostics.last_goal_command == previous_command
+    assert adapter.state.diagnostics.last_goal_command.payload["set_goal"]["goal_id"] == 1
+    assert _published_goal_attempt_outcomes(events)[-1] == "rejected"
+
+
+@pytest.mark.asyncio
+async def test_timed_out_goal_attempt_is_visible_without_replacing_last_accepted_goal():
+    events = _GoalAttemptEventHub()
+    adapter = _goal_attempt_adapter(events)
+    await _accept_diagnostic_goal(
+        adapter,
+        RobotGoalCommand(path_name="path-a", goal_id=1),
+    )
+    previous_command = adapter.state.diagnostics.last_goal_command
+
+    class SilentSocket:
+        async def send(self, _message):
+            return None
+
+    adapter._socket = SilentSocket()
+    original_request = adapter._request
+
+    async def quick_request(payload, response_key, timeout_s=5.0):
+        del timeout_s
+        return await original_request(payload, response_key, timeout_s=0.01)
+
+    adapter._request = quick_request
+    with pytest.raises(TimeoutError, match="等待机器人回复超时"):
+        await adapter.set_goal(RobotGoalCommand(path_name="path-b", goal_id=2))
+
+    timed_out = adapter.state.diagnostics.last_goal_attempt
+    assert timed_out is not None
+    assert timed_out.payload["set_goal"]["goal_id"] == 2
+    assert timed_out.outcome == "reply_timeout"
+    assert timed_out.completed_at is not None
+    assert "等待机器人回复超时" in str(timed_out.error)
+    assert adapter.state.diagnostics.last_goal_command == previous_command
+    assert adapter.state.diagnostics.last_goal_command.payload["set_goal"]["goal_id"] == 1
+    assert _published_goal_attempt_outcomes(events)[-1] == "reply_timeout"
+
+
+@pytest.mark.asyncio
+async def test_mismatched_goal_reply_marks_attempt_without_replacing_last_accepted_goal():
+    events = _GoalAttemptEventHub()
+    adapter = _goal_attempt_adapter(events)
+    await _accept_diagnostic_goal(
+        adapter,
+        RobotGoalCommand(path_name="path-a", goal_id=1),
+    )
+    previous_command = adapter.state.diagnostics.last_goal_command
+
+    class PreviousGoalReplySocket:
+        async def send(self, _message):
+            await adapter._handle_message(json.dumps({
+                "robot_goal": {
+                    "path_file": "path-a", "goal_id": 1,
+                    "goal_object": None, "goal_check": "true",
+                }
+            }))
+
+    adapter._socket = PreviousGoalReplySocket()
+    with pytest.raises(ValueError, match="目标点与本次指令不一致"):
+        await adapter.set_goal(RobotGoalCommand(path_name="path-b", goal_id=2))
+
+    mismatch = adapter.state.diagnostics.last_goal_attempt
+    assert mismatch is not None
+    assert mismatch.payload["set_goal"]["goal_id"] == 2
+    assert mismatch.outcome == "reply_mismatch"
+    assert mismatch.completed_at is not None
+    assert "目标点与本次指令不一致" in str(mismatch.error)
+    assert adapter.state.diagnostics.last_goal_command == previous_command
+    assert adapter.state.diagnostics.last_goal_command.payload["set_goal"]["goal_id"] == 1
+    assert _published_goal_attempt_outcomes(events)[-1] == "reply_mismatch"
+
+
+@pytest.mark.asyncio
+async def test_socket_send_failure_never_creates_or_overwrites_a_goal_attempt():
+    class FailingSocket:
+        async def send(self, _message):
+            raise OSError("socket write failed")
+
+    fresh_events = _GoalAttemptEventHub()
+    fresh = _goal_attempt_adapter(fresh_events)
+    fresh._socket = FailingSocket()
+    with pytest.raises(OSError, match="socket write failed"):
+        await fresh.set_goal(RobotGoalCommand(path_name="path-b", goal_id=2))
+    assert fresh.state.diagnostics.last_goal_attempt is None
+    assert fresh.state.diagnostics.last_goal_command is None
+    assert _published_goal_attempt_outcomes(fresh_events) == []
+
+    existing_events = _GoalAttemptEventHub()
+    existing = _goal_attempt_adapter(existing_events)
+    await _accept_diagnostic_goal(
+        existing,
+        RobotGoalCommand(path_name="path-a", goal_id=1),
+    )
+    previous_attempt = existing.state.diagnostics.last_goal_attempt
+    previous_command = existing.state.diagnostics.last_goal_command
+    existing._socket = FailingSocket()
+    with pytest.raises(OSError, match="socket write failed"):
+        await existing.set_goal(RobotGoalCommand(path_name="path-b", goal_id=2))
+
+    assert existing.state.diagnostics.last_goal_attempt == previous_attempt
+    assert existing.state.diagnostics.last_goal_attempt.outcome == "accepted"
+    assert existing.state.diagnostics.last_goal_command == previous_command
+    assert existing.state.diagnostics.last_goal_command.payload["set_goal"]["goal_id"] == 1
+
+
+@pytest.mark.asyncio
+async def test_connection_failure_after_goal_write_marks_attempt_as_reply_error():
+    events = _GoalAttemptEventHub()
+    adapter = _goal_attempt_adapter(events)
+    written = asyncio.Event()
+
+    class WrittenSocket:
+        async def send(self, _message):
+            written.set()
+
+    adapter._socket = WrittenSocket()
+    request = asyncio.create_task(
+        adapter.set_goal(RobotGoalCommand(path_name="path-b", goal_id=2))
+    )
+    await written.wait()
+    await asyncio.sleep(0)
+
+    awaiting = adapter.state.diagnostics.last_goal_attempt
+    assert awaiting is not None
+    assert awaiting.outcome == "awaiting_reply"
+    adapter._fail_pending(ConnectionError("connection lost after write"))
+
+    with pytest.raises(ConnectionError, match="connection lost after write"):
+        await request
+
+    failed = adapter.state.diagnostics.last_goal_attempt
+    assert failed is not None
+    assert failed.attempt_id == awaiting.attempt_id
+    assert failed.payload["set_goal"]["goal_id"] == 2
+    assert failed.outcome == "reply_error"
+    assert failed.completed_at is not None
+    assert failed.error == "connection lost after write"
+    assert adapter.state.diagnostics.last_goal_command is None
+    assert _published_goal_attempt_outcomes(events)[-1] == "reply_error"
+
+
+@pytest.mark.asyncio
+async def test_rejected_object_goal_does_not_supersede_previous_gimbal_target():
+    adapter = HardwareRobotAdapter(EventHub(), "ws://robot.local:8765")
+    adapter.state.connected = True
+    adapter.state.connection_status = "connected"
+    previous = GimbalCommandDiagnostic(
+        context="manual",
+        payload={"gimbal_control": {"yaw_end": 5, "pitch_end": -2}},
+    )
+    adapter.state.diagnostics.last_gimbal_command = previous
+
+    async def fake_connect():
+        return adapter.state
+
+    class RejectingSocket:
+        async def send(self, message):
+            payload = json.loads(message)
+            assert payload["set_goal"]["goal_object"] == "car"
+            # A socket write is not acceptance, so the visible target is unchanged here.
+            assert adapter.state.diagnostics.last_gimbal_command is previous
+            await adapter._handle_message(json.dumps({
+                "robot_goal": {
+                    "path_file": "path1",
+                    "goal_id": 3,
+                    "goal_object": "car",
+                    "goal_check": "false",
+                }
+            }))
+
+    adapter.connect = fake_connect
+    adapter._socket = RejectingSocket()
+
+    result = await adapter.set_goal(
+        RobotGoalCommand(path_name="path1", goal_id=3, goal_object="car")
+    )
+
+    assert result["goal_check"] == "false"
+    assert adapter.state.diagnostics.last_gimbal_command is previous
+    assert adapter._pending_goal_attempt is None
+
+
+@pytest.mark.asyncio
+async def test_navigation_only_goal_preserves_numeric_gimbal_target():
+    adapter = HardwareRobotAdapter(EventHub(), "ws://robot.local:8765")
+    adapter.state.connected = True
+    adapter.state.connection_status = "connected"
+    previous = GimbalCommandDiagnostic(
+        context="cruise_moving",
+        payload={"gimbal_control": {"yaw_end": 12, "pitch_end": -4}},
+    )
+    adapter.state.diagnostics.last_gimbal_command = previous
+
+    async def fake_connect():
+        return adapter.state
+
+    class AcceptingSocket:
+        async def send(self, message):
+            payload = json.loads(message)
+            await adapter._handle_message(json.dumps({
+                "robot_goal": {
+                    **payload["set_goal"],
+                    "goal_check": "true",
+                }
+            }))
+
+    adapter.connect = fake_connect
+    adapter._socket = AcceptingSocket()
+
+    await adapter.set_goal(RobotGoalCommand(path_name="path2", goal_id=8))
+
+    assert adapter.state.diagnostics.last_gimbal_command is previous
+    goal = adapter.state.diagnostics.last_goal_command
+    assert goal is not None
+    assert goal.context == "cruise_navigation_goal"
+    assert goal.payload["set_goal"]["goal_id"] == 8
+
+
+@pytest.mark.asyncio
+async def test_navigation_only_goal_tolerates_retained_object_identity_in_reply_and_heartbeat():
+    adapter = _goal_attempt_adapter()
+
+    class RetainedObjectSocket:
+        async def send(self, message):
+            payload = json.loads(message)
+            assert payload["set_goal"] == {
+                "path_name": "path-a",
+                "goal_id": 1,
+                "goal_object": None,
+            }
+            await adapter._handle_message(json.dumps({
+                "robot_goal": {
+                    "path_file": "path-a",
+                    "goal_id": 1,
+                    "goal_object": "car",
+                    "goal_check": "true",
+                }
+            }))
+
+    adapter._socket = RetainedObjectSocket()
+    response = await adapter.set_goal(RobotGoalCommand(path_name="path-a", goal_id=1))
+
+    assert response["goal_check"] == "true"
+    await adapter._handle_message(json.dumps({
+        "task": {
+            "path_file": "path-a",
+            "goal_id": 1,
+            "goal_object": "car",
+            "goal_status": "done",
+            "object_status": "failed",
+        }
+    }))
+    assert await adapter.wait_for_arrival(timeout_s=0.05) == "done"
+
+
+@pytest.mark.asyncio
+async def test_concurrent_goal_calls_serialize_arming_through_acknowledgement():
+    adapter = _goal_attempt_adapter()
+    a_written = asyncio.Event()
+    b_written = asyncio.Event()
+    sent_goal_ids = []
+
+    class ControlledSocket:
+        async def send(self, message):
+            goal_id = json.loads(message)["set_goal"]["goal_id"]
+            sent_goal_ids.append(goal_id)
+            (a_written if goal_id == 1 else b_written).set()
+
+    adapter._socket = ControlledSocket()
+    goal_a = RobotGoalCommand(path_name="path-a", goal_id=1)
+    goal_b = RobotGoalCommand(path_name="path-b", goal_id=2)
+    request_a = asyncio.create_task(adapter.set_goal(goal_a))
+    await a_written.wait()
+    request_b = asyncio.create_task(adapter.set_goal(goal_b))
+    await asyncio.sleep(0)
+
+    sent_before_a_ack = list(sent_goal_ids)
+    pending_before_a_ack = adapter._pending_goal
+    await adapter._handle_message(json.dumps({"task": {"goal_status": "going"}}))
+    await adapter._handle_message(json.dumps({"task": {"goal_status": "done"}}))
+    await adapter._handle_message(json.dumps({
+        "robot_goal": {
+            "path_file": "path-a",
+            "goal_id": 1,
+            "goal_object": None,
+            "goal_check": "true",
+        }
+    }))
+    response_a = await request_a
+    await asyncio.wait_for(b_written.wait(), timeout=0.05)
+    pending_after_b_write = adapter._pending_goal
+    arrival_after_b_write = adapter._arrival_event.is_set()
+    await adapter._handle_message(json.dumps({
+        "robot_goal": {
+            "path_file": "path-b",
+            "goal_id": 2,
+            "goal_object": None,
+            "goal_check": "true",
+        }
+    }))
+    response_b = await request_b
+
+    assert sent_before_a_ack == [1]
+    assert pending_before_a_ack == goal_a
+    assert response_a["goal_check"] == "true"
+    assert pending_after_b_write == goal_b
+    assert arrival_after_b_write is False
+    assert response_b["goal_check"] == "true"
+
+
+@pytest.mark.parametrize("navigation_key", ["navigation", "naviagtion"])
+@pytest.mark.asyncio
+async def test_navigation_only_goal_status_can_finish_current_arrival(navigation_key):
+    adapter = HardwareRobotAdapter(EventHub(), "ws://robot.local:8765")
+    goal = RobotGoalCommand(path_name="path-a", goal_id=1)
+    adapter._arm_goal_tracking(goal)
+
+    identity = {"path_file": "path-a", "goal_id": 1}
+    adapter._apply_protocol_state({
+        navigation_key: {"goal_status": "going"},
+        "task": identity,
+    })
+    adapter._apply_protocol_state({
+        navigation_key: {"goal_status": "done"},
+        "task": identity,
+    })
+
+    assert adapter._arrival_event.is_set() is True
+    assert await adapter.wait_for_arrival(timeout_s=0.05) == "done"
+
+
+@pytest.mark.asyncio
+async def test_delayed_mismatched_goal_ack_cannot_accept_the_current_command():
+    adapter = HardwareRobotAdapter(EventHub(), "ws://robot.local:8765")
+    adapter.state.connected = True
+    adapter.state.connection_status = "connected"
+
+    async def fake_connect():
+        return adapter.state
+
+    class DelayedPreviousGoalSocket:
+        async def send(self, message):
+            payload = json.loads(message)
+            assert payload["set_goal"] == {
+                "path_name": "path-b", "goal_id": 2, "goal_object": None,
+            }
+            # This is a late acknowledgement for A, delivered while B owns the generic
+            # ``robot_goal`` response slot.
+            await adapter._handle_message(json.dumps({
+                "robot_goal": {
+                    "path_file": "path-a",
+                    "goal_id": 1,
+                    "goal_object": None,
+                    "goal_check": "true",
+                }
+            }))
+
+    adapter.connect = fake_connect
+    adapter._socket = DelayedPreviousGoalSocket()
+
+    with pytest.raises(ValueError):
+        await adapter.set_goal(RobotGoalCommand(path_name="path-b", goal_id=2))
+
+    assert adapter.state.diagnostics.last_goal_command is None
+    assert adapter._pending_goal_attempt is None
+    assert adapter._pending_goal is None
+
+
+@pytest.mark.asyncio
+async def test_done_heartbeat_for_previous_identity_cannot_finish_pending_goal():
+    adapter = HardwareRobotAdapter(EventHub(), "ws://robot.local:8765")
+    current = RobotGoalCommand(path_name="path-b", goal_id=2)
+    adapter._arm_goal_tracking(current)
+
+    # B has genuinely started, so the ordinary stale-initial-done guard is already cleared.
+    adapter._apply_protocol_state({
+        "task": {"path_file": "path-b", "goal_id": 2, "goal_status": "going"}
+    })
+    adapter._apply_protocol_state({
+        "task": {"path_file": "path-a", "goal_id": 1, "goal_status": "done"}
+    })
+
+    assert adapter._pending_goal == current
+    assert adapter._arrival_event.is_set() is False
+
+    adapter._apply_protocol_state({
+        "task": {"path_file": "path-b", "goal_id": 2, "goal_status": "done"}
+    })
+    assert await adapter.wait_for_arrival(timeout_s=0.05) == "done"
 
 
 @pytest.mark.asyncio
@@ -525,7 +1097,7 @@ async def test_zero_yaw_is_a_real_gimbal_start_angle():
     adapter.state.camera_angle = -90.0
     sent = []
 
-    async def fake_send(payload):
+    async def fake_send(payload, *, context=""):
         sent.append(payload)
 
     adapter._send = fake_send
@@ -1274,3 +1846,197 @@ def test_zero_heartbeat_updates_camera_angle_instead_of_preserving_minus_ninety(
 
     assert adapter.state.yaw == 0.0
     assert adapter.state.camera_angle == 0.0
+
+
+@pytest.mark.asyncio
+async def test_gimbal_diagnostics_separate_sent_target_from_physical_heartbeat():
+    adapter = HardwareRobotAdapter(EventHub(), "ws://robot.local:8765")
+    adapter.state.connected = True
+    adapter.state.connection_status = "connected"
+    adapter.state.moving = True
+
+    async def fake_connect():
+        return adapter.state
+
+    class FakeSocket:
+        async def send(self, _message):
+            return None
+
+    adapter.connect = fake_connect
+    adapter._socket = FakeSocket()
+
+    await adapter.set_gimbal(
+        GimbalMoveRequest(
+            yaw_start=5,
+            yaw_end=-40,
+            yaw_speed=3,
+            pitch_start=0,
+            pitch_end=-8,
+            pitch_speed=2,
+            zoom_start=1,
+            zoom_end=1,
+        ),
+        context="cruise_moving",
+    )
+
+    command = adapter.state.diagnostics.last_gimbal_command
+    assert command is not None
+    assert command.context == "cruise_moving"
+    assert command.base_motion_intent == "moving"
+    assert command.payload["gimbal_control"] == {
+        "mode": 1,
+        "yaw_start": 5.0,
+        "yaw_speed": 3.0,
+        "yaw_end": -40.0,
+        "pitch_start": 0.0,
+        "pitch_speed": 2.0,
+        "pitch_end": -8.0,
+        "zoom_start": 1.0,
+        "zoom_speed": 0,
+        "zoom_end": 1.0,
+    }
+    # The ordinary state is optimistic, but the physical diagnostic remains absent until a
+    # hardware heartbeat arrives. The UI must never confuse these two values.
+    assert adapter.state.yaw == -40
+    assert adapter.state.diagnostics.last_heartbeat is None
+
+    await adapter._handle_message(json.dumps({
+        "task": {"goal_status": "going", "goal_id": 7},
+        "gimbal": {"yaw": -12, "pitch": -3, "mode": 1},
+    }))
+    heartbeat = adapter.state.diagnostics.last_heartbeat
+    assert heartbeat is not None
+    assert heartbeat.yaw == -12
+    assert heartbeat.pitch == -3
+    assert heartbeat.gimbal_mode == 1
+    assert heartbeat.payload["task"]["goal_status"] == "going"
+    assert heartbeat.payload["gimbal"]["yaw"] == -12
+
+    adapter.state.diagnostics.last_goal_attempt = GoalCommandAttemptDiagnostic(
+        context="cruise_navigation_goal",
+        payload={"set_goal": {"path_name": "path-a", "goal_id": 7}},
+    )
+    adapter._clear_heartbeat_diagnostics()
+    assert adapter.state.diagnostics.last_goal_attempt is None
+    assert adapter.state.diagnostics.last_heartbeat is None
+    assert adapter.state.diagnostics.last_goal_command is None
+    assert adapter.state.diagnostics.last_gimbal_command is None
+
+
+@pytest.mark.asyncio
+async def test_gimbal_command_boundary_cannot_pair_pre_command_yaw_with_post_command_pitch():
+    adapter = HardwareRobotAdapter(EventHub(), "ws://robot.local:8765")
+    adapter.state.connected = True
+    adapter.state.connection_status = "connected"
+
+    async def fake_connect():
+        return adapter.state
+
+    class FakeSocket:
+        async def send(self, _message):
+            return None
+
+    adapter.connect = fake_connect
+    adapter._socket = FakeSocket()
+    adapter._apply_protocol_state({"gimbal": {"yaw": 17}})
+
+    await adapter.set_gimbal(GimbalMoveRequest(yaw_start=17, yaw_end=0, pitch_end=0))
+    adapter._apply_protocol_state({"gimbal": {"pitch": 0}})
+    assert adapter.heartbeat_revision() is None
+
+    adapter._apply_protocol_state({"gimbal": {"yaw": 0}})
+    assert adapter.heartbeat_revision() == 1
+
+
+@pytest.mark.asyncio
+async def test_disconnect_discards_a_final_heartbeat_that_arrives_during_socket_close():
+    adapter = HardwareRobotAdapter(EventHub(), "ws://robot.local:8765")
+    adapter._apply_protocol_state({"gimbal": {"yaw": 1, "pitch": 2}})
+    adapter.state.diagnostics.last_gimbal_command = GimbalCommandDiagnostic(context="manual")
+
+    class ClosingSocket:
+        async def close(self):
+            adapter._apply_protocol_state({"gimbal": {"yaw": 9, "pitch": 9}})
+
+    adapter._socket = ClosingSocket()
+    await adapter._stop_connection_loop()
+
+    assert adapter.state.diagnostics.last_heartbeat is None
+    assert adapter.state.diagnostics.last_goal_command is None
+    assert adapter.state.diagnostics.last_gimbal_command is None
+    assert adapter.heartbeat_revision() is None
+
+
+def test_partial_heartbeat_preserves_each_physical_axis_and_movement_state():
+    adapter = HardwareRobotAdapter(EventHub(), "ws://robot.local:8765")
+
+    adapter._apply_protocol_state({
+        "task": {"goal_status": "going", "goal_id": 4},
+        "gimbal": {"yaw": 7, "pitch": -2, "mode": 1},
+    })
+    first = adapter.state.diagnostics.last_heartbeat
+    assert first is not None
+    assert adapter.heartbeat_revision() == 1
+
+    # A yaw-only sample is still useful, but it must not erase the last physical pitch.
+    adapter._apply_protocol_state({"gimbal": {"yaw": 8}})
+    second = adapter.state.diagnostics.last_heartbeat
+    assert second is not None
+    assert second.yaw == 8
+    assert second.pitch == -2
+    assert second.pitch_received_at == first.pitch_received_at
+    assert adapter.state.pitch == -2
+    assert adapter.heartbeat_revision() == 1
+
+    # The matching pitch-only packet completes one new logical two-axis sample.
+    adapter._apply_protocol_state({"gimbal": {"pitch": -2}})
+    assert adapter.heartbeat_revision() == 2
+
+    # Recording-only gimbal beats and partial task beats update diagnostics without inventing
+    # a new pose or falsely turning an already-moving base into a static one.
+    adapter._apply_protocol_state({"gimbal": {"record_status": "recording"}})
+    adapter._apply_protocol_state({"task": {"goal_id": 4}})
+    assert adapter.state.yaw == 8
+    assert adapter.state.pitch == -2
+    assert adapter.state.moving is True
+    assert adapter.heartbeat_revision() == 2
+    latest = adapter.state.diagnostics.last_heartbeat
+    assert latest.sequence == 5
+    assert latest.task_goal_status == "going"
+    assert latest.goal_id == 4
+    assert latest.task_goal_status_received_at == first.task_goal_status_received_at
+
+
+def test_split_heartbeat_retains_the_identity_that_supplied_each_goal_status():
+    adapter = HardwareRobotAdapter(EventHub(), "ws://robot.local:8765")
+
+    adapter._apply_protocol_state({
+        "naviagtion": {"goal_status": "going"},
+        "task": {
+            "path_file": "path-a",
+            "goal_id": 1,
+            "goal_object": "car",
+            "goal_status": "going",
+            "object_status": "done",
+        },
+    })
+    status_frame = adapter.state.diagnostics.last_heartbeat
+    assert status_frame is not None
+    expected_identity = {
+        "path_file": "path-a",
+        "goal_id": 1,
+        "goal_object": "car",
+    }
+    assert status_frame.task_goal_status_identity == expected_identity
+    assert status_frame.navigation_goal_status_identity == expected_identity
+    assert status_frame.object_status_identity == expected_identity
+
+    # A later split frame has no task identity. It must update the physical pose without
+    # divorcing the retained statuses from the point that originally supplied them.
+    adapter._apply_protocol_state({"gimbal": {"yaw": 4, "pitch": -2}})
+    pose_frame = adapter.state.diagnostics.last_heartbeat
+    assert pose_frame is not None
+    assert pose_frame.payload == {"gimbal": {"yaw": 4, "pitch": -2}}
+    assert pose_frame.task_goal_status_identity == expected_identity
+    assert pose_frame.navigation_goal_status_identity == expected_identity
+    assert pose_frame.object_status_identity == expected_identity

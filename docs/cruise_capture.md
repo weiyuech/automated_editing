@@ -15,7 +15,7 @@ switch_map (optional)
   -> capture session starts
   -> video_record { start: 0 }          one continuous recording
   -> for each point:
-       set_goal { path_name, goal_id, goal_object? }
+       set_goal { path_name, goal_id, goal_object: null }
        wait for goal_status: done
        marker recorded at the arrival timestamp
        dwell (random, optionally with a gimbal scan)
@@ -23,17 +23,20 @@ switch_map (optional)
   -> recorded file syncs into the media vault
 ```
 
-## Alignment is skipped by omission, not by a special mode
+## Product priority: cruise is always navigation-only
 
-`CruisePoint.goal_object` defaults to `None`. A point with no `goal_object` is
-navigation-only: the robot is never asked to aim at an object, so it never stalls waiting
-for recognition, and arrival is decided on `goal_status` alone. Setting `goal_object` on a
-point opts that point back into waiting for `object_status`.
+Cruise arrival is decided by the current point's `goal_status` alone. The app never waits for
+`object_status` and never fails a point because object recognition/alignment failed. The
+`goal_object` field remains readable only for compatibility with older saved routes and API
+payloads; `CruiseService` strips it before dispatch, so legacy data cannot silently restore
+robot-owned alignment. `object_status`, when present in a heartbeat, is diagnostic telemetry
+only.
 
 Arrival detection guards against the two failure modes the hardware makes easy:
 
-- A heartbeat carrying the **previous** goal's settled status is rejected until a non-done
-  heartbeat proves the robot actually started moving (`_require_non_done`).
+- A heartbeat that explicitly names a different path or point is rejected. A matching path
+  and point can report arrival directly; status-only reports must first show a non-terminal
+  state (`_require_non_done`) so a previous point's cached result is not reused.
 - A lost connection resolves any pending arrival as failed, so a cruise can never hang on
   an arrival that will not be reported.
 
@@ -88,8 +91,9 @@ moving, which would add shake.
 - If the camera's position is unknown, the scan is skipped rather than risking a pan that
   cannot be returned to origin.
 
-Navigation and gimbal are independent commands, so enabling the scan does not change how a
-cruise drives, and manual camera control stays usable throughout a run.
+Navigation and gimbal are separate commands, so enabling the scan does not change how a
+cruise drives. During a cruise, manual camera commands are disabled to keep one owner of
+the gimbal; the WebSocket API also rejects competing manual camera commands.
 
 ## Automatic camerawork profile
 
@@ -102,13 +106,44 @@ under **镜头设置**; a cruise is refused when the operator has never saved th
 - While the base travels, the planner repeatedly chooses adaptive wander (50%), ping-pong (30%),
   or one slow return-to-anchor action (20%). Reaching the anchor immediately returns control to
   the planner; it does not turn the remainder of the transit into a static hold.
-- From a left-side pose, adaptive wander chooses a broad rightward sweep 80% of the time or a
+- When both directions have more than 10° of room, a left-side pose chooses a broad rightward sweep 80% of the time or a
   small further-left move 20% of the time; the right-side case is mirrored. Every leg re-reads
-  the physical heartbeat pose and all targets stay inside the configured limits.
+  the latest available heartbeat pose, falling back per axis to the previous target when no
+  feedback exists. This planner does not apply the UI's five-second freshness limit. All targets
+  stay inside the configured limits.
+- Direction selection uses a 10° room threshold (`_CW_DIRECTION_ROOM_DEG`). With at most 10°
+  left outward and more than 10° inward, the next adaptive move goes inward without a draw.
+  The centre branch uses the same threshold. This is not a target exclusion band or a fixed
+  step size; probabilities, distance fractions, speeds, and configured limits are unchanged.
+  The existing fallback is preserved for narrow ranges: when neither side exceeds 10°, the
+  outward branch (leftward at zero) still runs and its target remains clamped to the range.
 - Zoom remains fixed during transit. After arrival, yaw and pitch first return to the anchor;
   zoom then moves on that safe composition and the complete pose settles visibly at the anchor.
 - The separately configured parked scan is ignored when automatic camerawork is enabled, so two
   planners never issue competing gimbal commands.
+
+### Random target separation
+
+Random transit targets use four regions split at the midpoints of the configured yaw and
+pitch ranges, not at protocol zero. Points on a dividing line belong to the greater-value
+half. Before each random command, the next target must change region: crossing either midpoint
+is sufficient, with no additional minimum-distance requirement. All target values
+remain inside the operator's bounds. This applies to wander, each ping-pong leg, and wander
+chosen when an anchor action starts already near the anchor. Explicit anchor targets are exempt.
+
+`_separate_camerawork_target()` preserves the selected yaw and chooses an eligible integer pitch.
+It therefore keeps the existing horizontal direction probabilities and distance fractions.
+It does not choose uniformly among the other three regions: yaw is selected first, and pitch
+is retained if it changes region or resampled from eligible integer angles otherwise.
+The check uses the latest available starting pose before each leg, including ping-pong's second
+leg, rather than assuming the first target was physically reached. The existing heartbeat/last
+command fallback and motion waiting behavior are unchanged. Region changes need not be diagonal
+or visit all four regions in order. The HTML console mirrors this with `separateCameraworkTarget()`.
+
+The transit planner adds no stationary dwell between legs or action blocks. It still waits for
+fresh pose confirmation or the motion-time budget before issuing the next command, so heartbeat
+latency and device execution can produce a gap. This is not continuous trajectory blending or
+cross-command acceleration planning; physical smoothness still needs hardware verification.
 
 ## Saved routes
 

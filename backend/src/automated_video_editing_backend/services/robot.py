@@ -5,6 +5,7 @@ import json
 from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
+from copy import deepcopy
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit
@@ -15,9 +16,13 @@ from automated_video_editing_backend.core.diagnostics import log_event
 from automated_video_editing_backend.core.events import EventHub
 from automated_video_editing_backend.core.models import (
     CameraAngle,
+    GimbalCommandDiagnostic,
     GimbalMoveRequest,
+    GoalCommandAttemptDiagnostic,
+    GoalCommandDiagnostic,
     MoveCommand,
     RobotGoalCommand,
+    RobotHeartbeatDiagnostic,
     RobotMode,
     RobotState,
     utc_now,
@@ -66,7 +71,13 @@ class RobotAdapter(ABC):
     async def wait_for_arrival(self, timeout_s: float = 60.0) -> str: ...
 
     @abstractmethod
-    async def sweep_camera(self, target_yaw: float, yaw_speed: float) -> RobotState: ...
+    async def sweep_camera(
+        self,
+        target_yaw: float,
+        yaw_speed: float,
+        *,
+        context: str = "camera_sweep",
+    ) -> RobotState: ...
 
     @abstractmethod
     def heartbeat_yaw(self) -> float | None: ...
@@ -87,7 +98,12 @@ class RobotAdapter(ABC):
     async def set_camera_angle(self, angle: CameraAngle) -> RobotState: ...
 
     @abstractmethod
-    async def set_gimbal(self, command: GimbalMoveRequest) -> RobotState: ...
+    async def set_gimbal(
+        self,
+        command: GimbalMoveRequest,
+        *,
+        context: str = "manual",
+    ) -> RobotState: ...
 
     @abstractmethod
     async def start_recording(self) -> RobotState: ...
@@ -112,6 +128,10 @@ class HardwareRobotAdapter(RobotAdapter):
         self._connection_task: asyncio.Task[None] | None = None
         self._request_lock = asyncio.Lock()
         self._send_lock = asyncio.Lock()
+        # set_goal mutates arrival ownership before it enters the generic request lock. Keep
+        # that whole arm -> write -> acknowledgement transaction single-owner as well, or a
+        # concurrent caller can make an old heartbeat resolve a goal that has not been sent.
+        self._goal_lock = asyncio.Lock()
         self._pending: dict[str, asyncio.Future[Any]] = {}
         self._reconnect_delay_s = 1.0
         self._max_reconnect_delay_s = 10.0
@@ -122,6 +142,9 @@ class HardwareRobotAdapter(RobotAdapter):
         self._heartbeat_yaw: float | None = None
         self._heartbeat_pitch: float | None = None
         self._heartbeat_revision: int | None = None
+        self._heartbeat_yaw_pending = False
+        self._heartbeat_pitch_pending = False
+        self._pending_goal_attempt: GoalCommandAttemptDiagnostic | None = None
         # Photo and video replies share RobotState.media_url. Keep the active recording URL
         # separately so an in-recording photo cannot become the fallback for video stop.
         self._recording_media_url: str | None = None
@@ -213,6 +236,10 @@ class HardwareRobotAdapter(RobotAdapter):
         return response if isinstance(response, list) else []
 
     async def set_goal(self, command: RobotGoalCommand) -> dict[str, Any]:
+        async with self._goal_lock:
+            return await self._set_goal_locked(command)
+
+    async def _set_goal_locked(self, command: RobotGoalCommand) -> dict[str, Any]:
         refuse_if_unfit_to_drive(self.state)
         payload = {
             "set_goal": {
@@ -224,19 +251,90 @@ class HardwareRobotAdapter(RobotAdapter):
         # Arm before sending: a heartbeat carrying the *previous* goal's settled status can
         # land before this goal is acknowledged, and _require_non_done rejects that stale one.
         self._arm_goal_tracking(command)
+        self._pending_goal_attempt = None
         try:
             response = await self._request(payload, "robot_goal")
-        except Exception:
+        except Exception as exc:
+            if self._pending_goal_attempt is not None:
+                outcome = "reply_timeout" if isinstance(exc, TimeoutError) else "reply_error"
+                self._finish_goal_attempt(outcome, str(exc))
+            self._pending_goal_attempt = None
             self._disarm_goal_tracking()
+            self.state.last_command = "set_goal"
+            self._touch()
+            await self._publish_state()
             raise
         if isinstance(response, dict):
+            if _goal_identity_conflicts(response, command):
+                if self._pending_goal_attempt is not None:
+                    self._finish_goal_attempt(
+                        "reply_mismatch",
+                        "机器人回复的目标点与本次指令不一致",
+                    )
+                self._pending_goal_attempt = None
+                self._disarm_goal_tracking()
+                self.state.last_command = "set_goal"
+                self._touch()
+                await self._publish_state()
+                raise ValueError("机器人回复的目标点与本次指令不一致")
             self.state.path_file = str(response.get("path_file") or command.path_name)
-            self.state.goal_id = _maybe_int(response.get("goal_id")) or command.goal_id
+            response_goal_id = _maybe_int(response.get("goal_id"))
+            self.state.goal_id = (
+                response_goal_id if response_goal_id is not None else command.goal_id
+            )
             self.state.goal_object = _maybe_str(response.get("goal_object") or command.goal_object)
             accepted = _truthy(response.get("goal_check"))
             self.state.goal_status = "going" if accepted else "failed"
-            if not accepted:
+            if accepted and self._pending_goal_attempt is not None:
+                attempt = self._finish_goal_attempt("accepted")
+                goal_diagnostic = GoalCommandDiagnostic(
+                    context=attempt.context,
+                    sent_at=attempt.sent_at,
+                    base_motion_intent=attempt.base_motion_intent,
+                    payload=deepcopy(attempt.payload),
+                )
+                self.state.diagnostics.last_goal_command = goal_diagnostic
+                current_gimbal = self.state.diagnostics.last_gimbal_command
+                current_is_newer = (
+                    current_gimbal is not None
+                    and current_gimbal.sent_at > goal_diagnostic.sent_at
+                )
+                if command.goal_object and not current_is_newer:
+                    # Object alignment gives the robot ownership of the numeric camera angle,
+                    # so the previous direct target is no longer a valid comparison.
+                    self.state.diagnostics.last_gimbal_command = GimbalCommandDiagnostic(
+                        context="goal_object_alignment",
+                        sent_at=goal_diagnostic.sent_at,
+                        base_motion_intent="moving",
+                        payload=deepcopy(goal_diagnostic.payload),
+                    )
+                elif (
+                    not command.goal_object
+                    and current_gimbal is not None
+                    and current_gimbal.context == "goal_object_alignment"
+                    and not current_is_newer
+                ):
+                    # Navigation-only leaves a direct numeric gimbal target valid, but an old
+                    # robot-owned object target must not leak into the new point.
+                    self.state.diagnostics.last_gimbal_command = None
+            elif not accepted:
+                if self._pending_goal_attempt is not None:
+                    rejection_reason = str(
+                        response.get("error")
+                        or response.get("message")
+                        or response.get("status")
+                        or "机器人拒绝目标点"
+                    )
+                    self._finish_goal_attempt("rejected", rejection_reason)
                 self._disarm_goal_tracking()
+        else:
+            if self._pending_goal_attempt is not None:
+                self._finish_goal_attempt(
+                    "reply_error",
+                    "机器人目标点回复格式无效",
+                )
+            self._disarm_goal_tracking()
+        self._pending_goal_attempt = None
         self.state.last_command = "set_goal"
         self._touch()
         await self._publish_state()
@@ -266,10 +364,16 @@ class HardwareRobotAdapter(RobotAdapter):
         return self._heartbeat_pitch
 
     def heartbeat_revision(self) -> int | None:
-        """Monotonic gimbal-heartbeat revision, or None until the first physical sample."""
+        """Monotonic revision, or None until both axes form one logical pose sample."""
         return self._heartbeat_revision
 
-    async def sweep_camera(self, target_yaw: float, yaw_speed: float) -> RobotState:
+    async def sweep_camera(
+        self,
+        target_yaw: float,
+        yaw_speed: float,
+        *,
+        context: str = "camera_sweep",
+    ) -> RobotState:
         """Drive the gimbal toward target_yaw at an explicit speed.
 
         Unlike set_camera_angle this leaves state.yaw to the heartbeat, so callers can poll
@@ -291,7 +395,7 @@ class HardwareRobotAdapter(RobotAdapter):
                 "zoom_end": 1,
             }
         }
-        await self._send(payload)
+        await self._send(payload, context=context)
         self.state.last_command = "gimbal_control"
         self._touch()
         await self._publish_state()
@@ -313,20 +417,46 @@ class HardwareRobotAdapter(RobotAdapter):
         self._arrival_result = status
         self._arrival_event.set()
 
+    def _finish_goal_attempt(
+        self,
+        outcome: str,
+        error: str | None = None,
+    ) -> GoalCommandAttemptDiagnostic:
+        """Finish only the attempt that still owns the current goal request."""
+        attempt = self._pending_goal_attempt
+        if attempt is None:
+            raise RuntimeError("No goal command attempt is pending")
+        finished = attempt.model_copy(
+            update={
+                "outcome": outcome,
+                "completed_at": utc_now(),
+                "error": error or None,
+            }
+        )
+        visible = self.state.diagnostics.last_goal_attempt
+        if visible is not None and visible.attempt_id == attempt.attempt_id:
+            self.state.diagnostics.last_goal_attempt = finished
+        self._pending_goal_attempt = finished
+        return finished
+
     def _evaluate_arrival(self, task: dict[str, Any]) -> None:
         if self._pending_goal is None:
             return
+        if _goal_identity_conflicts(task, self._pending_goal):
+            return
+        explicit_current_identity = _goal_identity_is_explicit_match(task, self._pending_goal)
         goal_status = _normalize_failed(_maybe_str(task.get("goal_status")))
         if goal_status not in {"done", "failed"}:
-            # Robot is actively navigating, so any later settled status belongs to this goal.
-            self._require_non_done = False
+            if goal_status is not None:
+                # A non-terminal report proves that subsequent terminal reports are not the
+                # cached result from the point we just left.
+                self._require_non_done = False
             return
-        if self._require_non_done:
+        if self._require_non_done and not explicit_current_identity:
             return
-        if self._pending_goal.goal_object and task.get("object_status") == "going":
-            # Only points that named a goal_object wait for the gimbal to finish aligning.
-            return
-        self._resolve_arrival(goal_status or "failed")
+        # Product decision: object recognition/alignment is telemetry only. It must never
+        # block, fail, or delay a cruise point; navigation goal_status owns arrival.
+        self._resolve_arrival(goal_status)
 
     async def stop_motion(self) -> RobotState:
         self.state.moving = False
@@ -356,7 +486,7 @@ class HardwareRobotAdapter(RobotAdapter):
                 "zoom_end": 1,
             }
         }
-        await self._send(payload)
+        await self._send(payload, context="manual")
         self.state.camera_angle = angle.angle
         self.state.yaw = angle.angle
         self.state.last_command = "gimbal_control"
@@ -364,7 +494,12 @@ class HardwareRobotAdapter(RobotAdapter):
         await self._publish_state()
         return self.state
 
-    async def set_gimbal(self, command: GimbalMoveRequest) -> RobotState:
+    async def set_gimbal(
+        self,
+        command: GimbalMoveRequest,
+        *,
+        context: str = "manual",
+    ) -> RobotState:
         payload = {
             "gimbal_control": {
                 "mode": 1,
@@ -379,7 +514,7 @@ class HardwareRobotAdapter(RobotAdapter):
                 "zoom_end": _gimbal_num(command.zoom_end),
             }
         }
-        await self._send(payload)
+        await self._send(payload, context=context)
         self.state.camera_angle = command.yaw_end
         self.state.yaw = command.yaw_end
         self.state.pitch = command.pitch_end
@@ -481,15 +616,67 @@ class HardwareRobotAdapter(RobotAdapter):
                 if self._pending.get(response_key) is future:
                     self._pending.pop(response_key, None)
 
-    async def _send(self, payload: dict[str, Any]) -> None:
+    async def _send(self, payload: dict[str, Any], *, context: str = "") -> None:
         await self.connect()
         if not self._socket or not self.state.connected:
             raise RobotCommandNotSentError(
                 self.state.error or "Robot websocket is not connected"
             )
+        gimbal = payload.get("gimbal_control")
+        goal = payload.get("set_goal")
+        is_goal_command = isinstance(goal, dict)
+        goal_aligns_object = is_goal_command and bool(_maybe_str(goal.get("goal_object")))
         async with self._send_lock:
-            log_event("info", "robot.command.sent", payload=payload)
+            if isinstance(gimbal, dict) or goal_aligns_object:
+                # A new target is a physical-sample boundary. A yaw received before this
+                # command must never be paired with a pitch received after it (or vice versa).
+                self._heartbeat_yaw_pending = False
+                self._heartbeat_pitch_pending = False
+            # Capture the command boundary before yielding to socket.send. The receive loop can
+            # process an immediate reply before send() resumes, but the public diagnostic is
+            # still created only after the write succeeds.
+            sent_at = utc_now()
             await self._socket.send(json.dumps(payload, ensure_ascii=False))
+            log_event("info", "robot.command.sent", payload=payload)
+            if isinstance(gimbal, dict):
+                # Record only after websocket.send succeeds. This still does not claim hardware
+                # execution; the independently received heartbeat is the evidence for that.
+                normalized_context = context or "manual"
+                if normalized_context == "cruise_moving":
+                    base_motion_intent = "moving"
+                elif normalized_context in {
+                    "cruise_stationary_scan",
+                    "cruise_stationary_anchor",
+                    "cruise_stationary_zoom",
+                    "framing_test",
+                }:
+                    base_motion_intent = "stationary"
+                else:
+                    base_motion_intent = "unknown"
+                self.state.diagnostics.last_gimbal_command = GimbalCommandDiagnostic(
+                    context=normalized_context,
+                    sent_at=sent_at,
+                    base_motion_intent=base_motion_intent,
+                    payload={"gimbal_control": deepcopy(gimbal)},
+                )
+            elif is_goal_command:
+                # The public attempt says only that the socket write succeeded.  The separate
+                # accepted command remains unchanged until robot_goal confirms this point.
+                attempt = GoalCommandAttemptDiagnostic(
+                    context=(
+                        "goal_object_alignment"
+                        if goal_aligns_object
+                        else "cruise_navigation_goal"
+                    ),
+                    sent_at=sent_at,
+                    base_motion_intent="moving",
+                    payload={"set_goal": deepcopy(goal)},
+                )
+                self._pending_goal_attempt = attempt
+                self.state.diagnostics.last_goal_attempt = attempt
+                self.state.last_command = "set_goal"
+                self._touch()
+                await self._publish_state()
 
     def _start_connection_loop(self) -> None:
         if not self.websocket_url:
@@ -500,6 +687,7 @@ class HardwareRobotAdapter(RobotAdapter):
 
     async def _stop_connection_loop(self) -> None:
         self._recording_status_known = False
+        self._clear_heartbeat_diagnostics()
         self._fail_pending(ConnectionError("Robot websocket was reconfigured"))
         socket = self._socket
         self._socket = None
@@ -511,6 +699,9 @@ class HardwareRobotAdapter(RobotAdapter):
             with suppress(asyncio.CancelledError):
                 await self._connection_task
         self._connection_task = None
+        # Closing/cancelling yields to the receive loop; a final queued heartbeat may arrive
+        # after the early clear. Clear again only once the old connection is fully quiescent.
+        self._clear_heartbeat_diagnostics()
 
     async def _connection_loop(self) -> None:
         first_attempt = True
@@ -519,6 +710,7 @@ class HardwareRobotAdapter(RobotAdapter):
             try:
                 websockets = _load_websockets()
                 self._recording_status_known = False
+                self._clear_heartbeat_diagnostics()
                 self.state.connected = False
                 self.state.connection_status = "connecting" if first_attempt else "reconnecting"
                 self.state.error = None
@@ -614,6 +806,13 @@ class HardwareRobotAdapter(RobotAdapter):
         task = payload.get("task") if isinstance(payload.get("task"), dict) else {}
         gimbal = payload.get("gimbal") if isinstance(payload.get("gimbal"), dict) else {}
 
+        heartbeat_payload = {
+            key: deepcopy(payload[key])
+            for key in ("system", "map", "naviagtion", "navigation", "task", "gimbal")
+            if isinstance(payload.get(key), dict)
+        }
+        heartbeat_received_at = utc_now() if heartbeat_payload else None
+
         if system or current_map or navigation or task or gimbal:
             self.state.connected = True
             self.state.connection_status = "connected"
@@ -621,24 +820,44 @@ class HardwareRobotAdapter(RobotAdapter):
             changed = True
 
         if system:
-            self.state.battery = _maybe_int(system.get("battery"))
-            self.state.system_status = _maybe_str(system.get("status"))
+            if "battery" in system:
+                self.state.battery = _maybe_int(system.get("battery"))
+            if "status" in system:
+                self.state.system_status = _maybe_str(system.get("status"))
         if current_map:
-            self.state.map_name = _maybe_str(current_map.get("name"))
-            self.state.map_mode = _maybe_str(current_map.get("mode"))
-            self.state.map_status = _normalize_failed(_maybe_str(current_map.get("status")))
+            if "name" in current_map:
+                self.state.map_name = _maybe_str(current_map.get("name"))
+            if "mode" in current_map:
+                self.state.map_mode = _maybe_str(current_map.get("mode"))
+            if "status" in current_map:
+                self.state.map_status = _normalize_failed(_maybe_str(current_map.get("status")))
         if navigation:
-            self.state.navigation_status = _maybe_str(navigation.get("status"))
-            self.state.goal_status = _maybe_str(navigation.get("goal_status"))
-            self.state.moving = navigation.get("goal_status") == "going"
+            if "status" in navigation:
+                self.state.navigation_status = _maybe_str(navigation.get("status"))
+            if "goal_status" in navigation:
+                goal_status = _normalize_failed(_maybe_str(navigation.get("goal_status")))
+                self.state.goal_status = goal_status
+                self.state.moving = goal_status == "going"
         if task:
-            self.state.path_file = _maybe_str(task.get("path_file"))
-            self.state.goal_id = _maybe_int(task.get("goal_id"))
-            self.state.goal_object = _maybe_str(task.get("goal_object"))
-            self.state.goal_status = _normalize_failed(_maybe_str(task.get("goal_status"))) or self.state.goal_status
-            self.state.object_status = _normalize_failed(_maybe_str(task.get("object_status")))
-            self.state.moving = task.get("goal_status") == "going"
-            self._evaluate_arrival(task)
+            if "path_file" in task:
+                self.state.path_file = _maybe_str(task.get("path_file"))
+            if "goal_id" in task:
+                self.state.goal_id = _maybe_int(task.get("goal_id"))
+            if "goal_object" in task:
+                self.state.goal_object = _maybe_str(task.get("goal_object"))
+            if "goal_status" in task:
+                goal_status = _normalize_failed(_maybe_str(task.get("goal_status")))
+                self.state.goal_status = goal_status or self.state.goal_status
+                self.state.moving = goal_status == "going"
+            if "object_status" in task:
+                self.state.object_status = _normalize_failed(_maybe_str(task.get("object_status")))
+            if "goal_status" in task:
+                self._evaluate_arrival(task)
+        if "goal_status" in navigation and "goal_status" not in task:
+            # Some firmware splits navigation status from task identity. Navigation is a valid
+            # arrival source when task did not provide its own status; task path/id, if present,
+            # still protects the current goal from a delayed previous-point heartbeat.
+            self._evaluate_arrival({**task, **navigation})
         if gimbal:
             # Only when the field is actually there. Absent, `.get` returns None, which is not
             # "recording" and would silently rewrite a running recording as stopped — a
@@ -647,13 +866,106 @@ class HardwareRobotAdapter(RobotAdapter):
             if "record_status" in gimbal:
                 self.state.recording = gimbal.get("record_status") == "recording"
                 self._recording_status_known = True
-            self.state.yaw = _maybe_float(gimbal.get("yaw"))
-            self._heartbeat_yaw = self.state.yaw
-            self.state.pitch = _maybe_float(gimbal.get("pitch"))
-            self._heartbeat_pitch = self.state.pitch
-            self._heartbeat_revision = (self._heartbeat_revision or 0) + 1
-            if self.state.yaw is not None:
-                self.state.camera_angle = self.state.yaw
+            if "yaw" in gimbal:
+                yaw = _maybe_float(gimbal.get("yaw"))
+                if yaw is not None:
+                    self.state.yaw = yaw
+                    self._heartbeat_yaw = yaw
+                    self._heartbeat_yaw_pending = True
+            if "pitch" in gimbal:
+                pitch = _maybe_float(gimbal.get("pitch"))
+                if pitch is not None:
+                    self.state.pitch = pitch
+                    self._heartbeat_pitch = pitch
+                    self._heartbeat_pitch_pending = True
+            # Some firmware reports the two axes in one frame; some splits them. Advance only
+            # once both axes have been updated since the prior complete sample or command.
+            if self._heartbeat_yaw_pending and self._heartbeat_pitch_pending:
+                self._heartbeat_revision = (self._heartbeat_revision or 0) + 1
+                self._heartbeat_yaw_pending = False
+                self._heartbeat_pitch_pending = False
+            if self._heartbeat_yaw is not None:
+                self.state.camera_angle = self._heartbeat_yaw
+
+        if heartbeat_received_at is not None:
+            previous = self.state.diagnostics.last_heartbeat
+            yaw = previous.yaw if previous else None
+            yaw_received_at = previous.yaw_received_at if previous else None
+            pitch = previous.pitch if previous else None
+            pitch_received_at = previous.pitch_received_at if previous else None
+            gimbal_mode = previous.gimbal_mode if previous else None
+            task_goal_status = previous.task_goal_status if previous else None
+            task_goal_status_received_at = (
+                previous.task_goal_status_received_at if previous else None
+            )
+            task_goal_status_identity = previous.task_goal_status_identity if previous else None
+            navigation_goal_status = previous.navigation_goal_status if previous else None
+            navigation_goal_status_received_at = (
+                previous.navigation_goal_status_received_at if previous else None
+            )
+            navigation_goal_status_identity = (
+                previous.navigation_goal_status_identity if previous else None
+            )
+            object_status = previous.object_status if previous else None
+            object_status_received_at = previous.object_status_received_at if previous else None
+            object_status_identity = previous.object_status_identity if previous else None
+            path_file = previous.path_file if previous else None
+            goal_id = previous.goal_id if previous else None
+            if "goal_status" in task:
+                task_goal_status = _normalize_failed(_maybe_str(task.get("goal_status")))
+                task_goal_status_received_at = heartbeat_received_at
+                task_goal_status_identity = _heartbeat_goal_identity(task)
+            if "goal_status" in navigation:
+                navigation_goal_status = _normalize_failed(
+                    _maybe_str(navigation.get("goal_status"))
+                )
+                navigation_goal_status_received_at = heartbeat_received_at
+                task_identity = _heartbeat_goal_identity(task) or {}
+                navigation_identity = _heartbeat_goal_identity(navigation) or {}
+                merged_identity = {**task_identity, **navigation_identity}
+                navigation_goal_status_identity = merged_identity or None
+            if "object_status" in task:
+                object_status = _normalize_failed(_maybe_str(task.get("object_status")))
+                object_status_received_at = heartbeat_received_at
+                object_status_identity = _heartbeat_goal_identity(task)
+            if "path_file" in task:
+                path_file = _maybe_str(task.get("path_file"))
+            if "goal_id" in task:
+                goal_id = _maybe_int(task.get("goal_id"))
+            if gimbal:
+                heartbeat_yaw = _maybe_float(gimbal.get("yaw")) if "yaw" in gimbal else None
+                heartbeat_pitch = _maybe_float(gimbal.get("pitch")) if "pitch" in gimbal else None
+                if heartbeat_yaw is not None:
+                    yaw = heartbeat_yaw
+                    yaw_received_at = heartbeat_received_at
+                if heartbeat_pitch is not None:
+                    pitch = heartbeat_pitch
+                    pitch_received_at = heartbeat_received_at
+                if "mode" in gimbal and gimbal.get("mode") is not None:
+                    raw_mode = gimbal.get("mode")
+                    gimbal_mode = raw_mode if isinstance(raw_mode, (int, str)) else str(raw_mode)
+            self.state.diagnostics.last_heartbeat = RobotHeartbeatDiagnostic(
+                sequence=(previous.sequence if previous else 0) + 1,
+                received_at=heartbeat_received_at,
+                yaw=yaw,
+                yaw_received_at=yaw_received_at,
+                pitch=pitch,
+                pitch_received_at=pitch_received_at,
+                gimbal_mode=gimbal_mode,
+                task_goal_status=task_goal_status,
+                task_goal_status_received_at=task_goal_status_received_at,
+                task_goal_status_identity=task_goal_status_identity,
+                navigation_goal_status=navigation_goal_status,
+                navigation_goal_status_received_at=navigation_goal_status_received_at,
+                navigation_goal_status_identity=navigation_goal_status_identity,
+                object_status=object_status,
+                object_status_received_at=object_status_received_at,
+                object_status_identity=object_status_identity,
+                path_file=path_file,
+                goal_id=goal_id,
+                payload=heartbeat_payload,
+            )
+            changed = True
 
         record = payload.get("robot_video_record")
         if isinstance(record, dict):
@@ -678,6 +990,19 @@ class HardwareRobotAdapter(RobotAdapter):
             changed = True
 
         return changed
+
+    def _clear_heartbeat_diagnostics(self) -> None:
+        """Invalidate comparisons whenever a hardware connection is replaced."""
+        self._heartbeat_yaw = None
+        self._heartbeat_pitch = None
+        self._heartbeat_revision = None
+        self._heartbeat_yaw_pending = False
+        self._heartbeat_pitch_pending = False
+        self._pending_goal_attempt = None
+        self.state.diagnostics.last_goal_attempt = None
+        self.state.diagnostics.last_goal_command = None
+        self.state.diagnostics.last_heartbeat = None
+        self.state.diagnostics.last_gimbal_command = None
 
     def _fail_pending(self, exc: Exception) -> None:
         for future in self._pending.values():
@@ -891,8 +1216,14 @@ class RobotService:
     async def wait_for_arrival(self, timeout_s: float = 60.0) -> str:
         return await self.adapter.wait_for_arrival(timeout_s)
 
-    async def sweep_camera(self, target_yaw: float, yaw_speed: float) -> RobotState:
-        state = await self.adapter.sweep_camera(target_yaw, yaw_speed)
+    async def sweep_camera(
+        self,
+        target_yaw: float,
+        yaw_speed: float,
+        *,
+        context: str = "camera_sweep",
+    ) -> RobotState:
+        state = await self.adapter.sweep_camera(target_yaw, yaw_speed, context=context)
         await self.events.publish("ROBOT_STATE", state.model_dump(mode="json"))
         return state
 
@@ -923,8 +1254,13 @@ class RobotService:
         await self.events.publish("ROBOT_STATE", state.model_dump(mode="json"))
         return state
 
-    async def set_gimbal(self, command: GimbalMoveRequest) -> RobotState:
-        state = await self.adapter.set_gimbal(command)
+    async def set_gimbal(
+        self,
+        command: GimbalMoveRequest,
+        *,
+        context: str = "manual",
+    ) -> RobotState:
+        state = await self.adapter.set_gimbal(command, context=context)
         log_event(
             "info", "gimbal.moved",
             yaw_end=command.yaw_end, pitch_end=command.pitch_end, zoom_end=command.zoom_end,
@@ -1335,6 +1671,69 @@ def _maybe_str(value: Any) -> str | None:
     if value is None:
         return None
     return str(value)
+
+
+def _heartbeat_goal_identity(block: dict[str, Any]) -> dict[str, Any] | None:
+    """Keep the identity beside the status that supplied it.
+
+    The next heartbeat may contain only gimbal data.  Keeping identity only in the latest
+    raw frame would then make an old point's retained ``done``/``object_status`` look as if it
+    belonged to the new point.  An absent field stays absent: status-only firmware frames are
+    still usable, but the UI will describe them as time-correlated rather than identity-proven.
+    """
+    identity: dict[str, Any] = {}
+    path_key = (
+        "path_file" if "path_file" in block else "path_name" if "path_name" in block else None
+    )
+    if path_key is not None:
+        path = _maybe_str(block.get(path_key))
+        if path is not None:
+            identity["path_file"] = path
+    if "goal_id" in block:
+        goal_id = _maybe_int(block.get("goal_id"))
+        if goal_id is not None:
+            identity["goal_id"] = goal_id
+    if "goal_object" in block:
+        goal_object = _maybe_str(block.get("goal_object"))
+        identity["goal_object"] = goal_object or None
+    return identity or None
+
+
+def _goal_identity_conflicts(block: dict[str, Any], command: RobotGoalCommand) -> bool:
+    """Reject a response/status only when an identity field explicitly contradicts the goal."""
+    path_key = (
+        "path_file" if "path_file" in block else "path_name" if "path_name" in block else None
+    )
+    if path_key is not None:
+        reported_path = _maybe_str(block.get(path_key))
+        if reported_path is not None and reported_path != command.path_name:
+            return True
+    if "goal_id" in block:
+        reported_goal_id = _maybe_int(block.get("goal_id"))
+        if reported_goal_id is None or reported_goal_id != command.goal_id:
+            return True
+    expected_object = _maybe_str(command.goal_object) or None
+    if expected_object is not None and "goal_object" in block:
+        reported_object = _maybe_str(block.get("goal_object")) or None
+        if reported_object != expected_object:
+            return True
+    return False
+
+
+def _goal_identity_is_explicit_match(
+    block: dict[str, Any], command: RobotGoalCommand
+) -> bool:
+    """A path and point pair is strong enough to accept a direct terminal heartbeat."""
+    path_key = (
+        "path_file" if "path_file" in block else "path_name" if "path_name" in block else None
+    )
+    if path_key is None or "goal_id" not in block:
+        return False
+    return (
+        _maybe_str(block.get(path_key)) == command.path_name
+        and _maybe_int(block.get("goal_id")) == command.goal_id
+        and not _goal_identity_conflicts(block, command)
+    )
 
 
 def _normalize_failed(value: str | None) -> str | None:

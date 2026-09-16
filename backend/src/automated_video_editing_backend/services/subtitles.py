@@ -10,7 +10,7 @@ from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, replace
 from difflib import SequenceMatcher
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 # Where the bundled fonts live. `scripts/prepare_assets.py` puts them here and checks that each
 # one calls itself the family name below — libass matches on the family name a font declares
@@ -184,18 +184,19 @@ def missing_fonts() -> list[str]:
 
 
 def load_words(metadata_path: str | Path) -> tuple[list[dict[str, Any]], str | None]:
-    """Word timings from a TTS sidecar, and a plain reason when there are none.
+    """Strict provider word timings from a TTS sidecar, and why they are unavailable.
 
     Returns `(words, problem)`. The two failures that matter are told apart: a sidecar that
-    cannot be read is a different situation from a provider that answered without timestamps,
-    and only the second means "this voice simply cannot be subtitled".
+    cannot be read is a different situation from a provider that answered without timestamps.
+    Rendering uses :func:`load_words_or_estimate`, which may recover the latter from reviewed
+    text and actual audio duration; this strict function remains useful for diagnostics.
     """
     path = Path(metadata_path)
     if not path.exists():
         return [], f"找不到配音时间戳文件：{path.name}"
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         return [], f"配音时间戳文件无法读取（{exc.__class__.__name__}）：{path.name}"
     if not isinstance(data, dict):
         return [], f"配音时间戳文件格式不对：{path.name}"
@@ -210,6 +211,138 @@ def load_words(metadata_path: str | Path) -> tuple[list[dict[str, Any]], str | N
     if not restored:
         return [], "该配音的逐字时间戳损坏，无法安全生成字幕"
     return restored, None
+
+
+def load_words_or_estimate(
+    metadata_path: str | Path,
+    *,
+    audio_duration_seconds: float | None = None,
+) -> tuple[list[dict[str, Any]], Literal["exact", "estimated"] | None, str | None]:
+    """Load trustworthy provider timings, or estimate them from reviewed text and duration.
+
+    The provider's labels never become subtitle text. When its word clock is missing or unsafe,
+    the exact text saved before synthesis is divided across the complete narration duration.
+    ``problem`` is the reason estimation was needed, or the reason even estimation was unsafe.
+    """
+    words, problem = load_words(metadata_path)
+    path = Path(metadata_path)
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return [], None, problem
+    if not isinstance(data, dict):
+        return [], None, problem
+
+    audio_duration_ms = None
+    if audio_duration_seconds is not None and not isinstance(audio_duration_seconds, bool):
+        try:
+            audio_duration_ms = _positive_duration_ms(float(audio_duration_seconds) * 1000.0)
+        except (TypeError, ValueError):
+            audio_duration_ms = None
+
+    if words:
+        # Only new sidecars can prove their clock is exact. Legacy files predate provenance and
+        # may already contain a proportional repair, so describe them conservatively.
+        _restored, observed_quality = restore_source_spelling_with_quality(
+            data.get("words") or [],
+            str(data.get("text") or ""),
+            duration_ms=data.get("duration_ms"),
+        )
+        quality: Literal["exact", "estimated"] = (
+            "exact"
+            if data.get("timing_quality") == "exact" and observed_quality == "exact"
+            else "estimated"
+        )
+        source_text = data.get("text")
+        if (
+            audio_duration_ms is not None
+            and not _word_timing_covers_duration(words, audio_duration_ms)
+            and isinstance(source_text, str)
+            and source_text.strip()
+        ):
+            # A repaired provider interval may end before the actual file. Once FFprobe has the
+            # complete duration, rebuild the estimate across that full clock rather than keeping
+            # a truncated subtitle track merely because its individual records are well formed.
+            estimated = estimate_source_timing(source_text, audio_duration_ms)
+            if estimated:
+                return estimated, "estimated", None
+        return words, quality, None
+
+    source_text = data.get("text")
+    if not isinstance(source_text, str) or not source_text.strip():
+        return [], None, f"{problem}；缺少已确认的旁白文字，无法估算字幕"
+
+    duration_ms = audio_duration_ms
+    if duration_ms is None:
+        duration_ms = _positive_duration_ms(data.get("duration_ms"))
+    if duration_ms is None:
+        return [], None, f"{problem}；无法取得旁白时长，无法估算字幕"
+
+    estimated = estimate_source_timing(source_text, duration_ms)
+    if not estimated:
+        return [], None, f"{problem}；旁白文字或时长不可用，无法估算字幕"
+    return estimated, "estimated", problem
+
+
+def estimate_source_timing(source_text: str, duration_ms: float) -> list[dict[str, Any]]:
+    """Spread reviewed narration over its audio duration with punctuation-aware weights.
+
+    This is deliberately deterministic and inexpensive. Punctuation receives some of the clock
+    so sentence and clause endings remain visible through the pause; cue building then uses those
+    same punctuation boundaries and the normal line-length limit to produce readable subtitles.
+    """
+    source = re.sub(r"\s+", " ", source_text).strip()
+    duration = _positive_duration_ms(duration_ms)
+    if not source or duration is None:
+        return []
+
+    def weight(char: str) -> float:
+        if char.isspace():
+            return 0.2
+        if char in _HARD_STOPS:
+            return 1.6
+        if char in _SOFT_STOPS:
+            return 0.8
+        if unicodedata.category(char).startswith("P"):
+            return 0.4
+        return 1.0
+
+    weights = [weight(char) for char in source]
+    total = sum(weights)
+    elapsed = 0.0
+    estimated: list[dict[str, Any]] = []
+    for char, char_weight in zip(source, weights, strict=True):
+        start = duration * elapsed / total
+        elapsed += char_weight
+        end = duration * elapsed / total
+        estimated.append({
+            "word": char,
+            "start_time": round(start, 3),
+            "end_time": round(end, 3),
+        })
+    return estimated
+
+
+def _word_timing_covers_duration(
+    words: Iterable[dict[str, Any]], duration_ms: float,
+) -> bool:
+    """Whether a word clock plausibly covers the complete audio file."""
+    duration = _positive_duration_ms(duration_ms)
+    if duration is None:
+        return False
+    timed = normalise_words(words)
+    if not timed:
+        return False
+    start_ms = min(item[1] for item in timed) * 1000.0
+    end_ms = max(item[2] for item in timed) * 1000.0
+    span_ms = end_ms - start_ms
+    tolerance = max(300.0, duration * 0.2)
+    return (
+        span_ms >= duration * 0.2
+        and start_ms <= tolerance
+        and end_ms >= duration - tolerance
+        and end_ms <= duration + tolerance
+    )
 
 
 @dataclass(frozen=True)
@@ -227,6 +360,20 @@ def restore_source_spelling(
     *,
     duration_ms: Any = None,
 ) -> list[dict[str, Any]]:
+    restored, _quality = restore_source_spelling_with_quality(
+        raw_words,
+        source_text,
+        duration_ms=duration_ms,
+    )
+    return restored
+
+
+def restore_source_spelling_with_quality(
+    raw_words: list[dict[str, Any]],
+    source_text: str,
+    *,
+    duration_ms: Any = None,
+) -> tuple[list[dict[str, Any]], Literal["exact", "estimated"] | None]:
     """Use the reviewed source as text and the provider response only as a timing guide.
 
     Provider labels can normalise spelling (``OPC`` → ``opc`` or ``六和桥`` → ``六合桥``),
@@ -241,7 +388,7 @@ def restore_source_spelling(
         # there is no safe spelling to restore (a place name may already have been normalised),
         # so callers must surface timestamps/subtitles as unavailable rather than leak those
         # labels into the finished video.
-        return []
+        return [], None
 
     tokens: list[_TimestampToken] = []
     valid_indices: list[int] = []
@@ -255,13 +402,17 @@ def restore_source_spelling(
         if not isinstance(value, str) or not value:
             discarded_token = True
             continue
+        if isinstance(record.get("start_time"), bool) or isinstance(record.get("end_time"), bool):
+            # bool is an int in Python; without this guard True becomes a plausible-looking 1 ms.
+            discarded_token = True
+            continue
         try:
             start = float(record["start_time"])
             end = float(record["end_time"])
         except (KeyError, TypeError, ValueError):
             discarded_token = True
             continue
-        if not math.isfinite(start) or not math.isfinite(end) or end < start:
+        if not math.isfinite(start) or not math.isfinite(end) or start < 0 or end <= start:
             discarded_token = True
             continue
         tokens.append(_TimestampToken(record, key, value, start, end))
@@ -271,45 +422,48 @@ def restore_source_spelling(
         # With no trustworthy spoken interval there is nowhere safe to place even the reviewed
         # characters. Returning the provider labels here would reintroduce exactly the names the
         # operator corrected, so callers must treat this as "timestamps unavailable" instead.
-        return []
+        return [], None
     out_of_order = any(
         later.start < earlier.start or later.end < earlier.end
         for earlier, later in itertools.pairwise(tokens)
+    )
+    overlapping = any(
+        later.start < earlier.end for earlier, later in itertools.pairwise(tokens)
     )
     if not _spoken_interval_is_plausible(tokens, duration_ms):
         # A provider may return one valid-looking token and then truncate the response. Stretching
         # an entire approved paragraph over that tiny fragment makes every later subtitle appear
         # at the start of the narration. The provider's total audio duration is the authority for
         # deciding whether the surviving interval is complete enough to reuse.
-        return []
-    if discarded_token or out_of_order:
+        return [], None
+    if discarded_token or out_of_order or overlapping:
         boundary_missing = valid_indices[0] != 0 or valid_indices[-1] != len(raw_words) - 1
         if boundary_missing and _positive_duration_ms(duration_ms) is None:
             # With no trustworthy total duration and a damaged first/last record, there is no
             # evidence for where the approved sentence begins or ends. Internal damage remains
             # recoverable when both outer provider timestamps survived.
-            return []
+            return [], None
         # A partially damaged response cannot preserve token-by-token alignment: the missing
         # record may have contained any part of the approved sentence. Keep the real outer
         # spoken interval from the valid records and rebuild a monotonic clock for the complete
         # reviewed source. This sacrifices some word-level precision but never its spelling or
         # order, and is safer than silently splicing provider text back into customer subtitles.
-        return _proportional_source_timing(tokens, source)
+        return _proportional_source_timing(tokens, source), "estimated"
 
     provider = "".join(token.text for token in tokens)
     provider_keys = [_alignment_key(char) for char in provider]
     source_keys = [_alignment_key(char) for char in source]
     if not provider_keys:
-        return []
+        return [], None
 
     # Exact normalised order is the common path and avoids running the sequence matcher.
     if provider_keys == source_keys:
-        return _restore_by_position(tokens, source)
+        return _restore_by_position(tokens, source), "exact"
 
     matcher = SequenceMatcher(None, provider_keys, source_keys)
     opcodes = matcher.get_opcodes()
     if not _alignment_is_confident(matcher.ratio(), opcodes, len(provider), len(source)):
-        return _proportional_source_timing(tokens, source)
+        return _proportional_source_timing(tokens, source), "estimated"
 
     provider_to_token = [
         token_index
@@ -347,14 +501,16 @@ def restore_source_spelling(
                     source_to_provider[source_index] = left if offset < halfway else right
 
     if any(index is None for index in source_to_provider):
-        return _proportional_source_timing(tokens, source)
+        return _proportional_source_timing(tokens, source), "estimated"
     token_mapping = [provider_to_token[index] for index in source_to_provider if index is not None]
     if any(second < first for first, second in itertools.pairwise(token_mapping)):
-        return _proportional_source_timing(tokens, source)
-    return _source_text_on_tokens(tokens, source, token_mapping)
+        return _proportional_source_timing(tokens, source), "estimated"
+    return _source_text_on_tokens(tokens, source, token_mapping), "exact"
 
 
 def _positive_duration_ms(value: Any) -> float | None:
+    if isinstance(value, bool):
+        return None
     try:
         duration = float(value)
     except (TypeError, ValueError):

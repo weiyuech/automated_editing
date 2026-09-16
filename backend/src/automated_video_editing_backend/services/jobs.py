@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import math
 import os
 import random
 from datetime import datetime
@@ -70,6 +72,10 @@ class JobService:
         self._jobs: dict[str, JobRecord] = {}
         self._allocated_output_names: set[str] = set()
         self._render_slots = asyncio.Semaphore(1)
+        # Planning can ask for the same narration length more than once (subtitle timing and
+        # semantic matching share it). Keep successful probes for this service lifetime so a
+        # batch does not repeatedly launch FFprobe for one unchanged audio file.
+        self._audio_duration_cache: dict[tuple[str, int, int], float] = {}
 
     def list_jobs(self) -> list[JobRecord]:
         return list(self._jobs.values())
@@ -1006,16 +1012,55 @@ class JobService:
         return False
 
     def _audio_duration(self, item) -> float | None:
-        """Length of a voiceover, preferring the timing the TTS provider already reported."""
+        """Length of a voiceover, measuring estimates against the actual audio when possible."""
         if item is None:
             return None
-        duration_ms = item.metadata.get("duration_ms")
+
+        metadata_path = item.metadata.get("metadata_path")
+        if not metadata_path:
+            metadata_path = str(Path(item.path).with_suffix(".json"))
         try:
-            if duration_ms and float(duration_ms) > 0:
-                return float(duration_ms) / 1000.0
-        except (TypeError, ValueError):
-            pass
-        return self.renderer.probe_duration(item.path)
+            sidecar = json.loads(Path(metadata_path).read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            sidecar = {}
+        if not isinstance(sidecar, dict):
+            sidecar = {}
+
+        # The output file is the clock the renderer will really play. Measuring it also catches
+        # an otherwise-valid provider response that stopped reporting words before the audio did.
+        # Direct JSON reading above is intentionally non-mutating: planning must never quarantine
+        # or rewrite a malformed narration sidecar merely because the operator selected it.
+        if self.renderer is not None:
+            cache_key = None
+            try:
+                audio_path = Path(item.path).resolve()
+                stat = audio_path.stat()
+                cache_key = (str(audio_path), stat.st_size, stat.st_mtime_ns)
+            except OSError:
+                pass
+            measured = self._audio_duration_cache.get(cache_key) if cache_key else None
+            if measured is None:
+                measured = self.renderer.probe_duration(item.path)
+                if (
+                    measured is not None
+                    and math.isfinite(measured)
+                    and measured > 0
+                    and cache_key is not None
+                ):
+                    self._audio_duration_cache[cache_key] = measured
+            if measured is not None and math.isfinite(measured) and measured > 0:
+                return measured
+
+        for duration_ms in (item.metadata.get("duration_ms"), sidecar.get("duration_ms")):
+            if isinstance(duration_ms, bool):
+                continue
+            try:
+                duration = float(duration_ms)
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(duration) and duration > 0:
+                return duration / 1000.0
+        return None
 
     def _semantic_alignment(
         self, media_items: list, voiceover,

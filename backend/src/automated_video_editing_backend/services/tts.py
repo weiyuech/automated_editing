@@ -25,7 +25,7 @@ from automated_video_editing_backend.core.store import read_json, write_json
 from automated_video_editing_backend.services.media import MediaService
 from automated_video_editing_backend.services.naming import stamped_name
 from automated_video_editing_backend.services.settings import SettingsService
-from automated_video_editing_backend.services.subtitles import restore_source_spelling
+from automated_video_editing_backend.services.subtitles import restore_source_spelling_with_quality
 
 VOLCENGINE_SYNC_TTS_URL = "https://openspeech.bytedance.com/api/v1/tts"
 
@@ -78,6 +78,11 @@ class TTSService:
         cfg = self.settings.tts_config()
         if not self._configured(cfg):
             raise ValueError("TTS settings are incomplete")
+        # Freeze the one-time legacy working set before quota accounting, provider I/O, or a new
+        # audio file. Otherwise the next lazy pool read can mistake this narration for an older
+        # asset and select it without an explicit operator action. If persistence is unhealthy,
+        # fail before spending a paid generation attempt.
+        self.media.ensure_media_pool_initialized()
         quota = self.quota()
         if quota.remaining <= 0:
             raise ValueError(f"今日旁白生成已达上限（{quota.limit}），可在设置中调整每日上限")
@@ -89,7 +94,7 @@ class TTSService:
             audio, timing = await self._request_sync_tts(clean_text)
             if not isinstance(audio, (bytes, bytearray)) or not audio:
                 raise ValueError("语音服务未返回可用音频，未生成旁白")
-            words = restore_source_spelling(
+            words, timing_quality = restore_source_spelling_with_quality(
                 timing.get("words") or [],
                 clean_text,
                 duration_ms=timing.get("duration_ms"),
@@ -108,6 +113,7 @@ class TTSService:
                 "created_at": datetime.now(timezone.utc).isoformat(),
                 "duration_ms": timing.get("duration_ms", 0),
                 "words": words,
+                "timing_quality": timing_quality or "unavailable",
                 "phonemes": timing.get("phonemes") or [],
                 "provider": "volcengine_sync",
                 "voice_type": cfg.get("voice_type"),
@@ -115,7 +121,7 @@ class TTSService:
             }
             try:
                 # A .tmp suffix keeps a half-written response out of list_assets after a crash.
-                # Publish the audio only after its reviewed text and exact timing are durable.
+                # Publish the audio only after its reviewed text and timing quality are durable.
                 audio_stage.write_bytes(audio)
                 if not write_json(metadata_path, metadata):
                     raise RuntimeError(f"旁白文字和时间数据无法保存：{metadata_path.name}")
@@ -134,6 +140,7 @@ class TTSService:
                         "role": "tts_voice",
                         "metadata_path": str(metadata_path),
                         "duration_ms": metadata["duration_ms"],
+                        "timing_quality": metadata["timing_quality"],
                     },
                 )
             except Exception:
@@ -379,6 +386,9 @@ class TTSService:
             except json.JSONDecodeError:
                 metadata = {}
         stat = audio_path.stat()
+        timing_quality = metadata.get("timing_quality")
+        if timing_quality not in {"exact", "estimated", "unavailable"}:
+            timing_quality = "unavailable"
         return TTSAsset(
             id=media_id,
             name=audio_path.name,
@@ -387,6 +397,7 @@ class TTSService:
             text=str(metadata.get("text") or ""),
             duration_ms=int(metadata.get("duration_ms") or 0),
             word_count=len(metadata.get("words") or []),
+            timing_quality=timing_quality,
             created_at=datetime.fromtimestamp(stat.st_mtime, timezone.utc),
         )
 
