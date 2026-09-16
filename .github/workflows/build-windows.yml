@@ -111,6 +111,9 @@ jobs:
           print("Frozen backend contains the executable, FFmpeg, fonts, and semantic model.")
           PY
 
+      - name: Smoke-test frozen backend startup and API authentication
+        run: python scripts/smoke_frozen_backend.py frontend/build/backend-dist/automated-video-editing-backend.exe
+
       - name: Install frontend dependencies
         working-directory: frontend
         run: pnpm install --frozen-lockfile
@@ -288,6 +291,11 @@ jobs:
           print(f"External backend contains every required runtime asset ({len(files)} files).")
           PY
           python scripts/audit_external_bundle.py frontend/build-external/backend-dist
+
+      - name: Smoke-test external-tools backend startup and API authentication
+        env:
+          AVE_EXTERNAL_MEDIA_TOOLS: "1"
+        run: python scripts/smoke_frozen_backend.py frontend/build-external/backend-dist/automated-video-editing-backend.exe
 
       - name: Install frontend dependencies
         working-directory: frontend

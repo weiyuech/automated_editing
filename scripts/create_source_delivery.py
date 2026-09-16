@@ -48,6 +48,7 @@ SCRIPT_FILES = (
     "run_backend.py",
     "safety.py",
     "smoke_check.py",
+    "smoke_frozen_backend.py",
 )
 
 EXCLUDED_PARTS = {
