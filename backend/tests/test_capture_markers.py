@@ -4,8 +4,8 @@ import pytest
 
 from automated_video_editing_backend.core.events import EventHub
 from automated_video_editing_backend.core.models import CruiseSegment
-from automated_video_editing_backend.services.analysis import AnalysisService
 from automated_video_editing_backend.services import capture as capture_module
+from automated_video_editing_backend.services.analysis import AnalysisService
 from automated_video_editing_backend.services.capture import (
     CaptureService,
     gimbal_sidecar_path,
@@ -195,6 +195,10 @@ async def test_gimbal_sidecar_failure_is_reported_and_samples_remain_retryable(
         await capture.complete_with_recording(str(video))
     assert capture.active_session() is session
     assert session.gimbal_samples == [(0.0, 1.0, 2.0)]
+    # The capture document is the splitter's enrollment marker. Publishing it before the
+    # associated physical-motion evidence would let background segmentation race ahead with
+    # an incomplete recording, so a telemetry failure must leave it absent.
+    assert not sidecar_path(video).exists()
 
 
 def test_markers_and_detected_cuts_are_merged(tmp_path):

@@ -35,15 +35,16 @@ function fixture() {
   const root = join(base, 'app')
   const exports = join(root, 'exports')
   const downloads = join(root, 'data', 'downloads')
+  const captureSegments = join(root, 'data', 'capture_segments')
   const previews = join(root, 'previews')
   const cache = join(root, '.cache')
   const seedanceCache = join(root, 'data', 'seedance', 'cache')
   const external = join(base, 'operator-video.mp4')
-  for (const path of [exports, downloads, previews, cache, seedanceCache]) {
+  for (const path of [exports, downloads, captureSegments, previews, cache, seedanceCache]) {
     mkdirSync(path, { recursive: true })
   }
   writeFileSync(external, 'operator-owned')
-  return { base, root, exports, downloads, previews, cache, seedanceCache, external }
+  return { base, root, exports, downloads, captureSegments, previews, cache, seedanceCache, external }
 }
 
 test('external imported media can be inspected but never physically deleted', () => {
@@ -89,6 +90,27 @@ test('a capture sidecar cannot be deleted as a primary asset', () => {
     /Only app-managed media files/
   )
   assert.equal(ensureDeletableManagedPath(root, sidecar, true), sidecar)
+})
+
+test('a generated capture segment and only its exact companions are deletable', () => {
+  const { root, captureSegments } = fixture()
+  const directory = join(captureSegments, 'session', 'timeline')
+  mkdirSync(directory, { recursive: true })
+  const video = join(directory, '001-transit.mp4')
+  const captureSidecar = `${video}.capture.json`
+  const gimbalSidecar = `${video}.gimbal.json`
+  writeFileSync(video, 'generated child')
+  writeFileSync(captureSidecar, '{}')
+  writeFileSync(gimbalSidecar, '{}')
+
+  assert.equal(ensureDeletableManagedPath(root, video), video)
+  for (const sidecar of [captureSidecar, gimbalSidecar]) {
+    assert.throws(
+      () => ensureDeletableManagedPath(root, sidecar),
+      /Only app-managed media files/
+    )
+    assert.equal(ensureDeletableManagedPath(root, sidecar, true), sidecar)
+  }
 })
 
 test('a symlink under exports cannot escape the managed delete boundary', (context) => {

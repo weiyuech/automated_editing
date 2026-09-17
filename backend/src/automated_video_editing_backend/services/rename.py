@@ -7,7 +7,7 @@ from uuid import uuid4
 
 from automated_video_editing_backend.core.models import MediaItem
 from automated_video_editing_backend.core.store import write_json
-from automated_video_editing_backend.services.capture import sidecar_path
+from automated_video_editing_backend.services.capture import gimbal_sidecar_path, sidecar_path
 from automated_video_editing_backend.services.jobs import JobService
 from automated_video_editing_backend.services.media import MediaService
 from automated_video_editing_backend.services.naming import validate_filename
@@ -63,6 +63,11 @@ class MediaRenameService:
         move_capture_sidecar = capture_sidecar.is_file()
         if item.kind == "video" and capture_target.exists():
             raise ValueError(f"'{capture_target.name}' already exists here")
+        gimbal_sidecar = gimbal_sidecar_path(source)
+        gimbal_target = gimbal_sidecar_path(target)
+        move_gimbal_sidecar = gimbal_sidecar.is_file()
+        if item.kind == "video" and gimbal_target.exists():
+            raise ValueError(f"'{gimbal_target.name}' already exists here")
 
         # Export subtitle layers are paired by stem as well. Keeping them beside both the
         # delivery and its clean master is what lets 手动微调 rediscover the timing after a
@@ -123,6 +128,8 @@ class MediaRenameService:
             moves.append((tts_metadata, tts_target))
         if move_capture_sidecar:
             moves.append((capture_sidecar, capture_target))
+        if move_gimbal_sidecar:
+            moves.append((gimbal_sidecar, gimbal_target))
         moves.extend(export_sidecars)
         self._rename_files(moves, rewritten_subtitles)
 

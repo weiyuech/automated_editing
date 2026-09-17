@@ -9,6 +9,7 @@ const PREVIEWABLE_EXTS = new Set([
 
 const MANAGED_MEDIA_ROOTS = [
   ['data', 'downloads'],
+  ['data', 'capture_segments'],
   ['data', 'tts'],
   ['data', 'seedance'],
   ['exports'],

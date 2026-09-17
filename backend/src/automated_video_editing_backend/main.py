@@ -294,12 +294,16 @@ def create_app() -> FastAPI:
     planner = EditPlanner()
     renderer = RenderService()
     seedance = SeedanceService(settings, media, renderer)
-    jobs = JobService(events, media, analysis, planner, renderer, settings)
+    encoding_slots = asyncio.Semaphore(1)
+    jobs = JobService(events, media, analysis, planner, renderer, settings, render_slots=encoding_slots)
+    media.captures.slots = encoding_slots
+    media.captures.external_path_in_use = jobs.is_path_in_use
     renamer = MediaRenameService(media, jobs, seedance)
     admin_access = AdminAccessService()
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
+        await media.captures.start(media.list_items)
         if settings.robot_config().get("websocket_url"):
             asyncio.create_task(robot.connect())
         try:
@@ -310,6 +314,7 @@ def create_app() -> FastAPI:
                 framing_test.close,
                 lambda: _shutdown_robot_and_capture(robot, capture),
             )
+            await media.captures.close()
 
     app = FastAPI(title="Automated Video Editing Backend", version="0.1.7", lifespan=lifespan)
     app.add_middleware(

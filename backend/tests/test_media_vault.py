@@ -53,6 +53,22 @@ def test_vault_hides_capture_sidecar_because_it_belongs_to_the_video():
         sidecar.unlink(missing_ok=True)
 
 
+def test_vault_hides_gimbal_sidecar_because_it_belongs_to_the_video():
+    video = generated_path("data", "downloads", f"gimbal-{uuid4().hex}.mp4")
+    sidecar = video.with_name(f"{video.name}.gimbal.json")
+    video.parent.mkdir(parents=True, exist_ok=True)
+    video.write_bytes(b"capture")
+    sidecar.write_text('{"samples": [[0, 0, 0]]}', encoding="utf-8")
+
+    try:
+        paths = {asset.path for asset in MediaVaultService().list_assets()}
+        assert str(video) in paths
+        assert str(sidecar) not in paths
+    finally:
+        video.unlink(missing_ok=True)
+        sidecar.unlink(missing_ok=True)
+
+
 def test_vault_includes_registered_external_import(tmp_path):
     path = tmp_path / "local-import.mp4"
     path.write_bytes(b"placeholder")

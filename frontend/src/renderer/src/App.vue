@@ -507,14 +507,14 @@
                 <div v-else class="asset-list">
                   <template v-for="row in selectedCalendarRows" :key="row.key">
                     <div v-if="row.type === 'group'" class="asset-row compact group-row" @click="toggleVaultGroup(row.key)">
-                      <span><span class="role-pill export">{{ roleLabel('export') }}</span></span>
+                      <span><span class="role-pill" :class="row.role || 'export'">{{ row.capture ? '拍摄' : roleLabel('export') }}</span></span>
                       <span class="group-name">
                         <span class="group-caret" :class="{ open: expandedVaultGroups[row.key] }">▸</span>
                         {{ row.name }}
                       </span>
                       <span>{{ formatBytes(row.size_bytes) }}</span>
                       <span class="asset-actions">
-                        <span class="group-count">{{ row.members.length }} 个视频</span>
+                        <span class="group-count">{{ row.capture ? '1 次拍摄 · ' : '' }}{{ row.members.length }} 个视频</span>
                         <button class="danger" @click.stop="trashVaultGroup(row)">全部删除</button>
                       </span>
                     </div>
@@ -535,9 +535,17 @@
                         <span v-else class="asset-actions">
                           <button v-if="member.can_rename" @click="startRename(member.path, member.name)">重命名</button>
                           <button :disabled="!member.can_preview" @click="openAsset(member)">打开</button>
-                          <button @click="revealAsset(member)">定位</button>
+                          <button :disabled="!member.path" @click="revealAsset(member)">定位</button>
                           <button class="danger" :disabled="!member.can_delete" @click="trashAsset(member)">删除</button>
                         </span>
+                      </div>
+                    <div v-if="row.capture" class="capture-group-tools">
+                        <span>{{ row.capture.error || row.capture.timing_note }}</span>
+                        <label>边界偏移（秒）<input type="number" min="-120" max="120" step="0.1"
+                          :value="captureOffsets[row.capture.id] ?? row.capture.offset_seconds"
+                          @input="captureOffsets[row.capture.id] = $event.target.value" /></label>
+                        <button :disabled="row.capture.status === 'generating'" @click="retryCapture(row.capture, true)">应用校准</button>
+                        <button :disabled="row.capture.status === 'generating'" @click="retryCapture(row.capture)">重新生成缺失片段</button>
                       </div>
                     </template>
                     <div v-else-if="row.type === 'asset'" class="asset-row compact">
@@ -575,7 +583,7 @@
             <template v-for="row in vaultRows" :key="row.key">
               <!-- 一个成片有两个文件（带字幕的成片和无字幕的母版）时收成一行，点开才展开 -->
               <div v-if="row.type === 'group'" class="table-row group-row" @click="toggleVaultGroup(row.key)">
-                <span><span class="role-pill export">{{ roleLabel('export') }}</span></span>
+                <span><span class="role-pill" :class="row.role || 'export'">{{ row.capture ? '拍摄' : roleLabel('export') }}</span></span>
                 <span class="group-name">
                   <span class="group-caret" :class="{ open: expandedVaultGroups[row.key] }">▸</span>
                   {{ row.name }}
@@ -583,7 +591,7 @@
                 <span>{{ formatBytes(row.size_bytes) }}</span>
                 <span>{{ formatDate(row.modified_at) }}</span>
                 <span class="asset-actions">
-                  <span class="group-count">{{ row.members.length }} 个视频</span>
+                  <span class="group-count">{{ row.capture ? '1 次拍摄 · ' : '' }}{{ row.members.length }} 个视频</span>
                   <button class="danger" @click.stop="trashVaultGroup(row)">全部删除</button>
                 </span>
               </div>
@@ -605,10 +613,18 @@
                   <span v-else class="asset-actions">
                     <button v-if="member.can_rename" @click="startRename(member.path, member.name)">重命名</button>
                     <button :disabled="!member.can_preview" @click="openAsset(member)">打开</button>
-                    <button @click="revealAsset(member)">定位</button>
+                    <button :disabled="!member.path" @click="revealAsset(member)">定位</button>
                     <button class="danger" :disabled="!member.can_delete" @click="trashAsset(member)">删除</button>
                   </span>
                 </div>
+              <div v-if="row.capture" class="capture-group-tools">
+                        <span>{{ row.capture.error || row.capture.timing_note }}</span>
+                        <label>边界偏移（秒）<input type="number" min="-120" max="120" step="0.1"
+                          :value="captureOffsets[row.capture.id] ?? row.capture.offset_seconds"
+                          @input="captureOffsets[row.capture.id] = $event.target.value" /></label>
+                        <button :disabled="row.capture.status === 'generating'" @click="retryCapture(row.capture, true)">应用校准</button>
+                        <button :disabled="row.capture.status === 'generating'" @click="retryCapture(row.capture)">重新生成缺失片段</button>
+                      </div>
               </template>
               <div v-else-if="row.type === 'asset'" class="table-row">
                 <span><span class="role-pill" :class="row.asset.role">{{ roleKindLabel(row.asset.role, row.asset.kind) }}</span></span>
@@ -689,7 +705,12 @@
                 <div v-if="sourcePoolItems.length === 0" class="empty">{{ sourcePoolEmptyText }}</div>
                 <div v-else-if="filteredSourceVideos.length === 0" class="empty">没有匹配「{{ sourceFilter }}」的视频。</div>
                 <div v-else class="scroll-list">
-                  <div v-for="item in filteredSourceVideos" :key="item.id" class="source-row">
+                  <template v-for="item in filteredSourceVideos" :key="item.id">
+                  <CaptureGroupPicker v-if="captureGroup(item)" :group="captureGroup(item)"
+                    :model-value="selectedSourceIds.includes(item.id) ? savedCaptureSelection(item) : null"
+                    :disabled="mediaPoolSaving || selectionAtLimit('source', item.id)"
+                    @update:model-value="updatePoolCapture(item, $event)" @preview="previewPoolItem" @retry="retryCapture" />
+                  <div v-else class="source-row">
                     <label class="source-pick" :title="selectionLimitTitle('source', item.id)">
                       <input
                         type="checkbox"
@@ -704,6 +725,8 @@
                       <button :disabled="mediaPoolSaving" @click="removeFromMediaPool('source', item.id)">移出</button>
                     </span>
                   </div>
+                  <button v-if="captureGroup(item)" class="capture-remove" :disabled="mediaPoolSaving" @click="removeFromMediaPool('source', item.id)">移出这次拍摄</button>
+                  </template>
                 </div>
               </div>
             </div>
@@ -1159,6 +1182,9 @@
                 <optgroup label="导入素材">
                   <option v-for="item in tuneImportedSources" :key="item.id" :value="item.id">{{ shortPath(item.path) }}</option>
                 </optgroup>
+                <optgroup v-for="group in tuneCaptureSourceGroups" :key="group.id" :label="`拍摄 · ${group.title}`">
+                  <option v-for="item in group.sources" :key="item.id" :value="item.id">{{ item.tune_label }}</option>
+                </optgroup>
                 <optgroup label="已导出成片（仅手动微调）">
                   <option v-for="item in tuneExportSources" :key="item.id" :value="item.id">{{ tuneExportOptionLabel(item) }}</option>
                 </optgroup>
@@ -1550,7 +1576,12 @@
         </div>
         <div v-if="filteredMediaLibraryItems.length === 0" class="empty library-empty">该分类暂无可用素材。</div>
         <div v-else class="library-picker-list">
-          <div v-for="item in filteredMediaLibraryItems" :key="item.id" class="library-picker-row"
+          <template v-for="item in filteredMediaLibraryItems" :key="item.id">
+          <CaptureGroupPicker v-if="mediaLibraryTab === 'source' && captureGroup(item)" :group="captureGroup(item)"
+            :model-value="isItemInPool('source', item.id) ? savedCaptureSelection(item) : pendingCaptureSelections[captureGroup(item).id] || null"
+            :disabled="isItemInPool('source', item.id) || mediaPoolSaving"
+            @update:model-value="updatePendingCapture(item, $event)" @preview="previewPoolItem" @retry="retryCapture" />
+          <div v-else class="library-picker-row"
             :class="{ pooled: isItemInPool(mediaLibraryTab, item.id), unavailable: !isMediaPoolEligible(mediaLibraryTab, item) }">
             <label :title="mediaPoolAvailabilityTitle(mediaLibraryTab, item)">
               <input type="checkbox" :checked="isItemInPool(mediaLibraryTab, item.id) || pendingPoolIds.includes(item.id)"
@@ -1560,6 +1591,7 @@
             </label>
             <button type="button" @click="previewPoolItem(item)">{{ item.kind === 'audio' ? '试听' : '预览' }}</button>
           </div>
+          </template>
         </div>
         <div class="library-picker-footer">
           <span>已选择 {{ pendingPoolIds.length }} 个待加入素材</span>
@@ -1575,7 +1607,7 @@
         <div class="library-picker-head"><div><strong>{{ shortPath(previewItem.path) }}</strong><small>{{ roleKindLabel(itemRole(previewItem), previewItem.kind) }}</small></div><button @click="closePoolPreview">关闭</button></div>
         <audio v-if="previewItem.kind === 'audio'" :src="mediaFileUrl(previewItem.path)" controls autoplay></audio>
         <img v-else-if="previewItem.kind === 'image'" :src="mediaFileUrl(previewItem.path)" :alt="shortPath(previewItem.path)" />
-        <video v-else :src="mediaFileUrl(previewItem.path)" controls autoplay playsinline></video>
+        <video v-else :src="mediaFileUrl(previewItem.path)" controls autoplay playsinline @loadedmetadata="startCapturePreview" @timeupdate="limitCapturePreview"></video>
       </div>
     </div>
     <div v-if="showFramingSetupPrompt" class="modal-backdrop" @click.self="showFramingSetupPrompt = false">
@@ -1598,6 +1630,16 @@ import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import StatusCard from './components/StatusCard.vue'
 import Panel from './components/Panel.vue'
 import LogList from './components/LogList.vue'
+import CaptureGroupPicker from './components/CaptureGroupPicker.vue'
+import {
+  captureGroup,
+  captureSearchText,
+  captureTuneClipIdentity,
+  captureTuneSourceGroups,
+  captureVaultRow,
+  fullCaptureSelection,
+  normalizeCaptureSelection
+} from './capture-group-policy.js'
 import {
   alignAudioBedToTimeline,
   hasBurnedSubtitleSource,
@@ -1662,8 +1704,10 @@ const MEDIA_POOL_FIELDS = {
   effect: 'effect_media_ids'
 }
 const EMPTY_MEDIA_POOL = {
-  source_media_ids: [], music_media_ids: [], voiceover_media_ids: [], effect_media_ids: []
+  source_media_ids: [], music_media_ids: [], voiceover_media_ids: [], effect_media_ids: [], capture_selections: []
 }
+const pendingCaptureSelections = ref({})
+const captureOffsets = ref({})
 
 const active = ref('dashboard')
 const current = computed(() => nav.find((item) => item.key === active.value) || nav[0])
@@ -2326,7 +2370,7 @@ const isGeneratingSeedance = ref(false)
 const filteredSourceVideos = computed(() => {
   const needle = sourceFilter.value.trim().toLowerCase()
   if (!needle) return sourcePoolItems.value
-  return sourcePoolItems.value.filter((item) => item.path.toLowerCase().includes(needle))
+  return sourcePoolItems.value.filter((item) => captureSearchText(item).includes(needle))
 })
 const sourceVideoItems = computed(() => media.value.filter((item) => item.kind === 'video' && itemRole(item) === 'raw_video'))
 const audioItems = computed(() => media.value.filter((item) => item.kind === 'audio' && itemRole(item) === 'music'))
@@ -2359,7 +2403,7 @@ const mediaLibraryItems = computed(() => ({
 const filteredMediaLibraryItems = computed(() => {
   const needle = mediaLibraryFilter.value.trim().toLowerCase()
   if (!needle) return mediaLibraryItems.value
-  return mediaLibraryItems.value.filter((item) => item.path.toLowerCase().includes(needle))
+  return mediaLibraryItems.value.filter((item) => captureSearchText(item).includes(needle))
 })
 
 function poolItems(items, poolKind) {
@@ -2424,7 +2468,7 @@ const filteredVaultAssets = computed(() => {
   const needle = vaultFilter.value.trim().toLowerCase()
   if (!needle) return userVaultAssets.value
   return userVaultAssets.value.filter((asset) =>
-    asset.name.toLowerCase().includes(needle) || roleKindLabel(asset.role, asset.kind).toLowerCase().includes(needle)
+    captureSearchText(asset).includes(needle) || roleKindLabel(asset.role, asset.kind).toLowerCase().includes(needle)
   )
 })
 const userVaultAssets = computed(() => vaultAssets.value.filter((asset) => asset.role !== 'cache'))
@@ -2443,6 +2487,11 @@ function groupVaultAssets(assets) {
   const groups = new Map()
   const rows = []
   for (const asset of assets) {
+    const capture = captureVaultRow(asset)
+    if (capture) {
+      rows.push(capture)
+      continue
+    }
     const key = asset.export_group
     if (!key) {
       rows.push({ type: 'asset', key: asset.id, asset })
@@ -2466,7 +2515,7 @@ function groupVaultAssets(assets) {
   // A group of one is just a file. Drawing it with a disclosure arrow would promise something
   // to open and then show a single row identical to the one above it.
   return rows.map((row) =>
-    row.type === 'group' && row.members.length === 1
+    row.type === 'group' && !row.capture && row.members.length === 1
       ? { type: 'asset', key: row.members[0].id, asset: row.members[0] }
       : row
   )
@@ -2807,6 +2856,7 @@ async function refreshEditingCapabilities() {
       method: 'POST',
       body: JSON.stringify({
         media_ids: selectedSourceIds.value.slice(0, MAX_SOURCE_VIDEOS),
+        capture_selections: selectedCaptureChoices(),
         music_media_ids: selectedAutomationMusicIds.value.slice(0, MAX_AUTOMATION_ITEMS)
       })
     })
@@ -2826,7 +2876,7 @@ async function refreshEditingCapabilities() {
 }
 
 watch(
-  [selectedSourceIds, selectedAutomationMusicIds],
+  [selectedSourceIds, selectedAutomationMusicIds, () => mediaPool.value.capture_selections],
   () => {
     if (editingCapabilityTimer) clearTimeout(editingCapabilityTimer)
     editingCapabilityTimer = setTimeout(
@@ -3780,6 +3830,7 @@ async function createAutomationJobs(forceWithoutPreference = false) {
       body: JSON.stringify({
         title: editTitle.value,
         media_ids: videoIds,
+        capture_selections: selectedCaptureChoices(),
         music_media_ids: selectedAutomationMusicIds.value.slice(0, MAX_AUTOMATION_ITEMS),
         voiceover_media_ids: selectedAutomationVoiceoverIds.value.slice(0, MAX_AUTOMATION_ITEMS),
         intro_effect_media_ids: selectedIntroEffectIds.value.slice(0, MAX_AUTOMATION_ITEMS),
@@ -3896,6 +3947,7 @@ function selectionLimitTitle(kind, id) {
 }
 
 function openMediaLibrary(kind) {
+  pendingCaptureSelections.value = {}
   mediaLibraryTab.value = kind
   mediaLibraryFilter.value = ''
   pendingPoolIds.value = []
@@ -3909,6 +3961,7 @@ function closeMediaLibrary() {
 }
 
 function switchMediaLibraryTab(kind) {
+  pendingCaptureSelections.value = {}
   mediaLibraryTab.value = kind
   mediaLibraryFilter.value = ''
   pendingPoolIds.value = []
@@ -3945,9 +3998,9 @@ async function saveMediaPool(nextPool, successMessage = '') {
   mediaPoolStatus.value = ''
   mediaPoolStatusKind.value = 'muted'
   try {
-    mediaPool.value = await api('/media/pool', {
+    mediaPool.value = { ...EMPTY_MEDIA_POOL, ...await api('/media/pool', {
       method: 'PUT', body: JSON.stringify({ ...EMPTY_MEDIA_POOL, ...nextPool })
-    })
+    }) }
     pruneSelectionsToPool()
     if (successMessage) {
       mediaPoolStatusKind.value = 'success'
@@ -3990,7 +4043,21 @@ async function addPendingItemsToPool() {
   }
   const ids = [...new Set([...(mediaPool.value[field] || []), ...eligibleIds])]
   const added = eligibleIds.length
-  if (await saveMediaPool({ ...mediaPool.value, [field]: ids }, `已加入媒体池 ${added} 个素材。`)) closeMediaLibrary()
+  const captures = [...(mediaPool.value.capture_selections || [])]
+  if (mediaLibraryTab.value === 'source') {
+    for (const id of eligibleIds) {
+      const item = mediaLibraryItems.value.find((entry) => entry.id === id)
+      const group = captureGroup(item)
+      if (group) {
+        const selection = normalizeCaptureSelection(
+          group,
+          pendingCaptureSelections.value[group.id] || fullCaptureSelection(group)
+        )
+        if (selection) captures.push(selection)
+      }
+    }
+  }
+  if (await saveMediaPool({ ...mediaPool.value, [field]: ids, capture_selections: captures }, `已加入媒体池 ${added} 项。`)) closeMediaLibrary()
 }
 
 async function removeFromMediaPool(kind, id) {
@@ -4012,6 +4079,48 @@ function previewPoolItem(item) {
   previewItem.value = item
 }
 
+function savedCaptureSelection(item) {
+  const group = captureGroup(item)
+  const saved = (mediaPool.value.capture_selections || []).find((selection) => selection.capture_id === group.id)
+  return normalizeCaptureSelection(group, saved || fullCaptureSelection(group))
+}
+
+function selectedCaptureChoices() {
+  return sourcePoolItems.value.filter((item) => selectedSourceIds.value.includes(item.id) && captureGroup(item))
+    .map(savedCaptureSelection).filter(Boolean)
+}
+
+function updatePendingCapture(item, selection) {
+  pendingCaptureSelections.value = { ...pendingCaptureSelections.value, [captureGroup(item).id]: selection }
+  togglePendingPoolItem(item, Boolean(selection))
+}
+
+async function updatePoolCapture(item, selection) {
+  if (!selection) {
+    toggleSourceSelection(item.id, false)
+    return
+  }
+  const captures = (mediaPool.value.capture_selections || []).filter((s) => s.capture_id !== selection.capture_id)
+  if (await saveMediaPool({ ...mediaPool.value, capture_selections: [...captures, selection] })) toggleSourceSelection(item.id, true)
+}
+
+async function retryCapture(group, calibrate = false) {
+  try {
+    const body = calibrate ? { offset_seconds: Number(captureOffsets.value[group.id] ?? group.offset_seconds) } : {}
+    await api(`/media/captures/${encodeURIComponent(group.id)}/regenerate`, { method: 'POST', body: JSON.stringify(body) })
+    await Promise.all([refreshMedia(), refreshVault()])
+  } catch (err) { log(`分段生成失败：${humanError(err.message)}`) }
+}
+
+function startCapturePreview(event) {
+  if (previewItem.value?.start_seconds) event.target.currentTime = previewItem.value.start_seconds
+}
+
+function limitCapturePreview(event) {
+  const end = previewItem.value?.end_seconds
+  if (end != null && event.target.currentTime >= end) event.target.pause()
+}
+
 function closePoolPreview() {
   previewItem.value = null
 }
@@ -4023,10 +4132,11 @@ function closePoolPreview() {
 
 const tuneImportedSources = computed(() =>
   media.value.filter((item) =>
-    (item.kind === 'video' && itemRole(item) === 'raw_video') ||
+    (item.kind === 'video' && itemRole(item) === 'raw_video' && !captureGroup(item)) ||
     (item.kind === 'image' && itemRole(item) === 'image')
   )
 )
+const tuneCaptureSourceGroups = computed(() => captureTuneSourceGroups(sourceVideoItems.value))
 const tuneExportSources = computed(() =>
   media.value.filter((item) => item.kind === 'video' && itemRole(item) === 'export')
 )
@@ -4034,9 +4144,13 @@ function tuneExportOptionLabel(item) {
   const variant = item?.metadata?.variant_label
   return variant ? `${variant} · ${shortPath(item.path)}` : shortPath(item.path)
 }
-const tuneSource = computed(() =>
-  media.value.find((item) => item.id === tuneSourceId.value) || null
-)
+const tuneSource = computed(() => {
+  const captureSource = tuneCaptureSourceGroups.value.flatMap((group) => group.sources)
+    .find((item) => item.id === tuneSourceId.value)
+  if (captureSource) return captureSource
+  const item = media.value.find((entry) => entry.id === tuneSourceId.value) || null
+  return captureGroup(item)?.master_available === false ? null : item
+})
 const tuneVideoSrc = computed(() => {
   if (tuneMode.value === 'result') return tunePreviewSrc.value
   return tuneSource.value ? mediaFileUrl(tuneSource.value.path) : ''
@@ -4202,8 +4316,9 @@ function newTuneClip() {
   const isImage = tuneSourceIsImage.value
   return {
     uid: ++tuneUid,
-    media_id: source.id,
-    source_path: source.path,
+    // Capture children use a virtual id in the picker, but the timeline claims their durable
+    // recording root. The real child path remains explicit for backend manifest validation.
+    ...captureTuneClipIdentity(source),
     name: shortPath(source.path).split('/').pop(),
     start: isImage ? 0 : Number(tuneIn.value.toFixed(2)),
     duration: Number(tunePlaceDuration.value.toFixed(2)),
@@ -4710,6 +4825,13 @@ async function generateSeedanceEffect() {
 }
 
 async function openAsset(asset) {
+  if (asset.capture_segment) {
+    const segment = asset.capture_segment
+    previewPoolItem({ path: segment.available ? segment.path : asset.master_path, kind: 'video',
+      start_seconds: segment.available ? 0 : segment.start,
+      end_seconds: segment.available ? segment.end - segment.start : segment.end })
+    return
+  }
   return openPath(asset.path)
 }
 
@@ -5551,12 +5673,21 @@ function humanError(message) {
   return text
 }
 
+let capturePollTimer = null
+let capturePollBusy = false
 onMounted(async () => {
   try {
     if (!window.desktopApi) throw new Error('桌面桥接不可用。请从 Electron 应用打开，而不是直接访问浏览器地址。')
     apiConfig.value = await window.desktopApi.getApiConfig()
     recordingClock = setInterval(() => { nowTs.value = Date.now() }, 1000)
     connectWs()
+    capturePollTimer = setInterval(async () => {
+      if (capturePollBusy || !media.value.some((item) => ['pending', 'generating'].includes(captureGroup(item)?.status))) return
+      capturePollBusy = true
+      try { await Promise.all([refreshMedia(), refreshVault()]) }
+      catch (err) { log(`拍摄分段刷新失败：${humanError(err.message)}`) }
+      finally { capturePollBusy = false }
+    }, 2500)
     setTimeout(async () => {
       try {
         await refreshAll(); connected.value = true
@@ -5580,6 +5711,7 @@ onUnmounted(() => {
   window.removeEventListener('pointermove', resizeSidebar)
   window.removeEventListener('pointermove', moveFramingDrag)
   window.removeEventListener('pointerup', endFramingDrag)
+  if (capturePollTimer) clearInterval(capturePollTimer)
   if (recordingClock) clearInterval(recordingClock)
   if (seedancePollTimer) clearInterval(seedancePollTimer)
   if (editingCapabilityTimer) clearTimeout(editingCapabilityTimer)

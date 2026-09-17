@@ -6,6 +6,12 @@ $ErrorActionPreference = "Stop"
 function Get-LatestWriteTime([string]$RuntimeRoot) {
     $logs = Join-Path $RuntimeRoot "logs"
     $files = @(
+        (Join-Path $logs "backend.log.3"),
+        (Join-Path $logs "backend.log.2"),
+        (Join-Path $logs "backend.log.1"),
+        (Join-Path $logs "diagnostics.log.3"),
+        (Join-Path $logs "diagnostics.log.2"),
+        (Join-Path $logs "diagnostics.log.1"),
         (Join-Path $logs "diagnostics.log"),
         (Join-Path $logs "backend.log")
     ) | Where-Object { Test-Path -LiteralPath $_ }
@@ -68,6 +74,15 @@ if ([string]::IsNullOrWhiteSpace($runtimeRoot)) {
 
 $stamp = Get-Date -Format "yyyyMMdd-HHmmss"
 $desktop = [Environment]::GetFolderPath("Desktop")
+if ([string]::IsNullOrWhiteSpace($desktop)) {
+    if ([string]::IsNullOrWhiteSpace($env:USERPROFILE)) {
+        throw "Neither the Windows Desktop folder nor USERPROFILE is available."
+    }
+    $desktop = Join-Path $env:USERPROFILE "Desktop"
+}
+if (-not (Test-Path -LiteralPath $desktop)) {
+    New-Item -ItemType Directory -Path $desktop -Force | Out-Null
+}
 $bundleRoot = Join-Path $desktop "AVE-Robot-Diagnostics-$stamp"
 New-Item -ItemType Directory -Path $bundleRoot | Out-Null
 
@@ -97,8 +112,10 @@ $summary = New-Object System.Collections.Generic.List[string]
 [void]$summary.Add("Robot WebSocket URL: $websocketUrl")
 [void]$summary.Add("")
 [void]$summary.Add("Expected evidence sequence:")
+[void]$summary.Add("  robot.heartbeat.received (raw protocol fields, connection generation, operation ownership)")
 [void]$summary.Add("  robot.command.sent")
 [void]$summary.Add("  robot.reply.received (contains the robot-returned URL)")
+[void]$summary.Add("  cruise.point.arrival_wait.* and cruise.recording.finalize.*")
 [void]$summary.Add("  robot.media.download.started (contains the resolved HTTP(S) URL)")
 [void]$summary.Add("  robot.media.download.completed (contains the Windows save path)")
 [void]$summary.Add("  OR robot.media.download.failed / robot.reply.timeout")
@@ -123,29 +140,54 @@ $summary | Set-Content -LiteralPath $summaryPath -Encoding UTF8
 
 $patterns = @(
     "robot.websocket.",
+    "robot.heartbeat.received",
     "robot.command.sent",
     "robot.reply.received",
+    "robot.reply.recovered",
+    "robot.reply.quarantined",
+    "robot.reply.delayed",
     "robot.reply.timeout",
+    "robot.recording.",
+    "robot.map.",
     "robot.media.download.",
     "capture.recording.",
     "capture.photo.",
+    "cruise.",
     "gimbal.center.",
     "framing"
 )
 $escapedPattern = ($patterns | ForEach-Object { [regex]::Escape($_) }) -join "|"
 $eventLines = New-Object System.Collections.Generic.List[string]
 
-if (Test-Path -LiteralPath $diagnosticsLog) {
-    Get-Content -LiteralPath $diagnosticsLog -Tail 5000 -ErrorAction SilentlyContinue |
-        Where-Object { $_ -match $escapedPattern } |
-        ForEach-Object { [void]$eventLines.Add($_) }
+$diagnosticLogs = @(
+    "$diagnosticsLog.3",
+    "$diagnosticsLog.2",
+    "$diagnosticsLog.1",
+    $diagnosticsLog
+)
+foreach ($logFile in $diagnosticLogs) {
+    if (Test-Path -LiteralPath $logFile) {
+        Get-Content -LiteralPath $logFile -Tail 5000 -ErrorAction SilentlyContinue |
+            Where-Object { $_ -match $escapedPattern } |
+            ForEach-Object { [void]$eventLines.Add($_) }
+    }
 }
 
-# Older builds may only have backend.log. Keep only AVE's structured, redacted lines.
-if ($eventLines.Count -eq 0 -and (Test-Path -LiteralPath $backendLog)) {
-    Get-Content -LiteralPath $backendLog -Tail 10000 -ErrorAction SilentlyContinue |
-        Where-Object { $_ -match "\[ave\]" -and $_ -match $escapedPattern } |
-        ForEach-Object { [void]$eventLines.Add($_) }
+# Include every retained backend.log generation even when diagnostics.log exists: process
+# startup/exit and the last buffered lines may exist in only one source. Keep only AVE's
+# structured, redacted lines and read the generations from oldest to newest.
+$backendLogs = @(
+    "$backendLog.3",
+    "$backendLog.2",
+    "$backendLog.1",
+    $backendLog
+)
+foreach ($logFile in $backendLogs) {
+    if (Test-Path -LiteralPath $logFile) {
+        Get-Content -LiteralPath $logFile -Tail 10000 -ErrorAction SilentlyContinue |
+            Where-Object { $_ -match "\[ave\]" -and $_ -match $escapedPattern } |
+            ForEach-Object { [void]$eventLines.Add($_) }
+    }
 }
 
 if ($eventLines.Count -eq 0) {

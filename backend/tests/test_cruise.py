@@ -61,6 +61,7 @@ def armed_adapter():
 async def test_arrival_ignores_the_previous_goal_settled_heartbeat():
     adapter = armed_adapter()
     adapter._arm_goal_tracking(RobotGoalCommand(path_name="path1", goal_id=2))
+    adapter._capture_goal_written = True
 
     # Stale 'done' from the point we just left must not count as arriving at the new one.
     await adapter._handle_message(heartbeat("done"))
@@ -76,6 +77,7 @@ async def test_arrival_ignores_the_previous_goal_settled_heartbeat():
 async def test_current_goal_with_full_identity_can_report_done_without_a_going_frame():
     adapter = armed_adapter()
     adapter._arm_goal_tracking(RobotGoalCommand(path_name="path1", goal_id=2))
+    adapter._capture_goal_written = True
 
     await adapter._handle_message(heartbeat("done", goal_id=2))
 
@@ -86,6 +88,7 @@ async def test_current_goal_with_full_identity_can_report_done_without_a_going_f
 async def test_identityless_initial_done_still_requires_a_non_done_transition():
     adapter = armed_adapter()
     adapter._arm_goal_tracking(RobotGoalCommand(path_name="path1", goal_id=2))
+    adapter._capture_goal_written = True
 
     await adapter._handle_message(json.dumps({"task": {"goal_status": "done"}}))
     with pytest.raises(TimeoutError):
@@ -103,6 +106,7 @@ async def test_object_status_is_diagnostic_only_and_never_blocks_arrival(object_
     adapter._arm_goal_tracking(
         RobotGoalCommand(path_name="path1", goal_id=1, goal_object="car")
     )
+    adapter._capture_goal_written = True
     await adapter._handle_message(heartbeat("going", object_status="going", goal_id=1))
     done = json.loads(heartbeat("done", object_status=object_status, goal_id=1))
     if object_status is None:
@@ -115,6 +119,7 @@ async def test_object_status_is_diagnostic_only_and_never_blocks_arrival(object_
 async def test_navigation_failure_still_fails_when_object_status_is_done():
     adapter = armed_adapter()
     adapter._arm_goal_tracking(RobotGoalCommand(path_name="path1", goal_id=1))
+    adapter._capture_goal_written = True
     await adapter._handle_message(heartbeat("going", goal_id=1))
     await adapter._handle_message(heartbeat("failed", object_status="done", goal_id=1))
     assert await adapter.wait_for_arrival(timeout_s=0.05) == "failed"
@@ -126,6 +131,25 @@ async def test_lost_connection_resolves_a_pending_arrival():
     adapter._arm_goal_tracking(RobotGoalCommand(path_name="path1", goal_id=1))
     adapter._fail_pending(ConnectionError("socket closed"))
     assert await adapter.wait_for_arrival(timeout_s=0.05) == "failed"
+
+
+@pytest.mark.asyncio
+async def test_heartbeats_before_goal_write_cannot_advance_the_new_goal():
+    adapter = armed_adapter()
+    adapter._arm_goal_tracking(RobotGoalCommand(path_name="path1", goal_id=2))
+
+    # These may still describe the prior visit while set_goal is queued behind another request.
+    await adapter._handle_message(json.dumps({"task": {"goal_status": "going"}}))
+    await adapter._handle_message(json.dumps({"task": {"goal_status": "done"}}))
+    assert adapter._arrival_event.is_set() is False
+    assert adapter._require_non_done is True
+
+    adapter._capture_goal_written = True
+    await adapter._handle_message(json.dumps({"task": {"goal_status": "done"}}))
+    assert adapter._arrival_event.is_set() is False
+    await adapter._handle_message(json.dumps({"task": {"goal_status": "going"}}))
+    await adapter._handle_message(json.dumps({"task": {"goal_status": "done"}}))
+    assert await adapter.wait_for_arrival(timeout_s=0.05) == "done"
 
 
 @pytest.mark.asyncio
@@ -523,13 +547,152 @@ async def test_route_wide_camerawork_runs_while_goal_acknowledgement_is_pending(
 
 
 @pytest.mark.asyncio
+async def test_stuck_camerawork_runner_cannot_delay_recording_finalization(monkeypatch):
+    config = CameraworkConfig(configured=True)
+    cruise, adapter, capture = build_cruise(camerawork_provider=lambda: config)
+    runner_started = asyncio.Event()
+    runner_release = asyncio.Event()
+    cancellation_seen = asyncio.Event()
+    gimbal_gate = asyncio.Lock()
+    finalize_calls = 0
+    anchor_calls = 0
+    original_finalize = cruise.robot.finalize_capture_recording
+
+    async def instant_anchor(_config, *, wait=True, deadline=float("inf")):
+        nonlocal anchor_calls
+        del wait, deadline
+        anchor_calls += 1
+        if anchor_calls > 1:
+            async with gimbal_gate:
+                pass
+        return True
+
+    async def cancellation_resistant_runner(_config, _stop_requested):
+        async with gimbal_gate:
+            runner_started.set()
+            try:
+                await runner_release.wait()
+            except asyncio.CancelledError:
+                # A normal cruise shutdown must not inject cancellation into a shared websocket
+                # send: the hardware adapter would close that transport before recording Stop.
+                cancellation_seen.set()
+                await runner_release.wait()
+
+    async def counted_finalize(**kwargs):
+        nonlocal finalize_calls
+        finalize_calls += 1
+        return await original_finalize(**kwargs)
+
+    async def download_without_camera_file_delay(operation, **_kwargs):
+        return await operation()
+
+    monkeypatch.setattr(cruise_module, "_CW_RUNNER_STOP_TIMEOUT_SECONDS", 0.01)
+    monkeypatch.setattr(
+        robot_module,
+        "retry_camera_media_download",
+        download_without_camera_file_delay,
+    )
+    monkeypatch.setattr(cruise, "_return_to_anchor", instant_anchor)
+    monkeypatch.setattr(cruise, "_run_camerawork", cancellation_resistant_runner)
+    monkeypatch.setattr(cruise.robot, "finalize_capture_recording", counted_finalize)
+
+    runner_task = None
+    try:
+        run = await cruise.start(cruise_request(
+            auto_camerawork=True,
+            points=[CruisePoint(path_name="path1", goal_id=1)],
+        ))
+        await runner_started.wait()
+        runner_task = cruise._cw_runner_task
+        assert runner_task is not None
+
+        await asyncio.wait_for(asyncio.shield(cruise._task), timeout=0.5)
+
+        assert cancellation_seen.is_set() is False
+        assert finalize_calls == 1
+        assert adapter.recording_calls == ["start", "stop"]
+        assert anchor_calls == 1  # preparation only; detached runner owns the gimbal gate
+        assert capture.active_session() is None
+        assert run.status == "succeeded", run.error
+    finally:
+        runner_release.set()
+        if runner_task is not None:
+            await asyncio.wait_for(runner_task, timeout=0.5)
+        if cruise._task is not None and not cruise._task.done():
+            await asyncio.wait_for(asyncio.shield(cruise._task), timeout=0.5)
+
+
+@pytest.mark.asyncio
+async def test_stuck_final_anchor_cannot_reopen_or_delay_a_completed_capture(monkeypatch):
+    config = CameraworkConfig(configured=True)
+    cruise, adapter, capture = build_cruise(camerawork_provider=lambda: config)
+    anchor_calls = 0
+    final_anchor_started = asyncio.Event()
+    final_anchor_canceled = asyncio.Event()
+    final_anchor_release = asyncio.Event()
+    anchor_task = None
+
+    async def cancellation_resistant_anchor(_config, *, wait=True, deadline=float("inf")):
+        nonlocal anchor_calls, anchor_task
+        del deadline
+        anchor_calls += 1
+        if wait:
+            return True
+        anchor_task = asyncio.current_task()
+        final_anchor_started.set()
+        try:
+            await final_anchor_release.wait()
+        except asyncio.CancelledError:
+            final_anchor_canceled.set()
+            await final_anchor_release.wait()
+        return True
+
+    async def idle_runner(_config, stop_requested):
+        await stop_requested.wait()
+
+    async def download_without_camera_file_delay(operation, **_kwargs):
+        return await operation()
+
+    monkeypatch.setattr(cruise_module, "_FINAL_ANCHOR_TIMEOUT_SECONDS", 0.01)
+    monkeypatch.setattr(
+        robot_module,
+        "retry_camera_media_download",
+        download_without_camera_file_delay,
+    )
+    monkeypatch.setattr(cruise, "_return_to_anchor", cancellation_resistant_anchor)
+    monkeypatch.setattr(cruise, "_run_camerawork", idle_runner)
+
+    try:
+        run = await cruise.start(cruise_request(
+            auto_camerawork=True,
+            points=[CruisePoint(path_name="path1", goal_id=1)],
+        ))
+        await asyncio.wait_for(asyncio.shield(cruise._task), timeout=0.5)
+
+        assert final_anchor_started.is_set() is True
+        assert final_anchor_canceled.is_set() is True
+        assert anchor_calls == 2
+        assert adapter.recording_calls == ["start", "stop"]
+        assert capture.active_session() is None
+        assert run.status == "succeeded", run.error
+
+        assert anchor_task is not None
+        assert anchor_task.done() is False
+    finally:
+        final_anchor_release.set()
+        if anchor_task is not None:
+            await asyncio.wait_for(anchor_task, timeout=0.5)
+
+
+@pytest.mark.asyncio
 async def test_zero_percent_final_resting_anchor_is_sent_only_after_recording_stops(
     monkeypatch,
 ):
     config = CameraworkConfig(configured=True, anchor_time_percent=0)
-    cruise, adapter, _ = build_cruise(camerawork_provider=lambda: config)
+    cruise, adapter, capture = build_cruise(camerawork_provider=lambda: config)
     order = []
     original_stop = adapter.stop_recording
+    original_complete = capture.complete_with_recording
 
     async def record_anchor(_config, *, wait=True, deadline=float("inf")):
         order.append(("anchor", adapter.state.recording, wait, deadline))
@@ -544,9 +707,16 @@ async def test_zero_percent_final_resting_anchor_is_sent_only_after_recording_st
     async def idle_runner(_config, stop_requested):
         await stop_requested.wait()
 
+    async def record_complete(*args, **kwargs):
+        order.append(("capture.complete.begin", capture.active_session() is not None))
+        completed = await original_complete(*args, **kwargs)
+        order.append(("capture.complete.done", capture.active_session() is not None))
+        return completed
+
     monkeypatch.setattr(cruise, "_return_to_anchor", record_anchor)
     monkeypatch.setattr(cruise, "_run_camerawork", idle_runner)
     monkeypatch.setattr(adapter, "stop_recording", record_stop)
+    monkeypatch.setattr(capture, "complete_with_recording", record_complete)
 
     run = await cruise.start(cruise_request(
         auto_camerawork=True,
@@ -559,10 +729,14 @@ async def test_zero_percent_final_resting_anchor_is_sent_only_after_recording_st
         "anchor",
         "stop.begin",
         "stop.done",
+        "capture.complete.begin",
+        "capture.complete.done",
         "anchor",
     ]
     assert order[0][1] is False  # preparation, before recording starts
     assert order[-1][1] is False  # resting pose, after Stop is confirmed
+    assert order[-1][2] is False  # final pose is a one-way command, never a pose wait
+    assert order[-2][1] is False  # capture session closed before the cosmetic final pose
 
 
 @pytest.mark.asyncio
@@ -1025,6 +1199,51 @@ async def test_ws_keeps_capture_session_when_stop_operation_fails():
 
 
 @pytest.mark.asyncio
+async def test_ws_keeps_local_file_session_when_idle_is_not_confirmed(tmp_path):
+    from automated_video_editing_backend.api.ws import _handle_command
+
+    _, _, capture = build_cruise()
+    await capture.start("拍摄")
+    saved_video = tmp_path / "uncertain-stop.mp4"
+    saved_video.write_bytes(b"video")
+    socket = FakeSocket()
+
+    class UnknownStopRobot:
+        def __init__(self):
+            self.state = RobotState(
+                connected=True,
+                recording=False,
+                media_local_path=str(saved_video),
+            )
+
+        async def finalize_capture_recording(self, **_kwargs):
+            raise RuntimeError("停止状态仍未确认")
+
+        async def status(self):
+            return self.state
+
+        def recording_idle_confirmed(self):
+            return False
+
+    class IdleCruise:
+        is_running = False
+
+    with pytest.raises(RuntimeError, match="仍未确认"):
+        await _handle_command(
+            socket,
+            "CAPTURE_STOP",
+            {},
+            UnknownStopRobot(),
+            capture,
+            IdleCruise(),
+            IdleFramingTest(),
+        )
+
+    assert capture.active_session() is not None
+    assert not sidecar_path(saved_video).exists()
+
+
+@pytest.mark.asyncio
 async def test_ws_reports_recording_success_separately_from_windows_save_failure():
     from automated_video_editing_backend.api.ws import _handle_command
 
@@ -1181,6 +1400,83 @@ async def test_stop_failure_marks_cruise_failed_and_keeps_session_for_manual_rec
     assert "Stop recording failed" in run.error
     assert adapter.state.recording is True
     assert capture.active_session() is not None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("recording", "status_known"),
+    [
+        pytest.param(True, True, id="still-recording"),
+        pytest.param(False, False, id="idle-is-not-confirmed"),
+    ],
+)
+async def test_downloaded_file_never_closes_capture_before_idle_is_confirmed(
+    tmp_path,
+    monkeypatch,
+    recording,
+    status_known,
+):
+    """A file on disk proves transfer, not that the robot has stopped recording."""
+    cruise, adapter, capture = build_cruise()
+    downloaded = tmp_path / "downloaded-before-idle.mp4"
+    downloaded.write_bytes(b"video")
+    complete_calls = []
+    original_complete = capture.complete_with_recording
+
+    async def ambiguous_finalize(**_kwargs):
+        adapter.state.recording = recording
+        adapter.state.media_local_path = str(downloaded)
+        return adapter.state
+
+    async def record_complete(*args, **kwargs):
+        complete_calls.append((args, kwargs))
+        return await original_complete(*args, **kwargs)
+
+    monkeypatch.setattr(cruise.robot, "finalize_capture_recording", ambiguous_finalize)
+    monkeypatch.setattr(cruise.robot, "recording_status_known", lambda: status_known)
+    monkeypatch.setattr(capture, "complete_with_recording", record_complete)
+
+    run = await cruise.start(cruise_request())
+    await cruise._task
+
+    session = capture.active_session()
+    assert run.media_local_path == str(downloaded)
+    assert complete_calls == []
+    assert session is not None
+    assert session.id == run.capture_session_id
+    assert not sidecar_path(downloaded).exists()
+    assert any("录制尚未确认停止" in warning for warning in run.warnings)
+
+
+@pytest.mark.asyncio
+async def test_downloaded_file_closes_capture_once_idle_is_confirmed(tmp_path, monkeypatch):
+    cruise, adapter, capture = build_cruise()
+    downloaded = tmp_path / "downloaded-after-idle.mp4"
+    downloaded.write_bytes(b"video")
+    complete_calls = []
+    original_complete = capture.complete_with_recording
+
+    async def confirmed_idle_finalize(**_kwargs):
+        adapter.state.recording = False
+        adapter.state.media_local_path = str(downloaded)
+        return adapter.state
+
+    async def record_complete(*args, **kwargs):
+        complete_calls.append((args, kwargs))
+        return await original_complete(*args, **kwargs)
+
+    monkeypatch.setattr(cruise.robot, "finalize_capture_recording", confirmed_idle_finalize)
+    monkeypatch.setattr(cruise.robot, "recording_status_known", lambda: True)
+    monkeypatch.setattr(capture, "complete_with_recording", record_complete)
+
+    run = await cruise.start(cruise_request())
+    await cruise._task
+
+    assert run.media_local_path == str(downloaded)
+    assert len(complete_calls) == 1
+    assert capture.active_session() is None
+    assert sidecar_path(downloaded).exists()
+    assert not any("录制尚未确认停止" in warning for warning in run.warnings)
 
 
 @pytest.mark.asyncio

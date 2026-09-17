@@ -1,6 +1,7 @@
 import asyncio
 import math
 import random
+from contextvars import ContextVar
 from types import SimpleNamespace
 
 import pytest
@@ -34,6 +35,11 @@ def _service():
     service._cw_stationary_zoom_lock = asyncio.Lock()
     service._cw_runner_stop = asyncio.Event()
     service._cw_runner_task = None
+    service._cw_generation = 1
+    service._cw_owner_generation = ContextVar(
+        f"test_camerawork_owner_{id(service)}",
+        default=None,
+    )
     service._point_dwell_baseline_seconds = 7.5
     return service
 
@@ -710,6 +716,147 @@ async def test_arrival_state_change_does_not_cancel_or_retarget_the_active_sweep
     release.set()
     await runner
     assert len(commands) == 1
+
+
+@pytest.mark.asyncio
+async def test_stop_runner_cooperatively_retires_an_inflight_gimbal_send(monkeypatch):
+    command_entered = asyncio.Event()
+    release_command = asyncio.Event()
+    cancellation_seen = asyncio.Event()
+
+    class CancellationSensitiveRobot:
+        def heartbeat_yaw(self):
+            return None
+
+        def heartbeat_pitch(self):
+            return None
+
+        def heartbeat_revision(self):
+            return None
+
+        async def set_gimbal(self, _command, *, context="manual"):
+            del context
+            command_entered.set()
+            try:
+                await release_command.wait()
+            except asyncio.CancelledError:
+                # HardwareRobotAdapter closes its websocket at this exact boundary because a
+                # cancelled send may have written a partial frame.
+                cancellation_seen.set()
+                raise
+            return RobotState(connected=True)
+
+    monkeypatch.setattr(cruise_module, "_CW_RUNNER_STOP_TIMEOUT_SECONDS", 0.2)
+    service = CruiseService(EventHub(), CancellationSensitiveRobot(), object())
+    config = _config(anchor_time_percent=0)
+    service._initialize_camerawork_schedule(config)
+    generation = service._cw_generation
+    task = asyncio.create_task(
+        service._run_owned_camerawork(config, service._cw_runner_stop, generation)
+    )
+    service._cw_runner_task = task
+
+    await command_entered.wait()
+    stopping = asyncio.create_task(service._stop_camerawork_runner())
+    await asyncio.sleep(0)
+
+    assert stopping.done() is False
+    assert cancellation_seen.is_set() is False
+
+    release_command.set()
+    assert await stopping is True
+    assert task.done() is True
+    assert cancellation_seen.is_set() is False
+
+
+@pytest.mark.asyncio
+async def test_retired_owned_runner_cannot_command_or_mutate_a_new_generation(monkeypatch):
+    command_entered = asyncio.Event()
+    cancellation_seen = asyncio.Event()
+    release_command = asyncio.Event()
+
+    class CancellationResistantRobot:
+        def __init__(self):
+            self.commands = []
+
+        def heartbeat_yaw(self):
+            return None
+
+        def heartbeat_pitch(self):
+            return None
+
+        def heartbeat_revision(self):
+            return None
+
+        async def set_gimbal(self, command, *, context="manual"):
+            self.commands.append((command, context))
+            if len(self.commands) == 1:
+                command_entered.set()
+                try:
+                    await release_command.wait()
+                except asyncio.CancelledError:
+                    # Model a transport/dependency that suppresses cancellation and completes
+                    # later. The retired owner must stop at the post-await generation check.
+                    cancellation_seen.set()
+                    await release_command.wait()
+            return RobotState(connected=True)
+
+    monkeypatch.setattr(cruise_module, "_CW_RUNNER_STOP_TIMEOUT_SECONDS", 0.01)
+    robot = CancellationResistantRobot()
+    service = CruiseService(EventHub(), robot, object())
+    config = _config(anchor_time_percent=0)
+    service._initialize_camerawork_schedule(config)
+    old_generation = service._cw_generation
+    old_stop = service._cw_runner_stop
+    old_task = asyncio.create_task(
+        service._run_owned_camerawork(config, old_stop, old_generation)
+    )
+    service._cw_runner_task = old_task
+
+    try:
+        await command_entered.wait()
+        quiesced = await service._stop_camerawork_runner()
+
+        assert quiesced is False
+        assert cancellation_seen.is_set() is False
+        assert old_task.done() is False
+
+        service._reset_camerawork_runtime()
+        new_event = service._cw_base_state_changed
+        new_event.set()
+        expected_state = {
+            "generation": service._cw_generation,
+            "phase": "new-run-phase",
+            "deadline": 12345.0,
+            "yaw": 71.0,
+            "pitch": -6.0,
+            "zoom": 1.35,
+            "quadrant": 4,
+        }
+        service._cw_phase = expected_state["phase"]
+        service._cw_phase_deadline = expected_state["deadline"]
+        service._cw_yaw = expected_state["yaw"]
+        service._cw_pitch = expected_state["pitch"]
+        service._cw_zoom = expected_state["zoom"]
+        service._cw_last_quadrant = expected_state["quadrant"]
+
+        release_command.set()
+        await asyncio.wait_for(old_task, timeout=0.2)
+
+        assert len(robot.commands) == 1
+        assert service._cw_generation == expected_state["generation"]
+        assert service._cw_phase == expected_state["phase"]
+        assert service._cw_phase_deadline == expected_state["deadline"]
+        assert service._cw_yaw == expected_state["yaw"]
+        assert service._cw_pitch == expected_state["pitch"]
+        assert service._cw_zoom == expected_state["zoom"]
+        assert service._cw_last_quadrant == expected_state["quadrant"]
+        assert service._cw_base_state_changed is new_event
+        assert new_event.is_set() is True
+    finally:
+        release_command.set()
+        if not old_task.done():
+            await asyncio.wait_for(old_task, timeout=0.2)
 
 
 @pytest.mark.asyncio

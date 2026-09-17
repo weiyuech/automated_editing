@@ -1,5 +1,6 @@
 import asyncio
 import json
+import time
 
 import pytest
 
@@ -160,6 +161,83 @@ async def test_hardware_adapter_uses_documented_websocket_protocol():
 
 
 @pytest.mark.asyncio
+async def test_heartbeat_diagnostics_keep_raw_ownership_and_sample_pose_repeats(monkeypatch):
+    adapter = HardwareRobotAdapter(EventHub(), "ws://robot.local:8765")
+    adapter.state.connected = True
+    adapter.state.connection_status = "connected"
+    adapter._pending_goal = RobotGoalCommand(
+        path_name="route-a",
+        goal_id=7,
+        goal_object=None,
+    )
+    emitted = []
+    monkeypatch.setattr(
+        robot_module,
+        "log_event",
+        lambda level, event, **fields: emitted.append((level, event, fields)),
+    )
+
+    base = {
+        "system": {"status": "ready"},
+        "map": {"name": "map-a", "mode": "localization", "status": "ready"},
+        "naviagtion": {"status": "ready", "goal_status": "going"},
+        "task": {"path_file": "route-a", "goal_id": 7, "goal_status": "going"},
+    }
+    await adapter._handle_message(json.dumps({
+        **base,
+        "gimbal": {"record_status": "recording", "yaw": 1.0, "pitch": -2.0},
+    }))
+    await adapter._handle_message(json.dumps({
+        **base,
+        "gimbal": {"record_status": "recording", "yaw": 1.5, "pitch": -1.5},
+    }))
+    await adapter._handle_message(json.dumps({
+        "gimbal": {"record_status": "idle", "yaw": 1.5, "pitch": -1.5},
+    }))
+
+    heartbeat_events = [
+        fields for _level, event, fields in emitted if event == "robot.heartbeat.received"
+    ]
+    assert len(heartbeat_events) == 2
+    first, transition = heartbeat_events
+    assert first["connection_epoch"] == adapter.connection_generation()
+    assert first["pending_goal"] == {
+        "path_name": "route-a",
+        "goal_id": 7,
+        "goal_object": None,
+        "write_confirmed": False,
+    }
+    assert first["payload"]["task"] == base["task"]
+    assert first["payload"]["gimbal"]["yaw"] == 1.0
+    assert first["received_monotonic_seconds"] > 0
+    assert transition["payload"] == {
+        "gimbal": {"record_status": "idle", "yaw": 1.5, "pitch": -1.5}
+    }
+    assert transition["suppressed_since_previous"] == 1
+
+
+@pytest.mark.parametrize("reported", [None, "", "unknown", "stopping"])
+def test_invalid_record_status_never_claims_the_camera_is_idle(reported):
+    adapter = HardwareRobotAdapter(EventHub(), "ws://robot.local:8765")
+    adapter.state.recording = True
+    adapter._recording_status_known = False
+    adapter._recording_stop_required = True
+    adapter._recording_reply_recovery = (7, "stop")
+
+    adapter._apply_protocol_state({
+        "gimbal": {"record_status": reported, "yaw": 12, "pitch": -3}
+    })
+
+    assert adapter.state.recording is True
+    assert adapter.recording_status_known() is False
+    assert adapter._recording_stop_required is True
+    assert adapter._recording_reply_recovery == (7, "stop")
+    # Bad recording state must not discard valid pose data from the same heartbeat.
+    assert adapter.heartbeat_yaw() == 12
+    assert adapter.heartbeat_pitch() == -3
+
+
+@pytest.mark.asyncio
 async def test_rejected_map_switch_never_relabels_the_active_map():
     adapter = HardwareRobotAdapter(EventHub(), "ws://robot.local:8765")
     adapter.state.connected = True
@@ -239,6 +317,311 @@ async def test_cruise_map_switch_waits_for_a_fresh_complete_ready_heartbeat():
     assert state.map_name == "new-map"
     assert state.map_mode == "localization"
     assert state.map_status == "ready"
+
+
+@pytest.mark.asyncio
+async def test_complete_map_proof_survives_a_later_gimbal_only_heartbeat(
+    monkeypatch,
+):
+    adapter = HardwareRobotAdapter(EventHub(), "ws://robot.local:8765")
+    adapter.state.connected = True
+    adapter.state.connection_status = "connected"
+
+    async def connected():
+        return adapter.state
+
+    report_tasks = []
+
+    class SwitchingSocket:
+        async def send(self, _message):
+            await adapter._handle_message(json.dumps({"robot_switch_map": "true"}))
+
+            async def report():
+                await asyncio.sleep(0)
+                await asyncio.sleep(0)
+                await adapter._handle_message(json.dumps({
+                    "system": {"status": "ready"},
+                    "map": {
+                        "mode": "localization",
+                        "name": "new-map",
+                        "status": "ready",
+                    },
+                    "naviagtion": {"status": "ready"},
+                }))
+                # This is the real cadence that previously erased the usable map proof before
+                # the 100 ms confirmation poll observed it.
+                await adapter._handle_message(json.dumps({
+                    "gimbal": {"yaw": 12, "pitch": -3}
+                }))
+
+            report_tasks.append(asyncio.create_task(report()))
+
+    adapter.connect = connected
+    adapter.status = connected
+    adapter._socket = SwitchingSocket()
+    robot = RobotService(EventHub(), adapter=adapter)
+    monkeypatch.setattr(robot_module, "_MAP_SWITCH_CONFIRM_POLL_SECONDS", 0.01)
+
+    state = await robot.switch_map_and_confirm("new-map", timeout_s=0.2)
+    await asyncio.gather(*report_tasks)
+
+    assert state.map_name == "new-map"
+    assert state.diagnostics.last_heartbeat is not None
+    assert set(state.diagnostics.last_heartbeat.payload) == {"gimbal"}
+    complete = adapter.complete_map_heartbeat()
+    assert complete is not None
+    assert complete.payload["map"]["name"] == "new-map"
+
+
+@pytest.mark.asyncio
+async def test_map_ack_bundled_with_complete_target_heartbeat_is_not_missed():
+    adapter = HardwareRobotAdapter(EventHub(), "ws://robot.local:8765")
+    adapter.state.connected = True
+    adapter.state.connection_status = "connected"
+
+    async def connected():
+        return adapter.state
+
+    class ImmediateSwitchSocket:
+        async def send(self, _message):
+            await adapter._handle_message(json.dumps({
+                "robot_switch_map": "true",
+                "system": {"status": "ready"},
+                "map": {
+                    "mode": "localization",
+                    "name": "new-map",
+                    "status": "ready",
+                },
+                "naviagtion": {"status": "ready"},
+            }))
+
+    adapter.connect = connected
+    adapter.status = connected
+    adapter._socket = ImmediateSwitchSocket()
+    robot = RobotService(EventHub(), adapter=adapter)
+
+    state = await robot.switch_map_and_confirm("new-map", timeout_s=0.03)
+
+    assert state.map_name == "new-map"
+
+
+@pytest.mark.asyncio
+async def test_map_switch_does_not_compose_ready_state_across_split_heartbeats(
+    monkeypatch,
+):
+    adapter = HardwareRobotAdapter(EventHub(), "ws://robot.local:8765")
+    adapter.state.connected = True
+    adapter.state.connection_status = "connected"
+    adapter._apply_protocol_state({
+        "system": {"status": "ready"},
+        "map": {"mode": "localization", "name": "old-map", "status": "ready"},
+        "naviagtion": {"status": "ready"},
+    })
+    partial_reports_sent = asyncio.Event()
+    release_complete_report = asyncio.Event()
+    report_tasks = []
+
+    async def connected():
+        return adapter.state
+
+    class SwitchingSocket:
+        async def send(self, message):
+            assert json.loads(message) == {"set_switch_map": "new-map"}
+            await adapter._handle_message(json.dumps({"robot_switch_map": "true"}))
+
+            async def report():
+                # Both reports are newer than the switch ACK, but neither is independently a
+                # complete readiness report.  In particular, navigation-ready must not inherit
+                # the map mode/status from the old map or the name-only report before it.
+                await asyncio.sleep(0)
+                await asyncio.sleep(0)
+                await adapter._handle_message(json.dumps({"map": {"name": "new-map"}}))
+                await adapter._handle_message(json.dumps({
+                    "naviagtion": {"status": "ready"}
+                }))
+                partial_reports_sent.set()
+                await release_complete_report.wait()
+                await adapter._handle_message(json.dumps({
+                    "system": {"status": "ready"},
+                    "map": {
+                        "mode": "localization",
+                        "name": "new-map",
+                        "status": "ready",
+                    },
+                    "naviagtion": {"status": "ready"},
+                }))
+
+            report_tasks.append(asyncio.create_task(report()))
+
+    adapter.connect = connected
+    adapter.status = connected
+    adapter._socket = SwitchingSocket()
+    robot = RobotService(EventHub(), adapter=adapter)
+    monkeypatch.setattr(robot_module, "_MAP_SWITCH_CONFIRM_POLL_SECONDS", 0.005)
+
+    switch_task = asyncio.create_task(
+        robot.switch_map_and_confirm("new-map", timeout_s=0.2)
+    )
+    await asyncio.wait_for(partial_reports_sent.wait(), timeout=0.1)
+    await asyncio.sleep(0.02)
+    assert not switch_task.done()
+
+    release_complete_report.set()
+    state = await asyncio.wait_for(switch_task, timeout=0.1)
+    await asyncio.gather(*report_tasks)
+
+    assert state.map_name == "new-map"
+    assert state.map_mode == "localization"
+    assert state.map_status == "ready"
+
+
+@pytest.mark.asyncio
+async def test_pending_manual_switch_to_another_map_cannot_reuse_reported_target(
+    monkeypatch,
+):
+    adapter = HardwareRobotAdapter(EventHub(), "ws://robot.local:8765")
+    adapter.state.connected = True
+    adapter.state.connection_status = "connected"
+    adapter._apply_protocol_state({
+        "system": {"status": "ready"},
+        "map": {"mode": "localization", "name": "map-a", "status": "ready"},
+        "naviagtion": {"status": "ready"},
+    })
+    requested_maps = []
+    report_tasks = []
+
+    async def connected():
+        return adapter.state
+
+    class SwitchingSocket:
+        async def send(self, message):
+            requested_map = json.loads(message)["set_switch_map"]
+            requested_maps.append(requested_map)
+            await adapter._handle_message(json.dumps({"robot_switch_map": "true"}))
+            if requested_map != "map-a":
+                return
+
+            async def report_ready_map_a():
+                await asyncio.sleep(0)
+                await asyncio.sleep(0)
+                await adapter._handle_message(json.dumps({
+                    "system": {"status": "ready"},
+                    "map": {
+                        "mode": "localization",
+                        "name": "map-a",
+                        "status": "ready",
+                    },
+                    "naviagtion": {"status": "ready"},
+                }))
+
+            report_tasks.append(asyncio.create_task(report_ready_map_a()))
+
+    adapter.connect = connected
+    adapter.status = connected
+    adapter._socket = SwitchingSocket()
+    robot = RobotService(EventHub(), adapter=adapter)
+    monkeypatch.setattr(robot_module, "_MAP_SWITCH_CONFIRM_POLL_SECONDS", 0.005)
+
+    await robot.switch_map("map-b")
+    assert adapter.state.map_name == "map-a"
+
+    state = await robot.switch_map_and_confirm("map-a", timeout_s=0.1)
+    await asyncio.gather(*report_tasks)
+
+    assert requested_maps == ["map-b", "map-a"]
+    assert state.map_name == "map-a"
+
+
+@pytest.mark.asyncio
+async def test_timed_out_reused_map_switch_is_not_reused_by_the_next_retry():
+    class NeverReadyAdapter:
+        def __init__(self):
+            self.state = RobotState(connected=True, connection_status="connected")
+            self.switches = []
+
+        async def status(self):
+            return self.state
+
+        async def switch_map(self, map_name):
+            self.switches.append(map_name)
+            return {"map_name": map_name, "ok": True, "raw": "true"}
+
+    adapter = NeverReadyAdapter()
+    robot = RobotService(EventHub(), adapter=adapter)
+
+    await robot.switch_map("map-a")
+    with pytest.raises(TimeoutError, match="未在"):
+        await robot.switch_map_and_confirm("map-a", timeout_s=0.001)
+    assert adapter.switches == ["map-a"]
+
+    with pytest.raises(TimeoutError, match="未在"):
+        await robot.switch_map_and_confirm("map-a", timeout_s=0.001)
+    assert adapter.switches == ["map-a", "map-a"]
+
+
+@pytest.mark.asyncio
+async def test_manual_map_switch_is_not_reused_after_connection_generation_changes():
+    class ReconnectingAdapter:
+        def __init__(self):
+            self.state = RobotState(connected=True, connection_status="connected")
+            self.switches = []
+            self.generation = 1
+
+        async def status(self):
+            return self.state
+
+        async def switch_map(self, map_name):
+            self.switches.append(map_name)
+            return {"map_name": map_name, "ok": True, "raw": "true"}
+
+        def connection_generation(self):
+            return self.generation
+
+    adapter = ReconnectingAdapter()
+    robot = RobotService(EventHub(), adapter=adapter)
+
+    await robot.switch_map("map-a")
+    adapter.generation += 1
+    with pytest.raises(TimeoutError, match="未在"):
+        await robot.switch_map_and_confirm("map-a", timeout_s=0.001)
+
+    assert adapter.switches == ["map-a", "map-a"]
+
+
+@pytest.mark.asyncio
+async def test_reused_manual_map_switch_accepts_its_single_post_ack_readiness_proof():
+    adapter = HardwareRobotAdapter(EventHub(), "ws://robot.local:8765")
+    adapter.state.connected = True
+    adapter.state.connection_status = "connected"
+    switches = []
+
+    async def connected():
+        return adapter.state
+
+    class SwitchingSocket:
+        async def send(self, message):
+            switches.append(json.loads(message)["set_switch_map"])
+            await adapter._handle_message(json.dumps({"robot_switch_map": "true"}))
+
+    adapter.connect = connected
+    adapter.status = connected
+    adapter._socket = SwitchingSocket()
+    robot = RobotService(EventHub(), adapter=adapter)
+
+    await robot.switch_map("map-a")
+    adapter._apply_protocol_state({
+        "system": {"status": "ready"},
+        "map": {"mode": "localization", "name": "map-a", "status": "ready"},
+        "naviagtion": {"status": "ready"},
+    })
+    complete = adapter.complete_map_heartbeat()
+    assert complete is not None
+    assert robot._pending_map_switch_after is not None
+
+    state = await robot.switch_map_and_confirm("map-a", timeout_s=0.1)
+
+    assert state.map_name == "map-a"
+    assert switches == ["map-a"]
 
 
 @pytest.mark.asyncio
@@ -754,6 +1137,7 @@ async def test_navigation_only_goal_status_can_finish_current_arrival(navigation
     adapter = HardwareRobotAdapter(EventHub(), "ws://robot.local:8765")
     goal = RobotGoalCommand(path_name="path-a", goal_id=1)
     adapter._arm_goal_tracking(goal)
+    adapter._capture_goal_written = True
 
     identity = {"path_file": "path-a", "goal_id": 1}
     adapter._apply_protocol_state({
@@ -811,6 +1195,7 @@ async def test_done_heartbeat_for_previous_identity_cannot_finish_pending_goal()
     adapter = HardwareRobotAdapter(EventHub(), "ws://robot.local:8765")
     current = RobotGoalCommand(path_name="path-b", goal_id=2)
     adapter._arm_goal_tracking(current)
+    adapter._capture_goal_written = True
 
     # B has genuinely started, so the ordinary stale-initial-done guard is already cleared.
     adapter._apply_protocol_state({
@@ -915,7 +1300,10 @@ async def test_unresolved_start_blocks_retry_and_endpoint_change_until_late_repl
         await adapter.start_recording()
     with pytest.raises(ValueError, match="暂时不能更改机器人连接"):
         await adapter.configure_websocket_url("ws://replacement.local:8765")
-    with pytest.raises(ValueError, match="暂时不能断开机器人连接"):
+    with pytest.raises(
+        ValueError,
+        match="机器人仍在录制|暂时不能断开机器人连接",
+    ):
         await adapter.disconnect()
     assert adapter._recording_reply_recovery == recovery
     assert adapter.websocket_url == "ws://robot.local:8765"
@@ -941,6 +1329,101 @@ async def test_unresolved_start_blocks_retry_and_endpoint_change_until_late_repl
 
     assert [next(iter(item["video_record"])) for item in sent] == ["start", "stop"]
     assert adapter.state.recording is False
+
+
+@pytest.mark.asyncio
+async def test_finalize_supersedes_start_without_ack_with_exactly_one_stop(monkeypatch):
+    """A written Start is unsafe even when neither its ACK nor a heartbeat arrives."""
+
+    monkeypatch.setattr(robot_module, "_RECORDING_REPLY_TIMEOUT_SECONDS", 0.01)
+    monkeypatch.setattr(robot_module, "_RECORDING_LATE_REPLY_GRACE_SECONDS", 0.01)
+    events = EventHub()
+    adapter = _goal_attempt_adapter(events)
+    sent: list[dict] = []
+
+    class StartSilentStopReplySocket:
+        async def send(self, message):
+            payload = json.loads(message)
+            sent.append(payload)
+            if payload.get("video_record", {}).get("stop") == 0:
+                await adapter._handle_message(json.dumps({
+                    "robot_video_record": {
+                        "stop": 0,
+                        "status": "ok",
+                        "url": "http://camera.local/REC_FINAL.mp4",
+                    }
+                }))
+
+    adapter._socket = StartSilentStopReplySocket()
+    robot = RobotService(events, adapter=adapter)
+
+    with pytest.raises(TimeoutError, match="等待机器人回复超时"):
+        await adapter.start_recording()
+
+    assert adapter.recording_stop_required() is True
+    assert adapter.state.recording is False
+    finalized = await robot.finalize_capture_recording()
+
+    actions = [next(iter(item["video_record"])) for item in sent]
+    assert actions == ["start", "stop"]
+    assert finalized.recording is False
+    assert adapter.recording_stop_required() is False
+    assert adapter._recording_reply_recovery is None
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_stop_can_be_retried_without_permanent_recovery_lock(monkeypatch):
+    monkeypatch.setattr(robot_module, "_RECORDING_REPLY_TIMEOUT_SECONDS", 0.01)
+    monkeypatch.setattr(robot_module, "_RECORDING_LATE_REPLY_GRACE_SECONDS", 0.01)
+    adapter = _goal_attempt_adapter()
+    adapter.state.recording = True
+    adapter._recording_status_known = True
+    adapter._recording_stop_required = True
+    stop_writes = 0
+
+    class SecondStopRepliesSocket:
+        async def send(self, message):
+            nonlocal stop_writes
+            payload = json.loads(message)
+            assert payload == {"video_record": {"stop": 0}}
+            stop_writes += 1
+            if stop_writes == 2:
+                await adapter._handle_message(json.dumps({
+                    "robot_video_record": {
+                        "stop": 0,
+                        "status": "ok",
+                        "url": "http://camera.local/REC_RETRY.mp4",
+                    }
+                }))
+
+    adapter._socket = SecondStopRepliesSocket()
+
+    with pytest.raises(TimeoutError, match="等待机器人回复超时"):
+        await adapter.stop_recording()
+    assert adapter._recording_reply_recovery is not None
+    assert adapter.recording_stop_required() is True
+
+    stopped = await adapter.stop_recording()
+
+    assert stop_writes == 2
+    assert stopped.recording is False
+    assert adapter._recording_reply_recovery is None
+    assert adapter.recording_stop_required() is False
+
+
+@pytest.mark.asyncio
+async def test_written_start_latch_blocks_transport_reconfiguration_while_state_is_unknown():
+    adapter = _goal_attempt_adapter()
+    adapter.state.recording = False
+    adapter._recording_status_known = False
+    adapter._recording_stop_required = True
+
+    with pytest.raises(ValueError, match="录制进行中"):
+        await adapter.configure_websocket_url("ws://replacement.local:8765")
+    with pytest.raises(ValueError, match="仍在录制"):
+        await adapter.disconnect()
+
+    assert adapter.websocket_url == "ws://robot.local:8765"
 
 
 @pytest.mark.asyncio
@@ -1485,6 +1968,598 @@ async def test_confirmed_orphan_stop_is_idempotent_for_a_waiting_finalizer():
 
 
 @pytest.mark.asyncio
+async def test_cancel_after_matched_start_reply_stops_the_committed_orphan_once(
+    monkeypatch,
+):
+    adapter = _goal_attempt_adapter()
+    original_wait = robot_module._wait_for_reply
+    reply_committed = asyncio.Event()
+    hold_start_waiter = asyncio.Event()
+    sent = []
+
+    async def pause_start_waiter(future, timeout_s):
+        response = await original_wait(future, timeout_s)
+        if robot_module._video_record_action(response) == "start":
+            reply_committed.set()
+            await hold_start_waiter.wait()
+        return response
+
+    class ReplyingSocket:
+        async def send(self, message):
+            payload = json.loads(message)
+            sent.append(payload)
+            if payload.get("video_record", {}).get("stop") == 0:
+                await adapter._handle_message(json.dumps({
+                    "robot_video_record": {
+                        "stop": 0,
+                        "status": "ok",
+                        "url": "http://camera.local/REC_ATOMIC.mp4",
+                    }
+                }))
+
+    monkeypatch.setattr(robot_module, "_wait_for_reply", pause_start_waiter)
+    adapter._socket = ReplyingSocket()
+    starting = asyncio.create_task(adapter.start_recording())
+    await asyncio.sleep(0)
+    await adapter._handle_message(json.dumps({
+        "robot_video_record": {
+            "start": 0,
+            "status": "ok",
+            "url": "http://camera.local/REC_ATOMIC.mp4",
+        }
+    }))
+    await reply_committed.wait()
+    await adapter._handle_message(json.dumps({
+        "gimbal": {"record_status": "idle", "yaw": 0, "pitch": 0}
+    }))
+    assert adapter.state.recording is True
+    starting.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await starting
+
+    compensation = adapter._recording_compensation_task
+    assert compensation is not None
+    await compensation
+
+    assert [next(iter(item["video_record"])) for item in sent] == ["start", "stop"]
+    assert adapter._recording_reply_recovery is None
+    assert adapter.state.recording is False
+    assert adapter.state.media_url == "http://camera.local/REC_ATOMIC.mp4"
+
+
+@pytest.mark.asyncio
+async def test_cancel_after_matched_stop_reply_retains_idle_state_and_url(
+    monkeypatch,
+):
+    adapter = _goal_attempt_adapter()
+    adapter.state.recording = True
+    adapter._recording_status_known = True
+    original_wait = robot_module._wait_for_reply
+    reply_committed = asyncio.Event()
+    hold_stop_waiter = asyncio.Event()
+    sent = []
+
+    async def pause_stop_waiter(future, timeout_s):
+        response = await original_wait(future, timeout_s)
+        if robot_module._video_record_action(response) == "stop":
+            reply_committed.set()
+            await hold_stop_waiter.wait()
+        return response
+
+    class ReplyingSocket:
+        async def send(self, message):
+            sent.append(json.loads(message))
+
+    monkeypatch.setattr(robot_module, "_wait_for_reply", pause_stop_waiter)
+    adapter._socket = ReplyingSocket()
+    stopping = asyncio.create_task(adapter.stop_recording())
+    await asyncio.sleep(0)
+    await adapter._handle_message(json.dumps({
+        "robot_video_record": {
+            "stop": 0,
+            "status": "ok",
+            "url": "http://camera.local/REC_STOP_ATOMIC.mp4",
+        }
+    }))
+    await reply_committed.wait()
+    await adapter._handle_message(json.dumps({
+        "gimbal": {"record_status": "recording", "yaw": 0, "pitch": 0}
+    }))
+    assert adapter.state.recording is False
+    stopping.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await stopping
+
+    assert adapter._recording_reply_recovery is None
+    assert adapter.state.recording is False
+    assert adapter.recording_status_known() is False
+    assert adapter.state.media_url == "http://camera.local/REC_STOP_ATOMIC.mp4"
+
+    await adapter._handle_message(json.dumps({
+        "gimbal": {"record_status": "idle", "yaw": 0, "pitch": 0}
+    }))
+    assert adapter.recording_status_known() is True
+
+    state = await adapter.stop_recording()
+    assert state.media_url == "http://camera.local/REC_STOP_ATOMIC.mp4"
+    assert len(sent) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("action", "transitional_status", "expected_recording"),
+    [
+        ("start", "idle", True),
+        ("stop", "recording", False),
+    ],
+)
+async def test_recording_reply_wins_over_bundled_transitional_heartbeat(
+    action,
+    transitional_status,
+    expected_recording,
+):
+    adapter = _goal_attempt_adapter()
+    adapter.state.recording = action == "stop"
+    adapter._recording_status_known = True
+
+    class SilentSocket:
+        async def send(self, _message):
+            return None
+
+    adapter._socket = SilentSocket()
+    operation = asyncio.create_task(
+        adapter.start_recording() if action == "start" else adapter.stop_recording()
+    )
+    await asyncio.sleep(0)
+    await adapter._handle_message(json.dumps({
+        "robot_video_record": {
+            action: 0,
+            "status": "ok",
+            "url": "http://camera.local/REC_BUNDLED.mp4",
+        },
+        "gimbal": {
+            "record_status": transitional_status,
+            "yaw": 0,
+            "pitch": 0,
+        },
+    }))
+    state = await operation
+
+    assert state.recording is expected_recording
+    assert state.media_url == "http://camera.local/REC_BUNDLED.mp4"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("action", "stale_status", "expected_status", "expected_recording"),
+    [
+        ("start", "idle", "recording", True),
+        ("stop", "recording", "idle", False),
+    ],
+)
+async def test_recording_reply_guard_survives_caller_return_until_matching_heartbeat(
+    action,
+    stale_status,
+    expected_status,
+    expected_recording,
+):
+    adapter = _goal_attempt_adapter()
+    adapter.state.recording = action == "stop"
+    adapter._recording_status_known = True
+
+    class ReplyingSocket:
+        async def send(self, _message):
+            await adapter._handle_message(json.dumps({
+                "robot_video_record": {
+                    action: 0,
+                    "status": "ok",
+                    "url": "http://camera.local/REC_GUARDED.mp4",
+                }
+            }))
+
+    adapter._socket = ReplyingSocket()
+    state = (
+        await adapter.start_recording()
+        if action == "start"
+        else await adapter.stop_recording()
+    )
+    assert state.recording is expected_recording
+
+    await adapter._handle_message(json.dumps({
+        "gimbal": {"record_status": stale_status, "yaw": 0, "pitch": 0}
+    }))
+    assert adapter.state.recording is expected_recording
+    assert adapter._recording_heartbeat_guard is not None
+    assert adapter._recording_heartbeat_conflict_count == 1
+    assert adapter.recording_status_known() is False
+    assert adapter.recording_operation_pending() is True
+
+    await adapter._handle_message(json.dumps({
+        "gimbal": {"record_status": expected_status, "yaw": 0, "pitch": 0}
+    }))
+    assert adapter.state.recording is expected_recording
+    assert adapter._recording_heartbeat_guard is None
+    assert adapter._recording_heartbeat_conflict_count == 0
+    assert adapter.recording_status_known() is True
+    assert adapter.recording_operation_pending() is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    (
+        "action",
+        "contradictory_status",
+        "ack_recording",
+        "resolved_recording",
+        "resolved_known",
+    ),
+    [
+        ("start", "idle", True, True, False),
+        ("stop", "recording", False, True, True),
+    ],
+)
+async def test_repeated_contradictory_recording_heartbeat_overrides_ack_guard(
+    action,
+    contradictory_status,
+    ack_recording,
+    resolved_recording,
+    resolved_known,
+):
+    adapter = _goal_attempt_adapter()
+    adapter.state.recording = action == "stop"
+    adapter._recording_status_known = True
+
+    class ReplyingSocket:
+        async def send(self, message):
+            requested_action = next(iter(json.loads(message)["video_record"]))
+            await adapter._handle_message(json.dumps({
+                "robot_video_record": {
+                    requested_action: 0,
+                    "status": "ok",
+                    "url": "http://camera.local/REC_CONFLICT.mp4",
+                }
+            }))
+
+    adapter._socket = ReplyingSocket()
+    if action == "start":
+        await adapter.start_recording()
+    else:
+        await adapter.stop_recording()
+    assert adapter.state.recording is ack_recording
+
+    conflicting_heartbeat = json.dumps({
+        "gimbal": {"record_status": contradictory_status, "yaw": 0, "pitch": 0}
+    })
+    await adapter._handle_message(conflicting_heartbeat)
+    assert adapter.state.recording is ack_recording
+    assert adapter.recording_status_known() is False
+    assert adapter.recording_operation_pending() is True
+    with pytest.raises(ValueError, match="正在等待机器人同步录制状态"):
+        await adapter.start_recording()
+    with pytest.raises(
+        ValueError,
+        match="机器人仍在录制|暂时不能断开机器人连接",
+    ):
+        await adapter.disconnect()
+
+    await adapter._handle_message(conflicting_heartbeat)
+    assert adapter.state.recording is resolved_recording
+    assert adapter._recording_heartbeat_guard is None
+    assert adapter._recording_heartbeat_conflict_count == 0
+    assert adapter.recording_status_known() is resolved_known
+    assert adapter.recording_operation_pending() is False
+
+    if action == "start":
+        await adapter._handle_message(conflicting_heartbeat)
+        assert adapter.state.recording is True
+        assert adapter.recording_status_known() is False
+        stopped = await adapter.stop_recording()
+        assert stopped.recording is False
+        assert adapter.recording_status_known() is True
+        assert adapter._recording_stop_required is False
+
+    if resolved_recording and action != "start":
+        with pytest.raises(ValueError, match="机器人仍在录制"):
+            await adapter.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_lone_idle_conflict_after_start_expires_to_safe_stop_required_state():
+    adapter = _goal_attempt_adapter()
+    adapter._recording_status_known = True
+
+    class ReplyingSocket:
+        async def send(self, message):
+            requested_action = next(iter(json.loads(message)["video_record"]))
+            await adapter._handle_message(json.dumps({
+                "robot_video_record": {
+                    requested_action: 0,
+                    "status": "ok",
+                    "url": "http://camera.local/REC_START_CONFLICT.mp4",
+                }
+            }))
+
+    adapter._socket = ReplyingSocket()
+    await adapter.start_recording()
+    await adapter._handle_message(json.dumps({
+        "gimbal": {"record_status": "idle", "yaw": 0, "pitch": 0}
+    }))
+
+    assert adapter.recording_operation_pending() is True
+    adapter._recording_heartbeat_conflict_deadline = time.monotonic() - 1
+
+    assert adapter.recording_operation_pending() is False
+    assert adapter.state.recording is True
+    assert adapter.recording_status_known() is False
+    await adapter._handle_message(json.dumps({
+        "gimbal": {"record_status": "idle", "yaw": 0, "pitch": 0}
+    }))
+    assert adapter.state.recording is True
+    assert adapter.recording_status_known() is False
+    with pytest.raises(ValueError, match="机器人仍在录制"):
+        await adapter.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_shutdown_reissues_stop_during_transitional_heartbeat_conflict():
+    adapter = _goal_attempt_adapter()
+    adapter.state.recording = False
+    adapter._recording_status_known = True
+    sent_actions = []
+
+    class ReplyingSocket:
+        async def send(self, message):
+            action = next(iter(json.loads(message)["video_record"]))
+            sent_actions.append(action)
+            await adapter._handle_message(json.dumps({
+                "robot_video_record": {
+                    action: 0,
+                    "status": "ok",
+                    "url": "http://camera.local/REC_SHUTDOWN_CONFLICT.mp4",
+                }
+            }))
+
+        async def close(self):
+            return None
+
+    adapter._socket = ReplyingSocket()
+    await adapter.stop_recording()
+    await adapter._handle_message(json.dumps({
+        "gimbal": {"record_status": "recording", "yaw": 0, "pitch": 0}
+    }))
+
+    assert adapter.state.recording is False
+    assert adapter.recording_status_known() is False
+    assert adapter.recording_operation_pending() is True
+
+    await adapter.shutdown(require_idle=False)
+
+    assert sent_actions == ["stop", "stop"]
+    assert adapter.shutdown_recording_confirmed_idle() is True
+    assert adapter.state.recording is False
+    assert adapter.state.connected is False
+
+
+@pytest.mark.asyncio
+async def test_successful_stop_with_empty_url_accepts_later_url_reply():
+    adapter = _goal_attempt_adapter()
+    adapter.state.recording = True
+    adapter._recording_status_known = True
+    empty_reply_sent = asyncio.Event()
+
+    class EmptyUrlStopSocket:
+        async def send(self, _message):
+            await adapter._handle_message(json.dumps({
+                "robot_video_record": {"stop": 0, "status": "ok", "url": ""}
+            }))
+            empty_reply_sent.set()
+
+    adapter._socket = EmptyUrlStopSocket()
+    stopping = asyncio.create_task(adapter.stop_recording())
+    await empty_reply_sent.wait()
+    await asyncio.sleep(0)
+
+    assert stopping.done() is False
+    assert adapter.state.recording is False
+    assert adapter.state.media_url is None
+    assert adapter._recording_reply_recovery is None
+    assert adapter._late_stop_metadata_owner is not None
+
+    await adapter._handle_message(json.dumps({
+        "robot_video_record": {"stop": 0, "status": "ok", "url": ""}
+    }))
+    await asyncio.sleep(0)
+    assert stopping.done() is False
+    assert adapter._late_stop_metadata_owner is not None
+
+    await adapter._handle_message(json.dumps({
+        "robot_video_record": {
+            "stop": 0,
+            "status": "ok",
+            "url": "http://camera.local/REC_FINALIZED.mp4",
+        }
+    }))
+    state = await stopping
+
+    assert adapter._late_stop_metadata_owner is None
+    assert state.media_url == "http://camera.local/REC_FINALIZED.mp4"
+
+
+@pytest.mark.asyncio
+async def test_empty_stop_url_fails_after_bounded_metadata_grace(monkeypatch):
+    monkeypatch.setattr(robot_module, "_RECORDING_STOP_METADATA_GRACE_SECONDS", 0.01)
+    adapter = _goal_attempt_adapter()
+    adapter.state.recording = True
+    adapter._recording_status_known = True
+
+    class EmptyUrlStopSocket:
+        async def send(self, _message):
+            await adapter._handle_message(json.dumps({
+                "robot_video_record": {"stop": 0, "status": "ok", "url": ""}
+            }))
+
+    adapter._socket = EmptyUrlStopSocket()
+    with pytest.raises(ValueError, match="没有返回视频地址"):
+        await adapter.stop_recording()
+
+    assert adapter.state.recording is False
+    assert adapter.recording_operation_pending() is False
+
+
+@pytest.mark.asyncio
+async def test_disconnect_and_shutdown_wait_for_late_stop_metadata():
+    adapter = _goal_attempt_adapter()
+    adapter.state.recording = True
+    adapter._recording_status_known = True
+    empty_reply_sent = asyncio.Event()
+
+    class EmptyThenLateSocket:
+        async def send(self, _message):
+            await adapter._handle_message(json.dumps({
+                "robot_video_record": {"stop": 0, "status": "ok", "url": ""}
+            }))
+            empty_reply_sent.set()
+
+        async def close(self):
+            return None
+
+    adapter._socket = EmptyThenLateSocket()
+    stopping = asyncio.create_task(adapter.stop_recording())
+    await empty_reply_sent.wait()
+    await asyncio.sleep(0)
+
+    with pytest.raises(ValueError, match="暂时不能断开机器人连接"):
+        await adapter.disconnect()
+    shutting_down = asyncio.create_task(adapter.shutdown())
+    await asyncio.sleep(0)
+    assert shutting_down.done() is False
+
+    await adapter._handle_message(json.dumps({
+        "robot_video_record": {
+            "stop": 0,
+            "status": "ok",
+            "url": "http://camera.local/REC_LIFECYCLE.mp4",
+        }
+    }))
+    stopped_state, shutdown_state = await asyncio.gather(stopping, shutting_down)
+
+    assert stopped_state.media_url == "http://camera.local/REC_LIFECYCLE.mp4"
+    assert shutdown_state.connected is False
+    assert adapter.shutdown_recording_confirmed_idle() is True
+
+
+@pytest.mark.asyncio
+async def test_recording_recovery_reply_from_replacement_connection_is_quarantined():
+    adapter = _goal_attempt_adapter()
+    adapter._connection_epoch = 5
+    adapter._recording_command_revision = 8
+    adapter._recording_write_attempt_revision = 8
+    adapter._recording_write_attempt_epoch = 4
+    adapter._recording_reply_recovery = (8, "start")
+
+    await adapter._handle_message(
+        json.dumps({
+            "robot_video_record": {
+                "start": 0,
+                "status": "ok",
+                "url": "http://camera.local/REC_STALE.mp4",
+            }
+        }),
+        connection_epoch=5,
+    )
+
+    assert adapter._recording_reply_recovery == (8, "start")
+    assert adapter.state.recording is False
+    assert adapter.state.media_url is None
+    assert adapter._recording_compensation_task is None
+
+
+@pytest.mark.asyncio
+async def test_idle_heartbeat_keeps_late_stop_url_ownership(monkeypatch):
+    monkeypatch.setattr(robot_module, "_RECORDING_REPLY_TIMEOUT_SECONDS", 0.005)
+    monkeypatch.setattr(robot_module, "_RECORDING_LATE_REPLY_GRACE_SECONDS", 0.005)
+    adapter = _goal_attempt_adapter()
+    adapter.state.recording = True
+    adapter._recording_status_known = True
+
+    class SilentSocket:
+        async def send(self, _message):
+            return None
+
+    adapter._socket = SilentSocket()
+    with pytest.raises(TimeoutError):
+        await adapter.stop_recording()
+
+    assert adapter._recording_reply_recovery is not None
+    assert adapter._late_stop_metadata_owner is not None
+    await adapter._handle_message(json.dumps({
+        "gimbal": {"record_status": "idle", "yaw": 0, "pitch": 0}
+    }))
+    assert adapter._recording_reply_recovery is None
+    assert adapter._late_stop_metadata_owner is not None
+    assert adapter.recording_operation_pending() is False
+
+    await adapter._handle_message(json.dumps({
+        "robot_video_record": {
+            "stop": 0,
+            "status": "ok",
+            "url": "http://camera.local/REC_LATE_URL.mp4",
+        }
+    }))
+
+    assert adapter._late_stop_metadata_owner is None
+    assert adapter.state.recording is False
+    assert adapter.state.media_url == "http://camera.local/REC_LATE_URL.mp4"
+
+
+@pytest.mark.asyncio
+async def test_old_late_stop_url_cannot_contaminate_a_new_start(monkeypatch):
+    monkeypatch.setattr(robot_module, "_RECORDING_REPLY_TIMEOUT_SECONDS", 0.005)
+    monkeypatch.setattr(robot_module, "_RECORDING_LATE_REPLY_GRACE_SECONDS", 0.005)
+    adapter = _goal_attempt_adapter()
+    adapter.state.recording = True
+    adapter._recording_status_known = True
+    start_sent = asyncio.Event()
+
+    class ControlledSocket:
+        async def send(self, message):
+            payload = json.loads(message)
+            if payload.get("video_record", {}).get("start") == 0:
+                start_sent.set()
+
+    adapter._socket = ControlledSocket()
+    with pytest.raises(TimeoutError):
+        await adapter.stop_recording()
+    await adapter._handle_message(json.dumps({
+        "gimbal": {"record_status": "idle", "yaw": 0, "pitch": 0}
+    }))
+
+    starting = asyncio.create_task(adapter.start_recording())
+    await start_sent.wait()
+    await adapter._handle_message(json.dumps({
+        "robot_video_record": {
+            "stop": 0,
+            "status": "ok",
+            "url": "http://camera.local/REC_OLD.mp4",
+        }
+    }))
+    assert not starting.done()
+    assert adapter.state.media_url != "http://camera.local/REC_OLD.mp4"
+
+    await adapter._handle_message(json.dumps({
+        "robot_video_record": {
+            "start": 0,
+            "status": "ok",
+            "url": "http://camera.local/REC_NEW.mp4",
+        }
+    }))
+    state = await starting
+
+    assert state.recording is True
+    assert state.media_url == "http://camera.local/REC_NEW.mp4"
+
+
+@pytest.mark.asyncio
 async def test_cancelled_start_with_a_late_success_is_stopped_automatically():
     adapter = _goal_attempt_adapter()
     start_sent = asyncio.Event()
@@ -1546,6 +2621,7 @@ async def test_late_stop_without_video_url_never_reuses_shared_photo_url():
     adapter.state.media_url = "http://camera.local/PHOTO.jpg"
     adapter._recording_media_url = None
     adapter._recording_command_revision = 4
+    adapter._recording_write_attempt_epoch = adapter.connection_generation()
     adapter._recording_reply_recovery = (4, "stop")
 
     await adapter._handle_message(json.dumps({
@@ -1603,6 +2679,89 @@ async def test_video_url_survives_an_in_recording_photo_when_stop_omits_its_url(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("heartbeat_count", [1, 2])
+async def test_stop_does_not_flatten_newer_recording_heartbeat_during_download(
+    monkeypatch,
+    heartbeat_count,
+):
+    adapter = _goal_attempt_adapter()
+    adapter.state.recording = True
+    adapter._recording_status_known = True
+    download_started = asyncio.Event()
+    release_download = asyncio.Event()
+    sent_actions = []
+
+    async def status_without_reconnect():
+        return adapter.state
+
+    adapter.status = status_without_reconnect
+
+    class ReplyingSocket:
+        async def send(self, message):
+            payload = json.loads(message)
+            if payload.get("video_record", {}).get("stop") == 0:
+                sent_actions.append("stop")
+                url = (
+                    "http://camera.local/REC_RACE_A.mp4"
+                    if len(sent_actions) == 1
+                    else "http://camera.local/REC_RACE_B.mp4"
+                )
+                await adapter._handle_message(json.dumps({
+                    "robot_video_record": {
+                        "stop": 0,
+                        "status": "ok",
+                        "url": url,
+                    }
+                }))
+
+    class DelayedMedia:
+        def __init__(self):
+            self.urls = []
+
+        async def download_url(self, url, metadata=None, **_kwargs):
+            self.urls.append(url)
+            download_started.set()
+            await release_download.wait()
+            return MediaItem(
+                path=f"C:/downloads/{url.rsplit('/', 1)[-1]}",
+                kind="video",
+                metadata=metadata or {},
+            )
+
+    async def retry_without_wait(operation, **_kwargs):
+        return await operation()
+
+    adapter._socket = ReplyingSocket()
+    monkeypatch.setattr(robot_module, "retry_camera_media_download", retry_without_wait)
+    media = DelayedMedia()
+    robot = RobotService(EventHub(), adapter=adapter, media=media)
+    stopping = asyncio.create_task(robot.stop_recording())
+    await download_started.wait()
+
+    heartbeat = json.dumps({
+        "gimbal": {"record_status": "recording", "yaw": 0, "pitch": 0}
+    })
+    for _ in range(heartbeat_count):
+        await adapter._handle_message(heartbeat)
+    assert adapter.recording_status_known() is (heartbeat_count > 1)
+    assert adapter.state.recording is (heartbeat_count > 1)
+
+    release_download.set()
+    stopped = await stopping
+
+    assert sent_actions == ["stop", "stop"]
+    assert media.urls == [
+        "http://camera.local/REC_RACE_A.mp4",
+        "http://camera.local/REC_RACE_B.mp4",
+    ]
+    assert stopped.recording is False
+    assert stopped.media_url.endswith("REC_RACE_B.mp4")
+    assert stopped.media_local_path.endswith("REC_RACE_B.mp4")
+    assert adapter.state.recording is False
+    assert adapter.recording_status_known() is True
+
+
+@pytest.mark.asyncio
 async def test_late_stop_recovery_never_uses_an_in_recording_photo_as_video(monkeypatch):
     adapter = HardwareRobotAdapter(EventHub(), "ws://robot.local:8765")
     adapter.state.connected = True
@@ -1615,6 +2774,8 @@ async def test_late_stop_recovery_never_uses_an_in_recording_photo_as_video(monk
         if "take_photo" in payload:
             return {"status": "ok", "url": "http://camera.local/PHOTO.jpg"}
         # The camera applies Stop, but its acknowledgement misses the caller's deadline.
+        adapter._recording_write_attempt_revision = adapter._recording_command_revision
+        adapter._recording_write_attempt_epoch = adapter.connection_generation()
         adapter.state.recording = False
         raise TimeoutError("stop acknowledgement arrived late")
 
@@ -1949,7 +3110,9 @@ async def test_zero_yaw_is_a_real_gimbal_start_angle():
     adapter.state.camera_angle = -90.0
     sent = []
 
-    async def fake_send(payload, *, context=""):
+    async def fake_send(payload, *, context="", on_write_started=None):
+        if on_write_started is not None:
+            on_write_started()
         sent.append(payload)
 
     adapter._send = fake_send
@@ -2411,6 +3574,49 @@ async def test_verified_local_recovery_finishes_before_first_post_restart_heartb
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("recording", "known"),
+    [(True, True), (False, False)],
+)
+async def test_same_process_local_file_does_not_bypass_stop_recovery(
+    tmp_path,
+    recording,
+    known,
+):
+    video = tmp_path / "same-process-download.mp4"
+    video.write_bytes(b"video")
+
+    class UnstableAdapter:
+        def __init__(self):
+            self.state = RobotState(
+                connected=True,
+                recording=recording,
+                media_url="http://camera.local/REC_UNSTABLE.mp4",
+                media_local_path=str(video),
+            )
+            self.stop_calls = 0
+
+        async def status(self):
+            return self.state
+
+        def recording_status_known(self):
+            return known
+
+        async def stop_recording(self):
+            self.stop_calls += 1
+            raise ConnectionError("cleanup Stop was not acknowledged")
+
+    adapter = UnstableAdapter()
+    robot = RobotService(EventHub(), adapter=adapter)
+
+    with pytest.raises(RuntimeError, match="补发停止指令失败"):
+        await robot.finalize_capture_recording()
+
+    assert adapter.stop_calls == 1
+    assert adapter.state.media_local_path == str(video)
+
+
+@pytest.mark.asyncio
 async def test_photo_path_is_never_restored_as_a_completed_recording(tmp_path):
     photo = tmp_path / "PHOTO.jpg"
     photo.write_bytes(b"photo")
@@ -2591,6 +3797,52 @@ async def test_disposable_preview_download_holds_capture_lock_and_resolves_relat
     assert preview == "temporary-preview"
     assert downloaded_urls == ["http://10.73.2.199:8765/mp4/REC_PREVIEW.mp4"]
     assert adapter.start_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_disposable_preview_cleanup_url_uses_caller_downloader_only():
+    caller_downloads = []
+
+    class RecordingAdapter:
+        def __init__(self):
+            self.websocket_url = "ws://10.73.2.199:8765/ws"
+            self.state = RobotState(connected=True, recording=True)
+            self.known = True
+            self.stop_calls = 0
+
+        async def status(self):
+            return self.state
+
+        def recording_status_known(self):
+            return self.known
+
+        async def stop_recording(self):
+            self.stop_calls += 1
+            self.state.recording = False
+            if self.stop_calls == 1:
+                self.state.media_url = "/mp4/REC_PREVIEW_A.mp4"
+                self.known = False
+            else:
+                self.state.media_url = "/mp4/REC_PREVIEW_B.mp4"
+                self.known = True
+            return self.state
+
+    class ForbiddenMediaPool:
+        async def download_url(self, *_args, **_kwargs):
+            raise AssertionError("temporary preview must not enter the media pool")
+
+    async def download_preview(url):
+        caller_downloads.append(url)
+        return "temporary-preview-b"
+
+    adapter = RecordingAdapter()
+    robot = RobotService(EventHub(), adapter=adapter, media=ForbiddenMediaPool())
+    stopped, preview = await robot.stop_recording_with_download(download_preview)
+
+    assert adapter.stop_calls == 2
+    assert stopped.media_url == "/mp4/REC_PREVIEW_B.mp4"
+    assert caller_downloads == ["http://10.73.2.199:8765/mp4/REC_PREVIEW_B.mp4"]
+    assert preview == "temporary-preview-b"
 
 
 @pytest.mark.asyncio
@@ -2893,6 +4145,66 @@ async def test_disconnect_discards_a_final_heartbeat_that_arrives_during_socket_
     assert adapter.state.path_file is None
     assert adapter.state.goal_id is None
     assert adapter.state.moving is False
+
+
+@pytest.mark.asyncio
+async def test_clean_websocket_close_immediately_fails_old_pending_requests(monkeypatch):
+    adapter = HardwareRobotAdapter(EventHub(), "ws://robot.local:8765")
+    closed_socket = object()
+
+    class ClosedSocket:
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            raise StopAsyncIteration
+
+        async def close(self):
+            return None
+
+    closed_socket = ClosedSocket()
+
+    class FakeWebsockets:
+        @staticmethod
+        async def connect(*_args, **_kwargs):
+            return closed_socket
+
+    monkeypatch.setattr(robot_module, "_load_websockets", lambda: FakeWebsockets)
+    loop = asyncio.get_running_loop()
+    pending = loop.create_future()
+    adapter._pending["robot_map_list"] = pending
+    adapter._pending_connection_epochs["robot_map_list"] = 0
+
+    task = asyncio.create_task(adapter._connection_loop())
+    with pytest.raises(ConnectionError, match="websocket closed"):
+        await asyncio.wait_for(asyncio.shield(pending), timeout=0.1)
+
+    assert adapter.state.connected is False
+    assert adapter.state.connection_status == "reconnecting"
+    assert adapter._socket is None
+    assert adapter._pending == {}
+    assert adapter._pending_connection_epochs == {}
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+
+@pytest.mark.asyncio
+async def test_reply_from_retired_connection_cannot_resolve_new_waiter():
+    adapter = HardwareRobotAdapter(EventHub(), "ws://robot.local:8765")
+    adapter._connection_epoch = 4
+    loop = asyncio.get_running_loop()
+    pending = loop.create_future()
+    adapter._pending["robot_map_list"] = pending
+    adapter._pending_connection_epochs["robot_map_list"] = 4
+
+    await adapter._handle_message(
+        json.dumps({"robot_map_list": ["stale"]}),
+        connection_epoch=3,
+    )
+
+    assert not pending.done()
 
 
 def test_new_map_heartbeat_drops_task_identity_from_the_previous_map():

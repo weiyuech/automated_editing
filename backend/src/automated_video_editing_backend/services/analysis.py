@@ -453,6 +453,12 @@ class AnalysisService:
         if not sidecar:
             return scenes
 
+        timeline = sidecar.get("recording_timeline")
+        if timeline:
+            merged = self._merge_cruise_segments(scenes, [], warnings, timeline)
+            if merged:
+                return merged
+
         segments = sidecar.get("segments") or []
         if segments:
             merged = self._merge_cruise_segments(scenes, segments, warnings)
@@ -509,6 +515,7 @@ class AnalysisService:
         scenes: list[dict[str, Any]],
         segments: list[Any],
         warnings: list[str],
+        recording_timeline: list[dict] | None = None,
     ) -> list[dict[str, Any]]:
         """Cut the recording along the cruise's own spans and label what each stretch is.
 
@@ -518,6 +525,13 @@ class AnalysisService:
         departures.
         """
         spans = self._cruise_spans(segments)
+        if recording_timeline is not None:
+            spans = [
+                (start, end, str(s.get("kind", "unknown")), str(s.get("label", "")))
+                for s in recording_timeline if isinstance(s, dict)
+                and (start := self._timestamp_value(s.get("start"))) is not None
+                and (end := self._timestamp_value(s.get("end"))) is not None and end > start
+            ]
         if not spans:
             return []
 
@@ -540,7 +554,7 @@ class AnalysisService:
         merged: list[dict[str, Any]] = []
         for index, start in enumerate(ordered[:-1]):
             end = ordered[index + 1]
-            if end - start < 0.5:
+            if end <= start:
                 continue
             # Classified on the midpoint: a boundary belongs to both neighbours, the middle
             # of a stretch belongs to exactly one.

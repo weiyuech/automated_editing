@@ -1,4 +1,8 @@
 * { box-sizing: border-box; }
+.capture-group-tools { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; padding: 12px 20px; color: var(--text-muted); font-size: 12px; }
+.capture-group-tools > span { flex-basis: 100%; }
+.capture-group-tools input { width: 80px; margin-left: 8px; padding: 5px; border: 1px solid var(--border); border-radius: 5px; background: var(--surface); color: var(--text); }
+.capture-remove { font-size: 11px; padding: 3px 9px; margin-bottom: 8px; color: var(--text-muted); }
 :root {
   --bg: #f8f7ff;
   --bg-deep: #eef0ff;

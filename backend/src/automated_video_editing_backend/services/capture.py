@@ -75,6 +75,8 @@ def inspect_sidecar(video_path: str | Path) -> dict:
             "failed_points": 0, "message": "点位文件格式无效",
         }
 
+    if payload.get("recording_timeline"):
+        return inspect_timeline(payload["recording_timeline"])
     segments = [item for item in (payload.get("segments") or []) if isinstance(item, dict)]
     markers = [item for item in (payload.get("markers") or []) if isinstance(item, dict)]
     segment_identities = {
@@ -144,6 +146,15 @@ def inspect_sidecar(video_path: str | Path) -> dict:
         "evidence": "invalid", "point_count": 0, "successful_points": 0,
         "failed_points": 0, "message": "点位文件没有可用的到达信息",
     }
+
+
+def inspect_timeline(timeline: list[dict]) -> dict:
+    visits = {str(s.get("id", "")).rsplit("-", 1)[0] for s in timeline if s.get("kind") in {"dwell", "transit", "unknown"}}
+    parked = {str(s.get("id", "")).rsplit("-", 1)[0] for s in timeline if s.get("kind") == "dwell"}
+    failed = {str(s.get("id", "")).rsplit("-", 1)[0] for s in timeline if s.get("kind") in {"failed", "unknown"}}
+    return {"evidence": "full" if visits else "none", "point_count": len(visits),
+            "successful_points": len(parked), "failed_points": len(failed - parked),
+            "message": f"所选内容包含 {len(visits)} 个点位 · 统一录制时间轴"}
 
 
 class CaptureService:
@@ -244,6 +255,17 @@ class CaptureService:
         except OSError:
             stored.segments = previous
             raise
+
+    def remember_recording_event(self, session: CaptureSession, event: dict) -> None:
+        """Persist only capture transitions, never the high-frequency heartbeat stream."""
+        session.recording_events.append(dict(event))
+        # Keep the in-memory evidence even if disk is temporarily unavailable. A later
+        # transition/finalization can persist it; recording shutdown must still proceed.
+        self._save()
+
+    def remember_recording_clock(self, session: CaptureSession, **values) -> None:
+        session.recording_clock.update(values)
+        self._save()
 
     def remember_gimbal_samples(
         self,
@@ -371,14 +393,20 @@ class CaptureService:
             "notes": list(session.notes),
             "markers": [marker.model_dump(mode="json") for marker in session.markers],
             "segments": serialized_segments,
+            "recording_events": list(session.recording_events),
+            "recording_clock": dict(session.recording_clock),
         }
-        target = sidecar_path(video)
-        if not write_json(target, payload):
-            return None
+        # Publish the capture document last: CaptureLibrary treats it as the enrollment marker.
+        # If motion telemetry cannot be persisted, leaving only a gimbal sidecar is harmless and
+        # retryable; publishing capture first would let the background splitter create children
+        # without the physical-motion evidence that was actually collected.
         if session.gimbal_samples and not write_json(
                 gimbal_sidecar_path(video),
                 {"samples": [list(sample) for sample in session.gimbal_samples]},
         ):
+            return None
+        target = sidecar_path(video)
+        if not write_json(target, payload):
             return None
 
         # The durable sidecars now own the high-volume motion track. Do not retain hundreds of

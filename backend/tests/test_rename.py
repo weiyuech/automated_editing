@@ -644,6 +644,55 @@ def test_a_recordings_markers_follow_it(bundle, tmp_path):
     assert read_sidecar(renamed)["markers"][0]["label"] == "path1#1"
 
 
+def test_a_recordings_gimbal_track_follows_it(bundle, tmp_path):
+    from automated_video_editing_backend.services.capture import gimbal_sidecar_path
+
+    media, _, _, renamer = bundle
+    video = tmp_path / "robot-cruise.mp4"
+    video.write_bytes(b"video")
+    gimbal_sidecar_path(video).write_text(
+        '{"samples": [[0.1, -20.0, 3.0]]}', encoding="utf-8"
+    )
+    item = media.import_path(str(video))
+
+    renamer.rename(item.id, "早班巡游")
+
+    renamed = tmp_path / "早班巡游.mp4"
+    assert renamed.exists()
+    assert not gimbal_sidecar_path(video).exists()
+    assert json.loads(gimbal_sidecar_path(renamed).read_text(encoding="utf-8"))[
+        "samples"
+    ] == [[0.1, -20.0, 3.0]]
+
+
+def test_recording_rename_rejects_an_existing_target_gimbal_sidecar(bundle, tmp_path):
+    from automated_video_editing_backend.services.capture import gimbal_sidecar_path
+
+    media, _, _, renamer = bundle
+    source = tmp_path / "robot-cruise.mp4"
+    target = tmp_path / "taken.mp4"
+    source.write_bytes(b"video")
+    gimbal_sidecar_path(source).write_text(
+        '{"samples": [[0.1, 1.0, 2.0]]}', encoding="utf-8"
+    )
+    gimbal_sidecar_path(target).write_text(
+        '{"samples": [[0.2, 3.0, 4.0]]}', encoding="utf-8"
+    )
+    item = media.import_path(str(source))
+
+    with pytest.raises(ValueError, match="taken.mp4.gimbal.json.*already exists"):
+        renamer.rename(item.id, target.name)
+
+    assert source.exists()
+    assert json.loads(gimbal_sidecar_path(source).read_text(encoding="utf-8"))[
+        "samples"
+    ] == [[0.1, 1.0, 2.0]]
+    assert json.loads(gimbal_sidecar_path(target).read_text(encoding="utf-8"))[
+        "samples"
+    ] == [[0.2, 3.0, 4.0]]
+    assert not target.exists()
+
+
 def test_recording_rename_rejects_an_existing_target_capture_sidecar(bundle, tmp_path):
     from automated_video_editing_backend.services.capture import sidecar_path
 

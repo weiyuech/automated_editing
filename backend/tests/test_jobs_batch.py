@@ -787,18 +787,19 @@ async def test_failed_delivery_registration_removes_the_new_flat_file_family(
     output = generated_path("exports", f"failed-delivery-{uuid4().hex[:8]}.mp4")
     renderer = RenderService()
     media = MediaService(path=tmp_path / "media-library.json")
+    source = media.import_path(str(_write(tmp_path / "source.mp4")))
     service = JobService(DummyEvents(), media, None, None, renderer)
     timeline = EditTimeline(
         title="failure",
         output_path=str(output),
         clips=[TimelineClip(
-            media_id="source", source_path=str(tmp_path / "source.mp4"),
+            media_id=source.id, source_path=source.path,
             start=0, duration=1, timeline_start=0,
         )],
         subtitles=None,
     )
     job = JobRecord(
-        request=EditJobRequest(title="failure", media_ids=["source"]),
+        request=EditJobRequest(title="failure", media_ids=[source.id]),
         timeline=timeline,
     )
     service._jobs[job.id] = job
@@ -839,18 +840,19 @@ async def test_failed_group_registration_removes_delivery_and_master_without_pub
     master = output.with_name(f"{output.stem} 母版{output.suffix}")
     renderer = RenderService()
     media = MediaService(path=tmp_path / "media-library.json")
+    source = media.import_path(str(_write(tmp_path / "source.mp4")))
     service = JobService(DummyEvents(), media, None, None, renderer)
     timeline = EditTimeline(
         title="master failure",
         output_path=str(output),
         clips=[TimelineClip(
-            media_id="source", source_path=str(tmp_path / "source.mp4"),
+            media_id=source.id, source_path=source.path,
             start=0, duration=1, timeline_start=0,
         )],
         subtitles=SubtitleTrack(cues=[SubtitleCue(start=0, end=0.8, text="一句")]),
     )
     job = JobRecord(
-        request=EditJobRequest(title="master failure", media_ids=["source"]),
+        request=EditJobRequest(title="master failure", media_ids=[source.id]),
         timeline=timeline,
     )
     service._jobs[job.id] = job
@@ -917,18 +919,19 @@ async def test_master_render_failure_removes_the_entire_new_export_group(
     master = output.with_name(f"{output.stem} 母版{output.suffix}")
     renderer = RenderService()
     media = MediaService(path=tmp_path / "media-library.json")
+    source = media.import_path(str(_write(tmp_path / "source.mp4")))
     service = JobService(DummyEvents(), media, None, None, renderer)
     timeline = EditTimeline(
         title="master render failure",
         output_path=str(output),
         clips=[TimelineClip(
-            media_id="source", source_path=str(tmp_path / "source.mp4"),
+            media_id=source.id, source_path=source.path,
             start=0, duration=1, timeline_start=0,
         )],
         subtitles=SubtitleTrack(cues=[SubtitleCue(start=0, end=0.8, text="一句")]),
     )
     job = JobRecord(
-        request=EditJobRequest(title="master render failure", media_ids=["source"]),
+        request=EditJobRequest(title="master render failure", media_ids=[source.id]),
         timeline=timeline,
     )
     service._jobs[job.id] = job

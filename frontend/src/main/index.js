@@ -2,7 +2,7 @@ import { app, BrowserWindow, ipcMain, dialog, shell } from 'electron'
 import { execFile, spawn } from 'node:child_process'
 import { randomBytes } from 'node:crypto'
 import { createServer } from 'node:net'
-import { existsSync, mkdirSync, appendFileSync, copyFileSync, readFileSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, copyFileSync, readFileSync, writeFileSync } from 'node:fs'
 import { delimiter, dirname, extname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import {
   beginBackendShutdown,
@@ -11,6 +11,7 @@ import {
   runBestEffort,
   settleBackendChild
 } from './backend-shutdown-policy.js'
+import { createBoundedBackendLogWriter } from './backend-log-policy.js'
 import { ensureDeletableManagedPath, ensureInspectableMediaPath } from './path-policy.js'
 import {
   MEDIA_IMPORT_DIALOG_BUTTONS,
@@ -26,6 +27,7 @@ let backendPort = DEFAULT_BACKEND_PORT
 let backendProcess = null
 let backendShutdown = null
 let backendStartupError = null
+let backendLogWriter = null
 let mainWindow = null
 let appQuitCoordinator = null
 
@@ -219,9 +221,12 @@ function managedCompanionPaths(targetPath) {
   if (VIDEO_FILE_EXTS.has(extension) && isInsideDirectory(join(root, 'exports'), targetPath)) {
     return [`${stem}.ass`, `${stem}.subtitles.json`]
   }
-  if (VIDEO_FILE_EXTS.has(extension) && isInsideDirectory(join(root, 'data', 'downloads'), targetPath)) {
+  if (VIDEO_FILE_EXTS.has(extension) && (
+    isInsideDirectory(join(root, 'data', 'downloads'), targetPath)
+    || isInsideDirectory(join(root, 'data', 'capture_segments'), targetPath)
+  )) {
     // Capture notes use the complete media filename, including its extension.
-    return [`${targetPath}.capture.json`]
+    return [`${targetPath}.capture.json`, `${targetPath}.gimbal.json`]
   }
   if (AUDIO_FILE_EXTS.has(extension) && isInsideDirectory(join(root, 'data', 'tts'), targetPath)) {
     return [`${stem}.json`]
@@ -286,6 +291,8 @@ async function startBackend() {
   backendPort = await findBackendPort()
   const root = appRoot()
   const logPath = join(root, 'logs', 'backend.log')
+  const log = createBoundedBackendLogWriter(logPath)
+  backendLogWriter = log
   const python = pythonExecutable()
   const env = {
     ...process.env,
@@ -308,7 +315,6 @@ async function startBackend() {
     windowsHide: true
   })
   backendProcess = child
-  const log = (line) => appendFileSync(logPath, line)
   child.stdout.on('data', (chunk) => runBestEffort(() => log(`[out] ${chunk}`)))
   child.stderr.on('data', (chunk) => runBestEffort(() => log(`[err] ${chunk}`)))
   const settleChild = () => {
@@ -453,10 +459,12 @@ function stopBackend() {
   if (!child) return
   backendShutdown = beginBackendShutdown(child, backendShutdown, {
     onStdinError: (error) => {
-      runBestEffort(() => appendFileSync(
-        join(appRoot(), 'logs', 'backend.log'),
-        `[shutdown-stdin-error] ${error?.message || String(error)}\n`
-      ))
+      runBestEffort(() => {
+        backendLogWriter ||= createBoundedBackendLogWriter(
+          join(appRoot(), 'logs', 'backend.log')
+        )
+        backendLogWriter(`[shutdown-stdin-error] ${error?.message || String(error)}\n`)
+      })
     },
     onForceComplete: (forcedChild) => {
       if (backendProcess === forcedChild) backendProcess = null

@@ -64,6 +64,12 @@ The initial app is designed to work with mock robot control first. Real hardware
 
 Media is organized by role instead of treated as one flat pile. Downloads are raw source media or music, exports are rendered results, and previews/cache are cleanup candidates. Edit Studio only uses explicitly selected raw clips, so exported MP4s do not get accidentally folded back into later renders. See `docs/media_vault.md` for the design rules.
 
+## 巡游完整录像与分段录像
+
+一次巡游只录制一条完整视频。文件保存后，应用会依据本次导航事件在电脑上生成“行进 / 停留 / 状态未确认”等分段，并在媒体库里收在同一次拍摄下面。自动剪辑可选完整录像或若干分段，但一次拍摄始终只占一个源视频名额；手动微调可以直接选用单个已生成分段。
+
+原片暂时不存在时，只允许使用仍在磁盘上的分段；声音轨无法确认时不发布可能错误的无声文件；重启、校准、删除和缓存清理均保留任务占用保护。完整交互和文件规则见 [docs/cruise_recording_segments.md](docs/cruise_recording_segments.md)。
+
 ## Settings, LLM, And Timed TTS
 
 Provider credentials are owned by the backend `SettingsService` and stored locally in `data/settings.local.json`. API routes return masked status only, and blank secret fields in the UI keep the existing local value. Provider changes apply immediately; restart is only needed after code changes.

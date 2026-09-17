@@ -12,7 +12,7 @@ from uuid import uuid4
 import httpx
 from pydantic import ValidationError
 
-from automated_video_editing_backend.core.models import MediaItem
+from automated_video_editing_backend.core.models import CaptureSelection, MediaItem
 from automated_video_editing_backend.core.paths import (
     GENERATED_DIRS,
     RootPathError,
@@ -20,6 +20,7 @@ from automated_video_editing_backend.core.paths import (
     generated_path,
 )
 from automated_video_editing_backend.core.store import read_json, write_json
+from automated_video_editing_backend.services.capture_library import CaptureLibrary
 from automated_video_editing_backend.services.media_download import (
     MediaDownloadNotReadyError,
     validate_downloaded_video,
@@ -274,6 +275,12 @@ class MediaService:
         self._generated_metadata_blocked = False
         self.generated_metadata_problem = ""
         self._pool_paths: dict[str, list[str]] = {field: [] for field in MEDIA_POOL_FIELDS}
+        self._capture_selections: list[dict] = []
+        self._edit_inputs: dict[str, MediaItem] = {}
+        self.captures = CaptureLibrary(
+            self.path.with_name("capture-recordings.json"),
+            GENERATED_DIRS["data"] / "capture_segments",
+        )
         self._pool_initialized = False
         self._pool_blocked = False
         self.media_pool_problem = ""
@@ -442,6 +449,10 @@ class MediaService:
 
         try:
             loaded = self._validate_pool_payload(raw)
+            self._capture_selections = [
+                CaptureSelection.model_validate(s).model_dump()
+                for s in raw.get("capture_selections", [])
+            ]
         except (TypeError, ValueError) as exc:
             self._block_pool(f"{self.pool_path.name} 格式无效：{exc}")
             return
@@ -469,16 +480,20 @@ class MediaService:
         self.media_pool_problem = problem
         LOGGER.error("Could not load media pool: %s", problem)
 
-    def _save_pool(self, paths: dict[str, list[str]]) -> None:
+    def _save_pool(self, paths: dict[str, list[str]], captures: list[dict] | None = None) -> None:
         """Persist a complete snapshot before exposing it as the current working set."""
         payload = {field: list(paths.get(field, [])) for field in MEDIA_POOL_FIELDS}
+        choices = self._capture_selections if captures is None else captures
+        if choices:
+            payload["capture_selections"] = choices
         if not write_json(self.pool_path, payload):
             problem = f"{self.pool_path.name} 无法保存；媒体池没有更新"
             self.media_pool_problem = problem
             LOGGER.error("Could not save media pool: %s", problem)
             raise MediaPoolPersistenceError(problem)
 
-        self._pool_paths = payload
+        self._pool_paths = {field: payload[field] for field in MEDIA_POOL_FIELDS}
+        self._capture_selections = choices
         self._pool_initialized = True
         self._pool_blocked = False
         self.media_pool_problem = ""
@@ -492,6 +507,9 @@ class MediaService:
 
     @staticmethod
     def is_automatic_source(item: MediaItem) -> bool:
+        if item.metadata.get("capture_input") and item.metadata.get("source") == "capture_input":
+            root = (GENERATED_DIRS["data"] / "capture_segments").resolve()
+            return item.kind == "video" and root in Path(item.path).resolve().parents
         """The authoritative boundary for footage automatic editing may consume."""
         return (
             item.kind == "video"
@@ -522,9 +540,7 @@ class MediaService:
             # pooled. Include temporarily offline catalog entries so upgrading while a removable
             # drive is detached does not silently change that working set.
             seed_candidates = {item.path: item for item in items}
-            seed_candidates.update(
-                {item.path: item for item in self._import_catalog.values()}
-            )
+            seed_candidates.update({item.path: item for item in self._import_catalog.values()})
             seeded = {
                 field: [
                     item.path
@@ -567,6 +583,8 @@ class MediaService:
             result[field] = visible_ids
         if cleaned != self._pool_paths:
             self._save_pool(cleaned)
+        if self._capture_selections:
+            result["capture_selections"] = self._capture_selections
         return result
 
     def ensure_media_pool_initialized(self) -> None:
@@ -614,9 +632,25 @@ class MediaService:
         # Write first so a full disk or permissions error cannot make a failed PUT look
         # successful until the process restarts. The old in-memory and on-disk set both stay
         # intact when the atomic write does not land.
-        self._save_pool(updated)
+        choices = media_ids.get("capture_selections")
+        if choices is None:
+            choices = self._capture_selections
+        choices = [CaptureSelection.model_validate(s).model_dump() for s in choices]
+        selected_groups = {
+            item.metadata["capture_group"]["id"]
+            for mid in result_ids["source_media_ids"]
+            if (item := self._items.get(mid)) and item.metadata.get("capture_group")
+        }
+        choices = [s for s in choices if s["capture_id"] in selected_groups]
+        if len({s["capture_id"] for s in choices}) != len(choices):
+            raise ValueError("同一次拍摄只能保存一份片段选择")
+        for choice in choices:
+            self.captures.validate_selection(choice)
+        self._save_pool(updated, choices)
         # The ids above were validated against the inventory snapshot from list_items().
         # Calling media_pool() here used to run that same full scan a second time immediately.
+        if choices:
+            result_ids["capture_selections"] = choices
         return result_ids
 
     def _load_imports(self) -> None:
@@ -653,9 +687,7 @@ class MediaService:
         catalog: dict[str, MediaItem] = {}
         catalog_id_by_path: dict[str, str] = {}
         reserved_catalog_ids = {
-            str(entry.get("id"))
-            for entry in raw
-            if isinstance(entry, dict) and entry.get("id")
+            str(entry.get("id")) for entry in raw if isinstance(entry, dict) and entry.get("id")
         }
         loaded: dict[str, MediaItem] = {}
         legacy_exports: dict[str, dict] = {}
@@ -963,6 +995,7 @@ class MediaService:
         # drive can then reconnect and restore the same media id on the next scan.
         self.forget_missing_imports()
         self._tag_cruise_points()
+        self.captures.enrich(self._items)
         return list(self._items.values())
 
     def _tag_cruise_points(self) -> None:
@@ -987,7 +1020,121 @@ class MediaService:
             item.metadata["point_evidence_message"] = capability["message"]
 
     def get(self, media_id: str) -> MediaItem | None:
-        return self._items.get(media_id)
+        return self._items.get(media_id) or self._edit_inputs.get(media_id)
+
+    def capture_input_item(self, media_id: str, source_path: str) -> MediaItem | None:
+        """Return one internally materialized capture input only for its exact id/path pair.
+
+        Capture selections are intentionally absent from ``list_items``: they are disposable
+        render inputs, not independent library assets.  A manual timeline produced from a draft
+        still needs to submit that input back to the renderer, so authorize it through the
+        process-local record that created it.  Resolving both paths strictly also rejects a
+        deleted input and a managed-directory symlink that was replaced to point elsewhere.
+        """
+        item = self._edit_inputs.get(media_id)
+        if (
+            item is None
+            or item.id != media_id
+            or item.kind != "video"
+            or item.metadata.get("source") != "capture_input"
+            or not item.metadata.get("capture_input")
+        ):
+            return None
+        try:
+            claimed = Path(source_path).expanduser().resolve(strict=True)
+            recorded = Path(item.path).expanduser().resolve(strict=True)
+            managed_root = self.captures.directory.resolve(strict=False)
+        except (OSError, RuntimeError, ValueError):
+            return None
+        if claimed != recorded or managed_root not in claimed.parents:
+            return None
+        return item
+
+    def is_capture_input_path(self, source_path: str) -> bool:
+        """Keep inputs returned by a draft alive until this backend session ends.
+
+        A draft is deliberately not a render job yet, so the ordinary queued/running job guard
+        cannot see it.  The process-local edit-input registry is the draft lease: safe cleanup
+        may reclaim abandoned inputs after a restart, but never between preview and render.
+        """
+        return any(
+            self.capture_input_item(media_id, source_path) is not None
+            for media_id in self._edit_inputs
+        )
+
+    def capture_child_item(self, root_media_id: str, child_path: str) -> MediaItem | None:
+        """Authorize one generated child through its durable capture root.
+
+        Children stay nested in the media library instead of becoming independent inventory
+        rows. Manual fine-tuning nevertheless needs a real path to play and render, so the root
+        id may vouch for exactly one ready child recorded in the authoritative manifest. Merely
+        placing a file under capture_segments, or pairing an arbitrary path with a root id, is
+        never sufficient.
+        """
+        root = self._items.get(root_media_id)
+        public_group = root.metadata.get("capture_group") if root else None
+        if root is None or not isinstance(public_group, dict):
+            return None
+        group = self.captures.groups.get(str(public_group.get("id") or ""))
+        if group is None:
+            return None
+        try:
+            requested = Path(child_path).expanduser().resolve(strict=True)
+            managed_root = self.captures.directory.resolve(strict=False)
+        except (OSError, RuntimeError, ValueError):
+            return None
+        if managed_root not in requested.parents or not requested.is_file():
+            return None
+        for segment in group.get("segments", []):
+            recorded_path = segment.get("path")
+            if not recorded_path or segment.get("status") != "ready":
+                continue
+            try:
+                recorded = Path(recorded_path).expanduser().resolve(strict=True)
+            except (OSError, RuntimeError, ValueError):
+                continue
+            if recorded != requested:
+                continue
+            child = root.model_copy(deep=True)
+            child.id = f"{root.id}:{segment['id']}"
+            child.path = str(requested)
+            child.metadata.update(
+                source="capture_child",
+                capture_child=True,
+                capture_root_media_id=root.id,
+                capture_segment_id=segment["id"],
+                capture_segment_kind=segment.get("kind", "unknown"),
+                capture_segment_label=segment.get("label", ""),
+            )
+            return child
+        return None
+
+    async def resolve_capture_sources(
+        self, media_ids: list[str], selections: list[CaptureSelection]
+    ) -> list[str]:
+        """One root in, one source out. Never deal children as separate recordings."""
+        if not selections:
+            return media_ids
+        self.list_items()
+        choices = {s.capture_id: s.model_dump() for s in selections}
+        if len(choices) != len(selections):
+            raise ValueError("同一次拍摄只能有一份片段选择")
+        result, consumed = [], set()
+        for media_id in dict.fromkeys(media_ids):
+            item = self.get(media_id)
+            group = item.metadata.get("capture_group") if item else None
+            key = group["id"] if group else None
+            if key in choices:
+                resolved = await self.captures.resolve(item, choices[key])
+                if resolved is not item:
+                    self._edit_inputs[resolved.id] = resolved
+                result.append(resolved.id)
+                consumed.add(key)
+            else:
+                result.append(media_id)
+        if consumed != set(choices):
+            raise ValueError("片段选择必须属于本次选中的拍摄组")
+        return result
 
     def infer_kind(self, path: Path) -> str:
         ext = path.suffix.lower()
@@ -1008,7 +1155,14 @@ class MediaService:
                 payload = json.loads(metadata_path.read_text(encoding="utf-8"))
                 recorded = payload.get("output_path") or payload.get("video_path")
                 recorded_path = Path(str(recorded)).expanduser().resolve()
-            except (AttributeError, OSError, RuntimeError, TypeError, ValueError, json.JSONDecodeError):
+            except (
+                AttributeError,
+                OSError,
+                RuntimeError,
+                TypeError,
+                ValueError,
+                json.JSONDecodeError,
+            ):
                 continue
             if recorded_path != path:
                 continue
@@ -1205,9 +1359,7 @@ class MediaService:
                 except OSError:
                     LOGGER.warning("Could not remove failed import staging file", exc_info=True)
             LOGGER.exception("Could not copy local import into managed downloads")
-            raise OSError(
-                f"无法复制 {source.name} 到应用媒体库；请检查磁盘空间和文件权限"
-            ) from exc
+            raise OSError(f"无法复制 {source.name} 到应用媒体库；请检查磁盘空间和文件权限") from exc
         return destination
 
     def _recognize_copied_import(self, destination: Path) -> MediaItem:
@@ -1327,9 +1479,7 @@ class MediaService:
                     raise ValueError("Only direct video, audio, or image URLs are supported")
                 expected_kind = str((metadata or {}).get("kind_hint") or "")
                 if expected_kind and not _content_type_matches_kind(content_type, expected_kind):
-                    raise MediaDownloadNotReadyError(
-                        f"摄像头返回的文件类型暂时不是{expected_kind}"
-                    )
+                    raise MediaDownloadNotReadyError(f"摄像头返回的文件类型暂时不是{expected_kind}")
                 target = generated_path(
                     "data",
                     "downloads",
@@ -1446,9 +1596,7 @@ class MediaService:
                             "A generated export subtitle sidecar must exist before registration"
                         )
                 if self._generated_metadata_blocked:
-                    raise GeneratedMetadataPersistenceError(
-                        self.generated_metadata_problem
-                    )
+                    raise GeneratedMetadataPersistenceError(self.generated_metadata_problem)
                 dumped = candidate.model_dump(mode="json")["metadata"]
                 if generated_snapshot.get(candidate.path) != dumped:
                     generated_snapshot[candidate.path] = dumped

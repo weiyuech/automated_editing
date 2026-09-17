@@ -6,8 +6,10 @@ import random
 import time
 from collections.abc import Callable
 from contextlib import suppress
+from contextvars import ContextVar
 from typing import Any
 
+from automated_video_editing_backend.core.diagnostics import log_event
 from automated_video_editing_backend.core.events import EventHub
 from automated_video_editing_backend.core.models import (
     CameraworkConfig,
@@ -35,6 +37,8 @@ _CW_ZOOM_SETTLE_SECONDS = 1.0
 _CW_POSE_TOLERANCE_DEG = 2.0
 _CW_POSE_POLL_SECONDS = 0.2
 _CW_POSE_STABLE_SAMPLES = 2
+_CW_RUNNER_STOP_TIMEOUT_SECONDS = 3.0
+_FINAL_ANCHOR_TIMEOUT_SECONDS = 3.0
 # Route-point dwell is deliberately not an operator control. It only gives the robot a short,
 # usable stationary shot after navigation; non-recording trial runs skip it entirely.
 _POINT_DWELL_BASELINE_SECONDS = 7.5
@@ -55,6 +59,12 @@ def _randomized_point_dwell_seconds(
         baseline * _DWELL_JITTER[0],
         baseline * _DWELL_JITTER[1],
     )
+
+
+def _consume_background_task(task: asyncio.Task[Any]) -> None:
+    """Retrieve a detached task's result so a late failure is not reported as unhandled."""
+    with suppress(asyncio.CancelledError, Exception):
+        task.result()
 
 
 class CruisePreflightError(ValueError):
@@ -93,6 +103,7 @@ class CruiseService:
         self._starting = False
         self._cancel = asyncio.Event()
         self._origin_monotonic = 0.0
+        self._capture_visit: CruiseSegment | None = None
         self._camerawork_config_provider = camerawork_config_provider or CameraworkConfig
         # Our last commanded pitch/zoom. Zoom has no heartbeat feedback, so we track what we sent
         # to use as the next leg's start; pitch is tracked for the same reason (start continuity).
@@ -100,6 +111,11 @@ class CruiseService:
         self._cw_pitch = 0.0
         self._cw_zoom = 1.0
         self._point_dwell_baseline_seconds = _POINT_DWELL_BASELINE_SECONDS
+        self._cw_generation = 0
+        self._cw_owner_generation: ContextVar[int | None] = ContextVar(
+            f"cruise_camerawork_owner_{id(self)}",
+            default=None,
+        )
         self._reset_camerawork_runtime()
         # (video_time, yaw, pitch) samples recorded during an auto-camerawork run, written beside
         # the video so the grader can tell a slow pan over a plain surface from a true freeze.
@@ -115,6 +131,7 @@ class CruiseService:
 
     def _reset_camerawork_runtime(self) -> None:
         """Create one clean planner/runner state for a service or a new cruise."""
+        self._cw_generation += 1
         self._cw_phase: str | None = None
         self._cw_phase_deadline = 0.0
         self._cw_pending_anchor_seconds = 0.0
@@ -201,6 +218,15 @@ class CruiseService:
                 self._run = run
                 self._reset_camerawork_runtime()
                 self._task = asyncio.create_task(self._execute(request, run, camerawork))
+                log_event(
+                    "info",
+                    "cruise.run.started",
+                    run_id=run.id,
+                    map_name=run.map_name,
+                    point_count=len(run.segments),
+                    recording=request.record,
+                    auto_camerawork=request.auto_camerawork,
+                )
                 await self.events.publish("CRUISE_STARTED", run.model_dump(mode="json"))
                 return run, validation
             finally:
@@ -382,6 +408,11 @@ class CruiseService:
 
             session = await self.capture.start(request.title)
             run.capture_session_id = session.id
+            self._origin_monotonic = time.monotonic()
+            self._capture_visit = None
+            observer = getattr(self.robot, "set_capture_observer", None)
+            if callable(observer):
+                observer(lambda event: self._observe_recording(run, session, event))
 
             if request.record:
                 try:
@@ -393,13 +424,20 @@ class CruiseService:
                     recording_start_rejected = True
                     raise
                 self.capture.remember_pending_media(session, recording_state.media_url)
-            # Every timestamp on this run is seconds from here, so markers line up with the
-            # start of the recorded file rather than with wall-clock time.
-            self._origin_monotonic = time.monotonic()
+                try:
+                    self.capture.remember_recording_clock(session, confirmation_delay_seconds=self._elapsed(),
+                                                         quality="application_estimate")
+                except OSError:
+                    run.warnings.append("录制对时信息暂存失败；完整视频仍会保存")
             if camerawork is not None:
                 self._initialize_camerawork_schedule(camerawork)
+                generation = self._cw_generation
                 self._cw_runner_task = asyncio.create_task(
-                    self._run_camerawork(camerawork, self._cw_runner_stop)
+                    self._run_owned_camerawork(
+                        camerawork,
+                        self._cw_runner_stop,
+                        generation,
+                    )
                 )
 
             if request.auto_camerawork and request.record:
@@ -428,14 +466,18 @@ class CruiseService:
             run.status = "failed"
             run.error = str(exc)
         finally:
-            await self._stop_camerawork_runner()
+            camerawork_quiesced = await self._stop_camerawork_runner()
             await self._finish(
                 request,
                 run,
                 camerawork,
                 recording_start_rejected,
                 recording_start_attempted,
+                camerawork_quiesced,
             )
+            observer = getattr(self.robot, "set_capture_observer", None)
+            if callable(observer):
+                observer(None)
 
     async def _run_segment(
         self,
@@ -444,6 +486,7 @@ class CruiseService:
         segment: CruiseSegment,
         camerawork: CameraworkConfig | None,
     ) -> None:
+        self._capture_visit = segment
         if camerawork is not None and not await self._begin_camerawork_transit():
             segment.status = "skipped"
             segment.departed_at_seconds = self._elapsed()
@@ -458,6 +501,14 @@ class CruiseService:
         # after the operator cancels would be irreversible.
         segment.status = "navigating"
         segment.transit_start_seconds = self._elapsed()
+        log_event(
+            "info",
+            "cruise.point.dispatched",
+            run_id=run.id,
+            point_index=segment.index,
+            path_name=segment.path_name,
+            goal_id=segment.goal_id,
+        )
         await self._publish_segment("CRUISE_POINT_DISPATCHED", run, segment)
         try:
             result = await self.robot.set_goal(
@@ -468,6 +519,7 @@ class CruiseService:
                 )
             )
         except ConnectionError:
+            self._record_capture_transition(run, "navigation_uncertain")
             # The robot is gone; failing every remaining point one by one would be noise.
             if camerawork is not None:
                 self._set_camerawork_stationary(True)
@@ -479,12 +531,29 @@ class CruiseService:
             return
 
         if not _goal_accepted(result):
+            self._record_capture_transition(run, "goal_rejected")
             if camerawork is not None:
                 self._set_camerawork_stationary(True)
             await self._fail_segment(run, segment, "Robot rejected the goal (goal_check false)")
             return
 
+        self._record_capture_transition(run, "goal_accepted")
+
+        log_event(
+            "info",
+            "cruise.point.arrival_wait.started",
+            run_id=run.id,
+            point_index=segment.index,
+            timeout_seconds=_ARRIVAL_TIMEOUT_SECONDS,
+        )
         arrival = await self._await_arrival(_ARRIVAL_TIMEOUT_SECONDS)
+        log_event(
+            "info",
+            "cruise.point.arrival_wait.finished",
+            run_id=run.id,
+            point_index=segment.index,
+            result=arrival,
+        )
         if camerawork is not None:
             # Preserve the current phase and in-flight target. The one route-wide runner merely
             # learns that zoom is now safe; it does not redraw a target at the arrival boundary.
@@ -498,7 +567,8 @@ class CruiseService:
             return
 
         segment.status = "arrived"
-        segment.arrived_at_seconds = self._elapsed()
+        segment.arrived_at_seconds = segment.arrived_at_seconds if segment.arrived_at_seconds is not None else self._elapsed()
+        self._record_capture_transition(run, "goal_done")
         marker = await self.capture.add_marker(
             segment.arrived_at_seconds,
             f"{segment.path_name}#{segment.goal_id}",
@@ -584,17 +654,92 @@ class CruiseService:
             self._set_camerawork_stationary(False)
             return True
 
-    async def _stop_camerawork_runner(self) -> None:
+    async def _stop_camerawork_runner(self) -> bool:
+        """Retire the route-wide camera owner and report whether it actually exited."""
         task = self._cw_runner_task
         self._cw_runner_task = None
         if task is None:
-            return
+            return True
+        # Revoke physical-command and state-mutation ownership, then wake every cooperative wait.
+        # Do not cancel here: cancelling while HardwareRobotAdapter is inside websocket.send()
+        # deliberately closes the transport because the frame may be partial. That would make
+        # the following recording Stop race a reconnect. Once an in-flight command returns, each
+        # production checkpoint sees the stale generation and exits without another command.
+        self._cw_generation += 1
         self._cw_runner_stop.set()
         self._cw_base_state_changed.set()
-        if not task.done():
-            task.cancel()
-        with suppress(asyncio.CancelledError, Exception):
-            await task
+        done, _pending = await asyncio.wait(
+            {task},
+            timeout=_CW_RUNNER_STOP_TIMEOUT_SECONDS,
+        )
+        if task in done:
+            with suppress(asyncio.CancelledError, Exception):
+                task.result()
+            return True
+        # Camera motion must never own the recording lifecycle. Keep the retired task detached
+        # (and deliberately uncancelled) so a wedged/slow send cannot tear down the shared socket
+        # immediately before finalization sends recording Stop.
+        log_event(
+            "error",
+            "cruise.camerawork.stop_timeout",
+            run_id=self._run.id if self._run else None,
+            timeout_seconds=_CW_RUNNER_STOP_TIMEOUT_SECONDS,
+        )
+        task.add_done_callback(_consume_background_task)
+        return False
+
+    async def _return_to_final_anchor(self, config: CameraworkConfig) -> None:
+        """Issue the post-capture resting command without letting it own run completion."""
+        generation = self._cw_generation
+
+        async def command() -> None:
+            owner = self._cw_owner_generation.set(generation)
+            try:
+                await self._return_to_anchor(config, wait=False)
+            finally:
+                self._cw_owner_generation.reset(owner)
+
+        task = asyncio.create_task(command())
+        done, _pending = await asyncio.wait(
+            {task},
+            timeout=_FINAL_ANCHOR_TIMEOUT_SECONDS,
+        )
+        if task in done:
+            with suppress(asyncio.CancelledError, Exception):
+                task.result()
+            return
+
+        # Revoke ownership before detaching. A transport that suppresses cancellation may finish
+        # its already-written command later, but it cannot update this or a subsequent run.
+        self._cw_generation += 1
+        task.cancel()
+        task.add_done_callback(_consume_background_task)
+        log_event(
+            "error",
+            "cruise.camerawork.final_anchor_timeout",
+            run_id=self._run.id if self._run else None,
+            timeout_seconds=_FINAL_ANCHOR_TIMEOUT_SECONDS,
+        )
+
+    async def _run_owned_camerawork(
+        self,
+        config: CameraworkConfig,
+        stop_requested: asyncio.Event,
+        generation: int,
+    ) -> None:
+        owner = self._cw_owner_generation.set(generation)
+        try:
+            await self._run_camerawork(config, stop_requested)
+        finally:
+            self._cw_owner_generation.reset(owner)
+
+    def _camerawork_owner_is_current(self) -> bool:
+        """Direct lifecycle calls are allowed; retired runner tasks are not."""
+        owner_context = getattr(self, "_cw_owner_generation", None)
+        if owner_context is None:
+            return True
+        owner = owner_context.get()
+        return owner is None or owner == self._cw_generation
 
     @staticmethod
     def _axis_halves(low: int, high: int) -> tuple[tuple[int, int], tuple[int, int]]:
@@ -741,7 +886,7 @@ class CruiseService:
         observed = False
         last_revision = after_revision
         while time.monotonic() < deadline:
-            if self._cancel.is_set():
+            if not self._camerawork_owner_is_current() or self._cancel.is_set():
                 return False, observed
             yaw = self.robot.heartbeat_yaw()
             pitch = self._heartbeat_pitch()
@@ -785,16 +930,22 @@ class CruiseService:
         start_yaw = self._current_yaw(config)
         start_pitch = self._current_pitch(config)
         target_yaw, target_pitch = target
+        if not self._camerawork_owner_is_current():
+            return False
         command = GimbalMoveRequest(
             yaw_start=start_yaw, yaw_end=target_yaw, yaw_speed=speed,
             pitch_start=start_pitch, pitch_end=target_pitch, pitch_speed=speed,
             zoom_start=self._cw_zoom, zoom_end=self._cw_zoom,
         )
         try:
+            if not self._camerawork_owner_is_current():
+                return False
             await self.robot.set_gimbal(command, context=context)
         except ConnectionError:
             raise
         except Exception:
+            return False
+        if not self._camerawork_owner_is_current():
             return False
         # Capture the boundary after the command is written so no pre-command heartbeat can
         # be mistaken for feedback to this target.
@@ -811,7 +962,7 @@ class CruiseService:
             budget,
             after_revision=heartbeat_revision,
         )
-        return not self._cancel.is_set()
+        return self._camerawork_owner_is_current() and not self._cancel.is_set()
 
     async def _run_camerawork(
         self,
@@ -821,7 +972,11 @@ class CruiseService:
         """Own gimbal targets for the complete recording, across travel and point dwell."""
         if self._cw_phase is None:
             self._initialize_camerawork_schedule(config)
-        while not self._cancel.is_set() and not stop_requested.is_set():
+        while (
+            self._camerawork_owner_is_current()
+            and not self._cancel.is_set()
+            and not stop_requested.is_set()
+        ):
             now = time.monotonic()
             if now >= self._cw_phase_deadline:
                 # A leg that began inside the roam budget always gets its complete physical/
@@ -844,6 +999,8 @@ class CruiseService:
                         if self._cw_base_stationary else "cruise_moving"
                     ),
                 )
+                if not self._camerawork_owner_is_current():
+                    return
                 if not moved:
                     await self._wait_for_camerawork_boundary(
                         min(
@@ -864,6 +1021,8 @@ class CruiseService:
                         if self._cw_base_stationary else "cruise_moving"
                     ),
                 )
+                if not self._camerawork_owner_is_current():
+                    return
                 if moved:
                     self._cw_anchor_commanded = True
                     # This is the only place the N±30% anchor timer starts. The preceding
@@ -889,6 +1048,8 @@ class CruiseService:
                     config,
                     deadline=zoom_deadline,
                 )
+                if not self._camerawork_owner_is_current():
+                    return
                 if handled:
                     self._cw_anchor_zoomed = True
                 else:
@@ -911,9 +1072,12 @@ class CruiseService:
         stop_requested: asyncio.Event,
     ) -> None:
         """Wait for a phase edge while remaining interruptible by arrival or cancellation."""
+        if not self._camerawork_owner_is_current():
+            return
+        base_state_changed = self._cw_base_state_changed
         local_stop = asyncio.create_task(stop_requested.wait())
         canceled = asyncio.create_task(self._cancel.wait())
-        base_changed = asyncio.create_task(self._cw_base_state_changed.wait())
+        base_changed = asyncio.create_task(base_state_changed.wait())
         try:
             await asyncio.wait(
                 {local_stop, canceled, base_changed},
@@ -922,7 +1086,7 @@ class CruiseService:
             )
         finally:
             if base_changed.done():
-                self._cw_base_state_changed.clear()
+                base_state_changed.clear()
             for task in (local_stop, canceled, base_changed):
                 if not task.done():
                     task.cancel()
@@ -944,6 +1108,8 @@ class CruiseService:
     ) -> bool:
         """Confirm the anchor and fit a complete zoom-out/return inside the parked window."""
         async with self._cw_stationary_zoom_lock:
+            if not self._camerawork_owner_is_current():
+                return False
             # The base can become moving while this coroutine is waiting to acquire ownership.
             # Re-check inside the gate so a stale stationary observation cannot emit a zoom.
             if not self._cw_base_stationary:
@@ -957,10 +1123,10 @@ class CruiseService:
         deadline: float,
     ) -> bool:
         """Run one stationary-only anchor/zoom cycle while holding the transit gate."""
-        if deadline <= time.monotonic():
+        if not self._camerawork_owner_is_current() or deadline <= time.monotonic():
             return False
         anchored = await self._return_to_anchor(config, deadline=deadline)
-        if self._cancel.is_set():
+        if not self._camerawork_owner_is_current() or self._cancel.is_set():
             return False
         if not anchored:
             # Keep the last command pointed at the anchor, but do not add zoom motion to a pose
@@ -987,6 +1153,8 @@ class CruiseService:
 
         zoom_target = self._parked_zoom_target(config)
         try:
+            if not self._camerawork_owner_is_current():
+                return False
             await self.robot.set_gimbal(
                 GimbalMoveRequest(
                     yaw_start=config.anchor_yaw, yaw_end=config.anchor_yaw,
@@ -1003,6 +1171,8 @@ class CruiseService:
             with suppress(Exception):
                 await self._return_to_anchor(config, wait=False)
             return False
+        if not self._camerawork_owner_is_current():
+            return False
         self._cw_yaw = config.anchor_yaw
         self._cw_pitch = config.anchor_pitch
         self._cw_zoom = zoom_target
@@ -1010,7 +1180,7 @@ class CruiseService:
             min(_CW_ZOOM_SETTLE_SECONDS, max(0.0, deadline - time.monotonic())),
             self._cw_runner_stop,
         )
-        if self._cancel.is_set():
+        if not self._camerawork_owner_is_current() or self._cancel.is_set():
             return False
         if not self._cw_base_stationary or deadline <= time.monotonic():
             # Departure or an unexpectedly slow command must not leave zoom away from its anchor.
@@ -1018,6 +1188,8 @@ class CruiseService:
                 await self._return_to_anchor(config, wait=False)
             return True
         returned = await self._return_to_anchor(config, deadline=deadline)
+        if not self._camerawork_owner_is_current():
+            return False
         if not returned:
             with suppress(Exception):
                 await self._return_to_anchor(config, wait=False)
@@ -1034,6 +1206,8 @@ class CruiseService:
         attempts = 2 if wait else 1
         ever_observed_conflict = False
         for attempt in range(attempts):
+            if not self._camerawork_owner_is_current():
+                return False
             if wait and deadline <= time.monotonic():
                 return False
             start_yaw = self._current_yaw(config)
@@ -1048,6 +1222,8 @@ class CruiseService:
                 ),
                 context="cruise_stationary_anchor",
             )
+            if not self._camerawork_owner_is_current():
+                return False
             # This boundary must be taken after the command reaches the adapter. It excludes
             # any heartbeat that raced in before the new target was actually written.
             heartbeat_revision = self._heartbeat_revision()
@@ -1070,6 +1246,8 @@ class CruiseService:
                 budget,
                 after_revision=heartbeat_revision,
             )
+            if not self._camerawork_owner_is_current():
+                return False
             if start_zoom != config.anchor_zoom:
                 remaining_zoom = _CW_ZOOM_SETTLE_SECONDS - (time.monotonic() - started)
                 if remaining_zoom > 0:
@@ -1117,6 +1295,7 @@ class CruiseService:
         """
         segment.status = "failed"
         segment.error = error
+        self._record_capture_transition(run, "navigation_uncertain")
         segment.departed_at_seconds = self._elapsed()
         marker = await self.capture.add_marker(
             segment.transit_start_seconds
@@ -1135,6 +1314,7 @@ class CruiseService:
         camerawork: CameraworkConfig | None,
         recording_start_rejected: bool = False,
         recording_start_attempted: bool = True,
+        camerawork_quiesced: bool = True,
     ) -> None:
         for segment in run.segments:
             if segment.status in {"pending", "navigating"}:
@@ -1177,10 +1357,30 @@ class CruiseService:
                     self.capture.remember_pending_media(session, media_url)
 
             try:
+                log_event(
+                    "info",
+                    "cruise.recording.finalize.started",
+                    run_id=run.id,
+                )
                 state = await self.robot.finalize_capture_recording(
                     on_media_url=remember_final_url,
                 )
+                log_event(
+                    "info",
+                    "cruise.recording.finalize.finished",
+                    run_id=run.id,
+                    recording=state.recording,
+                    has_media_url=bool(state.media_url),
+                    has_local_file=bool(state.media_local_path),
+                    media_sync_error=state.media_sync_error,
+                )
             except Exception as exc:
+                log_event(
+                    "error",
+                    "cruise.recording.finalize.failed",
+                    run_id=run.id,
+                    error=str(exc),
+                )
                 run.error = run.error or f"Stop recording failed: {exc}"
                 run.status = "failed"
                 with suppress(Exception):
@@ -1202,9 +1402,9 @@ class CruiseService:
                     run.error = run.error or str(exc)
                     run.warnings.append("待保存视频地址暂存失败")
 
-        # The anchor is the physical resting pose, but it is not unbudgeted footage.  Return only
+        # The anchor is the physical resting pose, but it is not unbudgeted footage. Return only
         # after Stop is confirmed (or when this run never recorded), so even a 0% anchor share is
-        # respected by the complete recorded file.  If Stop is still ambiguous, leave the camera
+        # respected by the complete recorded file. If Stop is still ambiguous, leave the camera
         # untouched rather than contaminating a recording that may still be active.
         recording_is_stopped = (
             not request.record
@@ -1216,9 +1416,6 @@ class CruiseService:
                 and self._recording_status_known()
             )
         )
-        if camerawork is not None and recording_is_stopped:
-            with suppress(Exception):
-                await self._return_to_anchor(camerawork, wait=not self._cancel.is_set())
 
         if request.record and not run.media_local_path:
             run.error = run.error or media_sync_error or "录制文件尚未保存到本地"
@@ -1226,7 +1423,7 @@ class CruiseService:
 
         # Stopped on the robot is not the same as safely finalized on the desktop. Attach the
         # point/gimbal sidecars first; only then may the session disappear from recovery UI.
-        if request.record and run.media_local_path:
+        if request.record and run.media_local_path and recording_is_stopped:
             try:
                 completed = await self.capture.complete_with_recording(
                     run.media_local_path,
@@ -1248,9 +1445,32 @@ class CruiseService:
         elif request.record:
             # The spans are the whole reason editing can tell a parked shot from a moving one.
             # No local file means they cannot be attached yet, so keep the session recoverable.
-            run.warnings.append("录制文件未同步到本地，点位信息未能写入")
+            if recording_is_stopped:
+                run.warnings.append(
+                    "录制文件未同步到本地，点位信息未能写入；拍摄会话已保留以便重试"
+                )
+            else:
+                run.warnings.append(
+                    "录制尚未确认停止，或文件未同步到本地；拍摄会话已保留以便重试"
+                )
+
+        # Capture lifecycle always wins over cosmetic resting position. Closing (or preserving)
+        # the recovery session first prevents a wedged gimbal transport from leaving the UI and
+        # recording lifecycle open. A runner that did not stop may still own the adapter gate, so
+        # do not compete with it. Even after a clean stop, the one-way final command is bounded.
+        if camerawork is not None and recording_is_stopped and camerawork_quiesced:
+            await self._return_to_final_anchor(camerawork)
 
         run.ended_at = utc_now()
+        log_event(
+            "info",
+            "cruise.run.finished",
+            run_id=run.id,
+            status=run.status,
+            error=run.error,
+            warnings=run.warnings,
+            has_local_file=bool(run.media_local_path),
+        )
         event = {
             "canceled": "CRUISE_CANCELED",
             "failed": "CRUISE_FAILED",
@@ -1258,10 +1478,58 @@ class CruiseService:
         await self.events.publish(event, run.model_dump(mode="json"))
 
     async def _publish_segment(self, event: str, run: CruiseRun, segment: CruiseSegment) -> None:
+        session = self.capture.active_session()
+        if session is not None and session.id == run.capture_session_id:
+            try:
+                self.capture.remember_segments(session, run.segments)
+            except OSError:
+                warning = "点位过程暂存失败；停止录制时会重试保存"
+                if warning not in run.warnings:
+                    run.warnings.append(warning)
         await self.events.publish(
             event,
             {"run_id": run.id, "segment": segment.model_dump(mode="json")},
         )
+
+    def _record_capture_transition(self, run: CruiseRun, kind: str) -> None:
+        session = self.capture.active_session()
+        if session is not None and session.id == run.capture_session_id:
+            self._observe_recording(run, session, {"type": kind, "monotonic": time.monotonic()})
+
+    def _observe_recording(self, run: CruiseRun, session, event: dict) -> None:
+        kind = event["type"]
+        if kind == "record_write":
+            self._origin_monotonic = event["monotonic"]
+            session.recording_clock.update(origin="record_write_estimate", quality="application_estimate")
+        segment = self._capture_visit
+        if (
+            kind.startswith("goal_")
+            and event.get("path_name") is not None
+            and (
+                segment is None
+                or (segment.path_name, segment.goal_id)
+                != (event["path_name"], event.get("goal_id"))
+            )
+        ):
+            return
+        index = segment.index if segment else None
+        if any(e["type"] == kind and e.get("visit_index") == index for e in session.recording_events):
+            return
+        seconds = max(0.0, event["monotonic"] - self._origin_monotonic)
+        if segment is not None:
+            if kind == "goal_write":
+                segment.transit_start_seconds = seconds
+            elif kind == "goal_done":
+                segment.arrived_at_seconds = seconds
+        try:
+            self.capture.remember_recording_event(session, {
+                "type": kind, "seconds": seconds, "visit_index": index,
+                "sequence": len(session.recording_events),
+            })
+        except OSError:
+            warning = "拍摄分段事件暂存失败；停止录制时会重试保存"
+            if warning not in run.warnings:
+                run.warnings.append(warning)
 
     def _recording_status_known(self) -> bool:
         reader = getattr(self.robot, "recording_status_known", None)

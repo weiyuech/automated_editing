@@ -14,6 +14,7 @@ from automated_video_editing_backend.core.models import (
     CameraAngle,
     CameraworkConfig,
     CameraworkPreferenceSaveRequest,
+    CaptureSelection,
     CruiseRequest,
     CruiseRouteSaveRequest,
     EditBatchRequest,
@@ -66,6 +67,7 @@ class DownloadMediaRequest(BaseModel):
 class EditingCapabilityRequest(BaseModel):
     media_ids: list[str] = Field(default_factory=list, max_length=20)
     music_media_ids: list[str] = Field(default_factory=list, max_length=100)
+    capture_selections: list[CaptureSelection] = Field(default_factory=list, max_length=20)
 
 
 class CaptureStartRequest(BaseModel):
@@ -89,6 +91,11 @@ class MediaPoolUpdateRequest(BaseModel):
     music_media_ids: list[str] = Field(default_factory=list, max_length=10_000)
     voiceover_media_ids: list[str] = Field(default_factory=list, max_length=10_000)
     effect_media_ids: list[str] = Field(default_factory=list, max_length=10_000)
+    capture_selections: list[CaptureSelection] | None = Field(default=None, max_length=10_000)
+
+
+class CaptureRegenerateRequest(BaseModel):
+    offset_seconds: float | None = Field(default=None, ge=-120, le=120, allow_inf_nan=False)
 
 
 class MediaTrashPreflightRequest(BaseModel):
@@ -208,6 +215,14 @@ def build_router(
         if capture.active_session() is not None:
             raise HTTPException(status_code=409, detail="原地采集正在进行，请使用采集停止操作")
 
+    def recording_idle_confirmed(state) -> bool:
+        reader = getattr(robot, "recording_idle_confirmed", None)
+        if callable(reader):
+            return bool(reader())
+        known_reader = getattr(robot, "recording_status_known", None)
+        known = bool(known_reader()) if callable(known_reader) else True
+        return bool(known and not state.recording)
+
     async def close_capture_if_robot_confirmed_idle() -> None:
         try:
             state = await robot.status()
@@ -221,7 +236,7 @@ def build_router(
                 state.media_sync_error,
                 state.media_local_path,
             )
-        if state.recording or not state.media_local_path:
+        if not recording_idle_confirmed(state) or not state.media_local_path:
             return
         await capture.complete_with_recording(state.media_local_path)
 
@@ -473,6 +488,11 @@ def build_router(
                 state.media_local_path,
             )
         if state.media_local_path:
+            if not recording_idle_confirmed(state):
+                raise HTTPException(
+                    status_code=503,
+                    detail="尚未确认机器人已停止录制，拍摄会话已保留",
+                )
             try:
                 session = await capture.complete_with_recording(state.media_local_path)
             except OSError as exc:
@@ -607,6 +627,14 @@ def build_router(
     async def media_cleanup_safe(_: Secured = None):
         return vault.safe_cleanup()
 
+    @router.post("/media/captures/{capture_id}/regenerate")
+    async def capture_regenerate(capture_id: str, request: CaptureRegenerateRequest, _: Secured = None):
+        try:
+            media.captures.retry(capture_id, request.offset_seconds)
+            return {"status": "pending"}
+        except (ValueError, KeyError, OSError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
     @router.post("/media/trash-preflight")
     async def media_trash_preflight(
         request: MediaTrashPreflightRequest, _: Secured = None
@@ -673,7 +701,10 @@ def build_router(
 
     @router.post("/editing/capabilities")
     async def editing_capabilities(request: EditingCapabilityRequest, _: Secured = None):
-        return await jobs.editing_capabilities(request.media_ids, request.music_media_ids)
+        try:
+            return await jobs.editing_capabilities(request.media_ids, request.music_media_ids, request.capture_selections)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @router.post("/jobs")
     async def jobs_create(request: EditJobRequest, _: Secured = None):

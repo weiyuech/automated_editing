@@ -39,6 +39,15 @@ ALLOWED_COMMANDS = {
 }
 
 
+def _recording_idle_confirmed(robot: Any, state: Any) -> bool:
+    reader = getattr(robot, "recording_idle_confirmed", None)
+    if callable(reader):
+        return bool(reader())
+    known_reader = getattr(robot, "recording_status_known", None)
+    known = bool(known_reader()) if callable(known_reader) else True
+    return bool(known and not state.recording)
+
+
 async def websocket_endpoint(
     websocket: WebSocket,
     events: EventHub,
@@ -173,7 +182,7 @@ async def _handle_command(
                         current.media_sync_error,
                         current.media_local_path,
                     )
-                if not current.recording and current.media_local_path:
+                if _recording_idle_confirmed(robot, current) and current.media_local_path:
                     await capture.complete_with_recording(current.media_local_path)
             raise
         except Exception:
@@ -190,7 +199,7 @@ async def _handle_command(
                         current.media_sync_error,
                         current.media_local_path,
                     )
-                if not current.recording and current.media_local_path:
+                if _recording_idle_confirmed(robot, current) and current.media_local_path:
                     await capture.complete_with_recording(current.media_local_path)
             raise
         session = capture.active_session()
@@ -202,6 +211,8 @@ async def _handle_command(
                 state.media_local_path,
             )
         if state.media_local_path:
+            if not _recording_idle_confirmed(robot, state):
+                raise RuntimeError("尚未确认机器人已停止录制，拍摄会话已保留")
             session = await capture.complete_with_recording(state.media_local_path)
         payload = session.model_dump(mode="json") if session else {}
         payload.update(

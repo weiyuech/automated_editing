@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
@@ -44,6 +45,14 @@ _RECORDING_LATE_REPLY_GRACE_SECONDS = 8.0
 _RECORDING_SHUTDOWN_TIMEOUT_SECONDS = 18.0
 _MAP_SWITCH_CONFIRM_TIMEOUT_SECONDS = 10.0
 _MAP_SWITCH_CONFIRM_POLL_SECONDS = 0.1
+_WEBSOCKET_SEND_TIMEOUT_SECONDS = 5.0
+_WEBSOCKET_CLOSE_AFTER_SEND_TIMEOUT_SECONDS = 2.0
+_GIMBAL_PREVIOUS_COMMAND_WAIT_SECONDS = 2.0
+_GIMBAL_COMMAND_SETTLE_MARGIN_SECONDS = 1.0
+_GIMBAL_COMMAND_MAX_BUDGET_SECONDS = 120.0
+_RECORDING_TRANSITIONAL_HEARTBEAT_LIMIT = 2
+_RECORDING_TRANSITIONAL_HEARTBEAT_GRACE_SECONDS = 3.0
+_RECORDING_STOP_METADATA_GRACE_SECONDS = 5.0
 
 
 class _ReplyDeadlineExpired(Exception):
@@ -140,6 +149,15 @@ class HardwareRobotAdapter(RobotAdapter):
         self._connection_task: asyncio.Task[None] | None = None
         self._request_lock = asyncio.Lock()
         self._send_lock = asyncio.Lock()
+        # Gimbal replies are asynchronous (`busy`, then `ok`) and carry no request id.  Keep the
+        # next camera command behind the prior command's terminal reply so slow sweeps cannot be
+        # overwritten by a pile of optimistic targets.
+        self._gimbal_command_lock = asyncio.Lock()
+        self._gimbal_ready = asyncio.Event()
+        self._gimbal_ready.set()
+        self._gimbal_inflight = False
+        self._gimbal_release_deadline = 0.0
+        self._gimbal_terminal_replies_trusted = True
         # Recording acknowledgements have no request id. Serialize the whole request -> state
         # commit boundary so a later opposite command cannot start while the prior caller is
         # still applying its accepted reply.
@@ -149,6 +167,12 @@ class HardwareRobotAdapter(RobotAdapter):
         # concurrent caller can make an old heartbeat resolve a goal that has not been sent.
         self._goal_lock = asyncio.Lock()
         self._pending: dict[str, asyncio.Future[Any]] = {}
+        # A protocol reply has no request id, so the response key alone is not enough after a
+        # reconnect. Bind every waiter to the socket generation that performed its write.
+        # ``None`` means the request is registered but has not crossed a socket write boundary.
+        # A concurrently failing older transport must not fail such a queued request; it may
+        # reconnect and bind itself to the replacement socket immediately before its write.
+        self._pending_connection_epochs: dict[str, int | None] = {}
         # Some protocol operations share one top-level response key. Keep the matcher beside
         # the future so, for example, a delayed Start reply cannot complete a later Stop wait.
         self._pending_reply_matchers: dict[str, Callable[[Any], bool]] = {}
@@ -164,6 +188,13 @@ class HardwareRobotAdapter(RobotAdapter):
         self._heartbeat_yaw_pending = False
         self._heartbeat_pitch_pending = False
         self._pending_goal_attempt: GoalCommandAttemptDiagnostic | None = None
+        # Keep the latest *single-frame* map readiness proof independently from the general
+        # diagnostic heartbeat. Gimbal/task-only frames arrive much more frequently and must
+        # not erase a coherent system+map+navigation report while map confirmation polls it.
+        self._latest_complete_map_heartbeat: RobotHeartbeatDiagnostic | None = None
+        # Incremented whenever a socket is installed or retired. Frames and accepted manual map
+        # switches from an older physical connection cannot own work on its replacement.
+        self._connection_epoch = 0
         # Photo and video replies share RobotState.media_url. Keep the active recording URL
         # separately so an in-recording photo cannot become the fallback for video stop.
         self._recording_media_url: str | None = None
@@ -176,13 +207,41 @@ class HardwareRobotAdapter(RobotAdapter):
         # are refused until a matching reply or authoritative heartbeat resolves it.
         self._recording_command_revision = 0
         self._recording_reply_recovery: tuple[int, str] | None = None
+        # The receiver commits a matched recording reply before waking its caller. This closes
+        # the cancellation gap between ``future.set_result`` and the waiting coroutine resuming.
+        self._pending_recording_reply: (
+            tuple[asyncio.Future[Any], int, str, int | None] | None
+        ) = None
+        self._committed_recording_reply: tuple[int, str, bool] | None = None
+        # A reply can be bundled with (or immediately followed by) a transitional heartbeat.
+        # Until hardware reports the commanded state (or a newer command supersedes it), an
+        # opposite transitional record_status must not undo that acknowledgement.
+        self._recording_heartbeat_guard: tuple[int, str, bool, int] | None = None
+        self._recording_heartbeat_conflict_count = 0
+        self._recording_heartbeat_conflict_state: bool | None = None
+        self._recording_heartbeat_conflict_deadline = 0.0
+        # Once Start is accepted, idle telemetry alone is never enough to prove safety. This
+        # latch is released only by an accepted Stop (or causal idle recovery after a written
+        # Stop), preventing any number of queued pre-Start heartbeats from skipping final Stop.
+        self._recording_stop_required = False
+        # An idle heartbeat can prove an ambiguous Stop physically completed before the Stop ACK
+        # supplies its URL. Keep ownership while the bounded metadata wait is active.
+        self._late_stop_metadata_owner: tuple[int, int] | None = None
+        self._late_stop_metadata_event = asyncio.Event()
         # A cancellation is ambiguous only once execution has reached the physical socket write.
         # Keep this separate from the operation revision: a task can be cancelled while queued
         # behind another request, in which case no recording command was sent and no recovery or
         # compensating Stop is safe.
         self._recording_write_attempt_revision: int | None = None
+        self._recording_write_attempt_epoch: int | None = None
         self._recording_compensation_task: asyncio.Task[None] | None = None
         self._last_shutdown_recording_confirmed_idle = True
+        # Retain every semantic heartbeat transition, while sampling unchanged high-rate pose
+        # frames once per second with a suppression count. This keeps field logs useful without
+        # letting telemetry volume dominate the Electron log.
+        self._last_heartbeat_log_signature: str | None = None
+        self._last_heartbeat_log_monotonic = 0.0
+        self._suppressed_heartbeat_logs = 0
 
     async def configure_websocket_url(self, websocket_url: str) -> RobotState:
         next_url = websocket_url.strip()
@@ -193,7 +252,7 @@ class HardwareRobotAdapter(RobotAdapter):
 
         if self.recording_operation_pending():
             raise ValueError("上一条录制指令仍在确认中，暂时不能更改机器人连接")
-        if self.state.recording:
+        if self.state.recording or self._recording_stop_required:
             raise ValueError("录制进行中，无法更改机器人连接")
 
         await self._stop_connection_loop()
@@ -232,10 +291,11 @@ class HardwareRobotAdapter(RobotAdapter):
         return self.state
 
     async def disconnect(self) -> RobotState:
-        if self.state.recording:
-            raise ValueError("机器人仍在录制，请先停止录制再断开连接")
+        self._expire_recording_heartbeat_conflict()
         if self.recording_operation_pending():
             raise ValueError("上一条录制指令仍在确认中，暂时不能断开机器人连接")
+        if self.state.recording or self._recording_stop_required:
+            raise ValueError("机器人仍在录制，请先停止录制再断开连接")
         await self._stop_connection_loop()
         self._recording_media_url = None
         self._recording_status_known = False
@@ -256,8 +316,10 @@ class HardwareRobotAdapter(RobotAdapter):
         """
         cleanup_error = ""
         cleanup_unconfirmed = False
+        self._expire_recording_heartbeat_conflict()
         cleanup_needed = (
             self.state.recording
+            or self._recording_stop_required
             or self.recording_operation_pending()
             or (require_idle and not self._recording_status_known)
         )
@@ -265,9 +327,12 @@ class HardwareRobotAdapter(RobotAdapter):
         try:
             async with asyncio.timeout(_RECORDING_SHUTDOWN_TIMEOUT_SECONDS):
                 async with self._recording_lock:
+                    self._expire_recording_heartbeat_conflict()
                     cleanup_needed = (
                         self.state.recording
+                        or self._recording_stop_required
                         or self._recording_reply_recovery is not None
+                        or self._recording_heartbeat_conflict_count > 0
                         or (require_idle and not self._recording_status_known)
                     )
                     self._last_shutdown_recording_confirmed_idle = not cleanup_needed
@@ -334,6 +399,7 @@ class HardwareRobotAdapter(RobotAdapter):
         return self._last_shutdown_recording_confirmed_idle
 
     async def status(self) -> RobotState:
+        self._expire_recording_heartbeat_conflict()
         if self.websocket_url:
             self._start_connection_loop()
         return self.state
@@ -344,7 +410,12 @@ class HardwareRobotAdapter(RobotAdapter):
 
     def recording_status_known(self) -> bool:
         """Whether recording/idle came from hardware rather than the model default."""
+        self._expire_recording_heartbeat_conflict()
         return self._recording_status_known
+
+    def recording_stop_required(self) -> bool:
+        """Whether a Start crossed the socket boundary without a confirmed later Stop."""
+        return self._recording_stop_required
 
     async def map_list(self) -> list[str]:
         response = await self._request({"get_map_list": "all"}, "robot_map_list")
@@ -413,6 +484,7 @@ class HardwareRobotAdapter(RobotAdapter):
             )
             self.state.goal_object = _maybe_str(response.get("goal_object") or command.goal_object)
             accepted = _truthy(response.get("goal_check"))
+            self._capture_event("goal_accepted" if accepted else "goal_rejected", command)
             self.state.goal_status = "going" if accepted else "failed"
             if accepted and self._pending_goal_attempt is not None:
                 attempt = self._finish_goal_attempt("accepted")
@@ -496,6 +568,14 @@ class HardwareRobotAdapter(RobotAdapter):
         """Monotonic revision, or None until both axes form one logical pose sample."""
         return self._heartbeat_revision
 
+    def complete_map_heartbeat(self) -> RobotHeartbeatDiagnostic | None:
+        """Newest coherent map-readiness report from one raw hardware frame."""
+        return self._latest_complete_map_heartbeat
+
+    def connection_generation(self) -> int:
+        """Physical websocket generation used to scope request and map ownership."""
+        return self._connection_epoch
+
     async def sweep_camera(
         self,
         target_yaw: float,
@@ -524,13 +604,27 @@ class HardwareRobotAdapter(RobotAdapter):
                 "zoom_end": 1,
             }
         }
-        await self._send(payload, context=context)
+        await self._send_gimbal(payload, context=context)
         self.state.last_command = "gimbal_control"
         self._touch()
         await self._publish_state()
         return self.state
 
+    def _capture_event(self, kind: str, command: RobotGoalCommand | None = None) -> None:
+        observer = getattr(self, "capture_observer", None)
+        if observer is None:
+            return
+        try:
+            observer({"type": kind, "monotonic": time.monotonic(),
+                      "path_name": command.path_name if command else None,
+                      "goal_id": command.goal_id if command else None})
+        except Exception as exc:
+            # Recording evidence must never prevent a stop or any protocol operation.
+            log_event("error", "capture.event.persist_failed", error=str(exc))
+
     def _arm_goal_tracking(self, command: RobotGoalCommand) -> None:
+        self._capture_goal_written = False
+        self._capture_going_seen = False
         self._pending_goal = command
         self._require_non_done = True
         self._arrival_result = None
@@ -541,10 +635,20 @@ class HardwareRobotAdapter(RobotAdapter):
         self._require_non_done = False
 
     def _resolve_arrival(self, status: str) -> None:
+        command = self._pending_goal
+        if command is not None and getattr(self, "_capture_goal_written", False):
+            self._capture_event("goal_" + status, command)
         self._pending_goal = None
         self._require_non_done = False
         self._arrival_result = status
         self._arrival_event.set()
+        log_event(
+            "info",
+            "robot.goal.arrival.accepted",
+            path_name=command.path_name if command else None,
+            goal_id=command.goal_id if command else None,
+            status=status,
+        )
 
     def _finish_goal_attempt(
         self,
@@ -572,16 +676,45 @@ class HardwareRobotAdapter(RobotAdapter):
         if self._pending_goal is None:
             return
         if _goal_identity_conflicts(task, self._pending_goal):
+            log_event(
+                "warning",
+                "robot.goal.arrival.ignored",
+                reason="identity_conflict",
+                expected_path=self._pending_goal.path_name,
+                expected_goal_id=self._pending_goal.goal_id,
+                reported_identity=_heartbeat_goal_identity(task),
+            )
+            return
+        if not getattr(self, "_capture_goal_written", False):
+            # set_goal arms ownership before it enters the serialized request/send path so stale
+            # terminal state cannot be attributed to the previous goal.  Heartbeats received in
+            # that queueing window are still pre-command evidence: they must not clear the stale
+            # state guard or complete the newly armed goal.
+            log_event(
+                "warning",
+                "robot.goal.arrival.ignored",
+                reason="command_not_written",
+                expected_path=self._pending_goal.path_name,
+                expected_goal_id=self._pending_goal.goal_id,
+                reported_identity=_heartbeat_goal_identity(task),
+                reported_status=_maybe_str(task.get("goal_status")),
+            )
             return
         explicit_current_identity = _goal_identity_is_explicit_match(task, self._pending_goal)
         goal_status = _normalize_failed(_maybe_str(task.get("goal_status")))
         if goal_status not in {"done", "failed"}:
+            if goal_status == "going" and getattr(self, "_capture_goal_written", False) and not getattr(self, "_capture_going_seen", False):
+                self._capture_going_seen = True
+                self._capture_event("goal_going", self._pending_goal)
             if goal_status is not None:
                 # A non-terminal report proves that subsequent terminal reports are not the
                 # cached result from the point we just left.
                 self._require_non_done = False
             return
         if self._require_non_done and not explicit_current_identity:
+            # A repeated bare ``done`` may simply be the previous point's cached heartbeat.
+            # Only an explicit current identity or a fresh non-terminal transition can prove
+            # ownership. The cruise-level timeout still guarantees recording finalization.
             return
         # Product decision: object recognition/alignment is telemetry only. It must never
         # block, fail, or delay a cruise point; navigation goal_status owns arrival.
@@ -615,7 +748,7 @@ class HardwareRobotAdapter(RobotAdapter):
                 "zoom_end": 1,
             }
         }
-        await self._send(payload, context="manual")
+        await self._send_gimbal(payload, context="manual")
         self.state.camera_angle = angle.angle
         self.state.yaw = angle.angle
         self.state.last_command = "gimbal_control"
@@ -643,7 +776,7 @@ class HardwareRobotAdapter(RobotAdapter):
                 "zoom_end": _gimbal_num(command.zoom_end),
             }
         }
-        await self._send(payload, context=context)
+        await self._send_gimbal(payload, context=context)
         self.state.camera_angle = command.yaw_end
         self.state.yaw = command.yaw_end
         self.state.pitch = command.pitch_end
@@ -652,37 +785,178 @@ class HardwareRobotAdapter(RobotAdapter):
         await self._publish_state()
         return self.state
 
+    def _reset_recording_heartbeat_conflict(self) -> None:
+        self._recording_heartbeat_conflict_count = 0
+        self._recording_heartbeat_conflict_state = None
+        self._recording_heartbeat_conflict_deadline = 0.0
+
+    def _expire_recording_heartbeat_conflict(self) -> bool:
+        """Resolve a lone transitional conflict without blocking lifecycle forever."""
+        reported_recording = self._recording_heartbeat_conflict_state
+        if (
+            self._recording_heartbeat_conflict_count <= 0
+            or reported_recording is None
+            or time.monotonic() < self._recording_heartbeat_conflict_deadline
+        ):
+            return False
+        guard = self._recording_heartbeat_guard
+        # A lone idle report immediately after an accepted Start can be the last pre-Start
+        # heartbeat. Never turn that ambiguity into a supposedly safe idle state: conservatively
+        # retain recording=true so every lifecycle/finalization path issues a Stop.
+        resolved_recording = bool(
+            reported_recording or (guard is not None and guard[1] == "start")
+        )
+        self.state.recording = resolved_recording
+        self._recording_heartbeat_guard = None
+        self._reset_recording_heartbeat_conflict()
+        self._recording_status_known = (
+            reported_recording and self._recording_reply_recovery is None
+        )
+        log_event(
+            "warning",
+            "robot.recording.heartbeat_override",
+            action=guard[1] if guard is not None else None,
+            revision=guard[0] if guard is not None else None,
+            reported_recording=reported_recording,
+            resolved_recording=resolved_recording,
+            reason="transitional_heartbeat_grace_expired",
+        )
+        return True
+
     def _begin_recording_operation(self, action: str) -> int:
-        if self._recording_reply_recovery is not None:
-            action_name = "开始录制" if action == "start" else "停止录制"
-            raise ValueError(
-                f"上一条录制指令仍在确认中，请等待机器人同步状态后再{action_name}"
-            )
+        self._expire_recording_heartbeat_conflict()
+        recovery = self._recording_reply_recovery
+        if recovery is not None:
+            # Start and Stop share one uncorrelated reply channel. A new Start can never safely
+            # supersede an older ambiguous operation. A Stop is different: once any Start has
+            # crossed the socket boundary, another ordered/idempotent Stop is the only safe
+            # target state. Advancing the revision also quarantines the older reply.
+            if action == "stop":
+                log_event(
+                    "warning",
+                    "robot.recording.recovery_superseded_by_stop",
+                    abandoned_revision=recovery[0],
+                    abandoned_action=recovery[1],
+                )
+                self._recording_reply_recovery = None
+            else:
+                action_name = "开始录制" if action == "start" else "停止录制"
+                raise ValueError(
+                    f"上一条录制指令仍在确认中，请等待机器人同步状态后再{action_name}"
+                )
+        if action == "start" and self._recording_heartbeat_conflict_count:
+            raise ValueError("正在等待机器人同步录制状态，请稍后再开始录制")
+        if action == "start" and self._recording_stop_required:
+            raise ValueError("上一段录制尚未确认停止，请先停止录制")
         self._recording_command_revision += 1
         revision = self._recording_command_revision
+        self._committed_recording_reply = None
+        self._recording_heartbeat_guard = None
+        self._reset_recording_heartbeat_conflict()
+        self._late_stop_metadata_owner = None
+        self._late_stop_metadata_event.clear()
         self._recording_write_attempt_revision = None
+        self._recording_write_attempt_epoch = None
         return revision
 
     def recording_operation_pending(self) -> bool:
         """Whether disconnect/reconfiguration could discard recording command ownership."""
+        self._expire_recording_heartbeat_conflict()
         compensation = self._recording_compensation_task
         return (
             self._recording_lock.locked()
             or self._recording_reply_recovery is not None
+            or self._recording_heartbeat_conflict_count > 0
             or (compensation is not None and not compensation.done())
         )
 
     def _abandon_recording_operation(self, revision: int, action: str) -> None:
         if revision != self._recording_command_revision:
             return
+        committed = self._committed_recording_reply
+        if committed is not None and committed[:2] == (revision, action):
+            if action == "start" and committed[2]:
+                # The reply reached the receiver before cancellation reached the waiter. The
+                # recording is real, but its caller is gone, so stop that orphan exactly once.
+                self._schedule_orphaned_recording_stop(revision)
+            return
         if self._recording_write_attempt_revision != revision:
             # Cancellation before socket.send is definitive: this operation did not reach the
             # robot, so a later heartbeat must not be interpreted as its result.
             return
         self._recording_reply_recovery = (revision, action)
+        if action == "stop" and self._recording_write_attempt_epoch is not None:
+            self._late_stop_metadata_owner = (
+                revision,
+                self._recording_write_attempt_epoch,
+            )
         # Until either the matching late reply or a heartbeat showing the command's resulting
         # state arrives, the process does not know whether the camera applied the command.
         self._recording_status_known = False
+
+    def _commit_recording_reply(
+        self,
+        revision: int,
+        action: str,
+        response: Any,
+        *,
+        require_echo: bool,
+        connection_epoch: int | None = None,
+    ) -> bool:
+        """Synchronously commit a reply while its generation still owns camera state."""
+        if revision != self._recording_command_revision or not isinstance(response, dict):
+            return False
+        committed = self._committed_recording_reply
+        if committed is not None and committed[:2] == (revision, action):
+            return True
+        response_action = _video_record_action(response)
+        if require_echo and (
+            response_action != action or response.get(action) != 0
+        ):
+            return False
+        if response_action is not None and response_action != action:
+            return False
+
+        success = _response_ok(response)
+        self._committed_recording_reply = (revision, action, success)
+        self._reset_recording_heartbeat_conflict()
+        self._recording_status_known = True
+        record_url = _maybe_str(response.get("url"))
+        reply_epoch = (
+            connection_epoch
+            if connection_epoch is not None
+            else self._recording_write_attempt_epoch
+            if self._recording_write_attempt_epoch is not None
+            else self._connection_epoch
+        )
+        if action == "start":
+            self.state.recording = success
+            self._recording_stop_required = success
+            if success:
+                self._recording_media_url = record_url
+                self.state.media_url = record_url
+                self.state.last_command = "video_record:start"
+        else:
+            self.state.recording = not success
+            if success:
+                self._recording_stop_required = False
+                self.state.media_url = record_url or self._recording_media_url
+                self._recording_media_url = None
+                self.state.last_command = "video_record:stop"
+                if not self.state.media_url:
+                    # Some firmware first acknowledges physical Stop with an empty URL and
+                    # repeats the same reply later once the file is finalized. Keep this
+                    # metadata ownership through the bounded finalization grace; physical
+                    # recording is already idle.
+                    self._late_stop_metadata_owner = (revision, reply_epoch)
+        if success:
+            self._recording_heartbeat_guard = (
+                revision,
+                action,
+                action == "start",
+                reply_epoch,
+            )
+        return True
 
     async def start_recording(self) -> RobotState:
         async with self._recording_lock:
@@ -697,6 +971,19 @@ class HardwareRobotAdapter(RobotAdapter):
                     "robot_video_record",
                     timeout_s=_RECORDING_REPLY_TIMEOUT_SECONDS,
                 )
+                self._commit_recording_reply(
+                    revision,
+                    "start",
+                    response,
+                    require_echo=False,
+                )
+                if not _response_ok(response):
+                    raise ValueError(
+                        f"机器人拒绝开始录制：{_response_error(response)}"
+                    )
+                self._touch()
+                await self._publish_state()
+                return self.state
             except RobotCommandNotSentError:
                 raise
             except asyncio.CancelledError:
@@ -705,18 +992,6 @@ class HardwareRobotAdapter(RobotAdapter):
             except Exception:
                 self._abandon_recording_operation(revision, "start")
                 raise
-            if not _response_ok(response):
-                self.state.recording = False
-                self._recording_status_known = True
-                raise ValueError(f"机器人拒绝开始录制：{_response_error(response)}")
-            self.state.recording = True
-            self._recording_status_known = True
-            self._recording_media_url = str(response.get("url") or "").strip() or None
-            self.state.media_url = self._recording_media_url
-            self.state.last_command = "video_record:start"
-            self._touch()
-            await self._publish_state()
-            return self.state
 
     async def _stop_recording_operation(self) -> RobotState:
         """Perform one serialized Stop; caller owns ``_recording_lock``."""
@@ -727,6 +1002,42 @@ class HardwareRobotAdapter(RobotAdapter):
                 "robot_video_record",
                 timeout_s=_RECORDING_REPLY_TIMEOUT_SECONDS,
             )
+            self._commit_recording_reply(
+                revision,
+                "stop",
+                response,
+                require_echo=False,
+            )
+            if not _response_ok(response):
+                raise ValueError(f"机器人拒绝停止录制：{_response_error(response)}")
+            if (
+                not self.state.media_url
+                and self._late_stop_metadata_owner is not None
+                and self._late_stop_metadata_owner[0] == revision
+            ):
+                log_event(
+                    "info",
+                    "robot.recording.metadata_wait_started",
+                    revision=revision,
+                    timeout_seconds=_RECORDING_STOP_METADATA_GRACE_SECONDS,
+                )
+                try:
+                    await asyncio.wait_for(
+                        self._late_stop_metadata_event.wait(),
+                        timeout=_RECORDING_STOP_METADATA_GRACE_SECONDS,
+                    )
+                except TimeoutError:
+                    log_event(
+                        "warning",
+                        "robot.recording.metadata_wait_expired",
+                        revision=revision,
+                        timeout_seconds=_RECORDING_STOP_METADATA_GRACE_SECONDS,
+                    )
+            if not self.state.media_url:
+                raise ValueError("机器人停止了录制，但没有返回视频地址")
+            self._touch()
+            await self._publish_state()
+            return self.state
         except RobotCommandNotSentError:
             raise
         except asyncio.CancelledError:
@@ -735,20 +1046,6 @@ class HardwareRobotAdapter(RobotAdapter):
         except Exception:
             self._abandon_recording_operation(revision, "stop")
             raise
-        if not _response_ok(response):
-            raise ValueError(f"机器人拒绝停止录制：{_response_error(response)}")
-        self.state.recording = False
-        self._recording_status_known = True
-        self.state.media_url = (
-            str(response.get("url") or "").strip() or self._recording_media_url
-        )
-        self._recording_media_url = None
-        if not self.state.media_url:
-            raise ValueError("机器人停止了录制，但没有返回视频地址")
-        self.state.last_command = "video_record:stop"
-        self._touch()
-        await self._publish_state()
-        return self.state
 
     async def stop_recording(self) -> RobotState:
         async with self._recording_lock:
@@ -796,7 +1093,19 @@ class HardwareRobotAdapter(RobotAdapter):
             loop = asyncio.get_running_loop()
             future: asyncio.Future[Any] = loop.create_future()
             self._pending[response_key] = future
+            # Bound to a physical connection only at the exact write boundary below. If an
+            # older gimbal write tears down the socket while this request is queued, the
+            # connection loop must not fail this as though it had already used that transport.
+            self._pending_connection_epochs[response_key] = None
             reply_matcher = _reply_matcher(payload, response_key)
+            recording_action = _video_record_action(payload.get("video_record"))
+            if response_key == "robot_video_record" and recording_action is not None:
+                self._pending_recording_reply = (
+                    future,
+                    self._recording_command_revision,
+                    recording_action,
+                    self._connection_epoch,
+                )
             if reply_matcher is not None:
                 self._pending_reply_matchers[response_key] = reply_matcher
             late_reply_grace_s = (
@@ -804,8 +1113,24 @@ class HardwareRobotAdapter(RobotAdapter):
                 if reply_matcher is not None
                 else 0.0
             )
+
+            def bind_reply_to_written_socket() -> None:
+                if self._pending.get(response_key) is future:
+                    self._pending_connection_epochs[response_key] = self._connection_epoch
+                pending_recording = self._pending_recording_reply
+                if (
+                    pending_recording is not None
+                    and pending_recording[0] is future
+                ):
+                    self._pending_recording_reply = (
+                        future,
+                        pending_recording[1],
+                        pending_recording[2],
+                        self._connection_epoch,
+                    )
+
             try:
-                await self._send(payload)
+                await self._send(payload, on_write_started=bind_reply_to_written_socket)
                 try:
                     # Shielding is essential: wait_for otherwise cancels the shared future at
                     # the primary deadline, making a slightly late hardware acknowledgement
@@ -847,11 +1172,24 @@ class HardwareRobotAdapter(RobotAdapter):
             finally:
                 if self._pending.get(response_key) is future:
                     self._pending.pop(response_key, None)
+                    self._pending_connection_epochs.pop(response_key, None)
                 self._pending_reply_matchers.pop(response_key, None)
+                pending_recording = self._pending_recording_reply
+                if (
+                    pending_recording is not None
+                    and pending_recording[0] is future
+                ):
+                    self._pending_recording_reply = None
                 if not future.done():
                     future.cancel()
 
-    async def _send(self, payload: dict[str, Any], *, context: str = "") -> None:
+    async def _send(
+        self,
+        payload: dict[str, Any],
+        *,
+        context: str = "",
+        on_write_started: Callable[[], None] | None = None,
+    ) -> None:
         await self.connect()
         if not self._socket or not self.state.connected:
             raise RobotCommandNotSentError(
@@ -862,6 +1200,16 @@ class HardwareRobotAdapter(RobotAdapter):
         is_goal_command = isinstance(goal, dict)
         goal_aligns_object = is_goal_command and bool(_maybe_str(goal.get("goal_object")))
         async with self._send_lock:
+            # The socket can be retired while this command waits behind a slow gimbal write.
+            # Re-check under the serialization lock and give the connection loop one bounded
+            # opportunity to install its replacement before declaring this command unsent.
+            if self._socket is None or not self.state.connected:
+                await self.connect()
+            socket = self._socket
+            if socket is None or not self.state.connected:
+                raise RobotCommandNotSentError(
+                    self.state.error or "Robot websocket disconnected before command write"
+                )
             if isinstance(gimbal, dict) or goal_aligns_object:
                 # A new target is a physical-sample boundary. A yaw received before this
                 # command must never be paired with a pitch received after it (or vice versa).
@@ -871,13 +1219,79 @@ class HardwareRobotAdapter(RobotAdapter):
             # process an immediate reply before send() resumes, but the public diagnostic is
             # still created only after the write succeeds.
             sent_at = utc_now()
+            sent_monotonic = time.monotonic()
+            sent_connection_epoch = self._connection_epoch
             video_record = payload.get("video_record")
             if _video_record_action(video_record) is not None:
                 # Mark immediately before the real write. Cancellation anywhere earlier is
                 # definitively pre-send; cancellation inside send remains correctly ambiguous.
                 self._recording_write_attempt_revision = self._recording_command_revision
-            await self._socket.send(json.dumps(payload, ensure_ascii=False))
-            log_event("info", "robot.command.sent", payload=payload)
+                self._recording_write_attempt_epoch = self._connection_epoch
+                if _video_record_action(video_record) == "start":
+                    # From this boundary onward an absent ACK is not evidence that Start failed.
+                    # The lifecycle therefore owes the camera one explicit later Stop.
+                    self._recording_stop_required = True
+            if on_write_started is not None:
+                on_write_started()
+            if is_goal_command:
+                self._capture_goal_written = True
+                self._capture_event("goal_write", self._pending_goal)
+            if _video_record_action(video_record) == "start":
+                self._capture_event("record_write")
+            try:
+                await asyncio.wait_for(
+                    socket.send(json.dumps(payload, ensure_ascii=False)),
+                    timeout=_WEBSOCKET_SEND_TIMEOUT_SECONDS,
+                )
+            except asyncio.CancelledError:
+                # websockets documents cancellation of send as unsafe to interpret. Close this
+                # transport so no later command can share a possibly partial/ambiguous frame.
+                log_event(
+                    "warning",
+                    "robot.command.send_cancelled",
+                    command=next(iter(payload), "unknown"),
+                )
+                self._retire_socket_after_failed_send(socket)
+                close = getattr(socket, "close", None)
+                if callable(close):
+                    with suppress(Exception):
+                        await asyncio.wait_for(
+                            close(),
+                            timeout=_WEBSOCKET_CLOSE_AFTER_SEND_TIMEOUT_SECONDS,
+                        )
+                raise
+            except TimeoutError as exc:
+                log_event(
+                    "error",
+                    "robot.command.send_timeout",
+                    timeout_seconds=_WEBSOCKET_SEND_TIMEOUT_SECONDS,
+                    command=next(iter(payload), "unknown"),
+                )
+                self._retire_socket_after_failed_send(socket)
+                close = getattr(socket, "close", None)
+                if callable(close):
+                    with suppress(Exception):
+                        await asyncio.wait_for(
+                            close(),
+                            timeout=_WEBSOCKET_CLOSE_AFTER_SEND_TIMEOUT_SECONDS,
+                        )
+                raise ConnectionError(
+                    f"向机器人发送指令超过 {_WEBSOCKET_SEND_TIMEOUT_SECONDS:g} 秒"
+                ) from exc
+            except Exception:
+                # ConnectionClosed and transport-specific write failures can race the receive
+                # loop. Retire synchronously so a queued Stop cannot reuse this socket merely
+                # because the connection task has not published `connected=false` yet.
+                self._retire_socket_after_failed_send(socket)
+                raise
+            log_event(
+                "info",
+                "robot.command.sent",
+                payload=payload,
+                connection_epoch=sent_connection_epoch,
+                recording_revision=self._recording_command_revision,
+                write_started_monotonic_seconds=round(sent_monotonic, 6),
+            )
             if isinstance(gimbal, dict):
                 # Record only after websocket.send succeeds. This still does not claim hardware
                 # execution; the independently received heartbeat is the evidence for that.
@@ -918,6 +1332,82 @@ class HardwareRobotAdapter(RobotAdapter):
                 self._touch()
                 await self._publish_state()
 
+    def _retire_socket_after_failed_send(self, socket: Any) -> None:
+        """Synchronously make an ambiguously failed transport unavailable to queued writers."""
+        if self._socket is not socket:
+            return
+        self._socket = None
+        self._connection_epoch += 1
+        self._recording_status_known = False
+        self.state.connected = False
+        self.state.connection_status = "reconnecting"
+
+    async def _send_gimbal(self, payload: dict[str, Any], *, context: str) -> None:
+        """Send one camera target only after the prior target is no longer reported busy."""
+        async with self._gimbal_command_lock:
+            await self._wait_for_gimbal_slot()
+            self._gimbal_ready.clear()
+            self._gimbal_inflight = True
+            self._gimbal_release_deadline = 0.0
+            write_started = False
+
+            def mark_write_started() -> None:
+                nonlocal write_started
+                write_started = True
+                # connect() may have replaced the socket and cleared all old physical ownership
+                # while this command was queued. Re-arm the gate at the new socket's exact write
+                # boundary so a following command cannot overtake it.
+                self._gimbal_ready.clear()
+                self._gimbal_inflight = True
+                # Reconnect/queue time is not physical travel time. Begin the fallback budget
+                # only when this command reaches the actual socket write boundary.
+                self._gimbal_release_deadline = (
+                    time.monotonic() + _gimbal_command_budget_seconds(payload)
+                )
+
+            try:
+                await self._send(
+                    payload,
+                    context=context,
+                    on_write_started=mark_write_started,
+                )
+            except (Exception, asyncio.CancelledError):
+                if not write_started or not self.state.connected:
+                    # Cancellation while reconnecting or queued behind another write is
+                    # definitively pre-send; a send failure that retired its transport likewise
+                    # cannot leave the next gimbal command behind a gate only that dead socket
+                    # could release.
+                    self._gimbal_inflight = False
+                    self._gimbal_release_deadline = 0.0
+                    self._gimbal_ready.set()
+                raise
+
+    async def _wait_for_gimbal_slot(self) -> None:
+        if self._gimbal_ready.is_set():
+            return
+        remaining = self._gimbal_release_deadline - time.monotonic()
+        if not self._gimbal_inflight or remaining <= 0:
+            log_event("warning", "robot.gimbal.estimated_completion")
+            self._gimbal_terminal_replies_trusted = False
+            self._gimbal_inflight = False
+            self._gimbal_release_deadline = 0.0
+            self._gimbal_ready.set()
+            return
+        try:
+            await asyncio.wait_for(
+                self._gimbal_ready.wait(),
+                timeout=min(_GIMBAL_PREVIOUS_COMMAND_WAIT_SECONDS, remaining),
+            )
+        except TimeoutError as exc:
+            if time.monotonic() >= self._gimbal_release_deadline:
+                log_event("warning", "robot.gimbal.estimated_completion")
+                self._gimbal_terminal_replies_trusted = False
+                self._gimbal_inflight = False
+                self._gimbal_release_deadline = 0.0
+                self._gimbal_ready.set()
+                return
+            raise TimeoutError("机器人云台仍在执行上一条指令") from exc
+
     def _start_connection_loop(self) -> None:
         if not self.websocket_url:
             return
@@ -928,12 +1418,22 @@ class HardwareRobotAdapter(RobotAdapter):
     async def _stop_connection_loop(self) -> None:
         # Replies queued on the old socket must never recover or complete work on a replacement
         # connection.
+        self._connection_epoch += 1
         self._recording_command_revision += 1
         self._recording_reply_recovery = None
+        self._pending_recording_reply = None
+        self._committed_recording_reply = None
+        self._recording_heartbeat_guard = None
+        self._late_stop_metadata_owner = None
+        self._late_stop_metadata_event.set()
         self._recording_write_attempt_revision = None
+        self._recording_write_attempt_epoch = None
         self._recording_status_known = False
         self._clear_heartbeat_diagnostics()
-        self._fail_pending(ConnectionError("Robot websocket was reconfigured"))
+        self._fail_pending(
+            ConnectionError("Robot websocket was reconfigured"),
+            include_unwritten=True,
+        )
         socket = self._socket
         self._socket = None
         if socket:
@@ -970,6 +1470,8 @@ class HardwareRobotAdapter(RobotAdapter):
                     close_timeout=2,
                     max_queue=32,
                 )
+                self._connection_epoch += 1
+                connection_epoch = self._connection_epoch
                 self._socket = socket
                 self._reconnect_delay_s = 1.0
                 first_attempt = False
@@ -979,7 +1481,10 @@ class HardwareRobotAdapter(RobotAdapter):
                 self._touch()
                 await self._publish_state()
                 log_event("info", "robot.websocket.connected", websocket_url=self.websocket_url)
-                await self._receive_messages(socket)
+                await self._receive_messages(socket, connection_epoch)
+                # A clean WebSocket close is still a connection failure for any in-flight
+                # command. Never carry its waiter or heartbeat proof into the replacement.
+                raise ConnectionError("Robot websocket closed")
             except asyncio.CancelledError:
                 raise
             except ModuleNotFoundError as exc:
@@ -991,7 +1496,11 @@ class HardwareRobotAdapter(RobotAdapter):
                 await self._publish_state()
                 return
             except Exception as exc:
+                if socket is not None and self._socket is socket:
+                    self._socket = None
+                    self._connection_epoch += 1
                 self._recording_status_known = False
+                self._clear_heartbeat_diagnostics()
                 self.state.connected = False
                 self.state.connection_status = "reconnecting"
                 self.state.error = str(exc)
@@ -1013,11 +1522,33 @@ class HardwareRobotAdapter(RobotAdapter):
                 if socket and self._socket is socket:
                     self._socket = None
 
-    async def _receive_messages(self, socket: Any) -> None:
+    async def _receive_messages(self, socket: Any, connection_epoch: int) -> None:
         async for raw in socket:
-            await self._handle_message(raw)
+            await self._handle_message(raw, connection_epoch=connection_epoch)
 
-    async def _handle_message(self, raw: str | bytes) -> None:
+    async def _handle_message(
+        self,
+        raw: str | bytes,
+        *,
+        connection_epoch: int | None = None,
+    ) -> None:
+        if (
+            connection_epoch is not None
+            and connection_epoch != self._connection_epoch
+        ):
+            log_event(
+                "warning",
+                "robot.reply.quarantined",
+                reason="stale_connection",
+                frame_connection_epoch=connection_epoch,
+                active_connection_epoch=self._connection_epoch,
+            )
+            return
+        frame_connection_epoch = (
+            self._connection_epoch
+            if connection_epoch is None
+            else connection_epoch
+        )
         if isinstance(raw, bytes):
             raw = raw.decode("utf-8", errors="replace")
         try:
@@ -1027,9 +1558,41 @@ class HardwareRobotAdapter(RobotAdapter):
         if not isinstance(payload, dict):
             return
 
+        self._log_heartbeat_frame(payload, frame_connection_epoch)
+
         replies = {key: value for key, value in payload.items() if key.startswith("robot_")}
         if replies:
-            log_event("info", "robot.reply.received", reply=replies)
+            log_event(
+                "info",
+                "robot.reply.received",
+                reply=replies,
+                connection_epoch=frame_connection_epoch,
+                recording_revision=self._recording_command_revision,
+                recording_recovery=self._recording_reply_recovery,
+            )
+
+        gimbal_reply = payload.get("robot_gimbal_control")
+        if isinstance(gimbal_reply, dict) and self._gimbal_inflight:
+            gimbal_status = str(gimbal_reply.get("status") or "").strip().casefold()
+            if gimbal_status == "busy":
+                self._gimbal_ready.clear()
+            elif gimbal_status:
+                # Both success and rejection are terminal for command serialization.  The reply
+                # is still logged above; freeing the gate prevents one failure from wedging all
+                # future camera control.
+                if self._gimbal_terminal_replies_trusted:
+                    self._gimbal_inflight = False
+                    self._gimbal_release_deadline = 0.0
+                    self._gimbal_ready.set()
+                else:
+                    # Once a command completed only by estimate, an id-less terminal reply may
+                    # belong to that older command. Keep later commands on their physical travel
+                    # budgets until reconnect restores an unambiguous reply stream.
+                    log_event(
+                        "warning",
+                        "robot.gimbal.reply_ignored",
+                        reason="terminal_reply_generation_ambiguous",
+                    )
 
         resolved = False
         recording_reply_resolved = False
@@ -1037,7 +1600,28 @@ class HardwareRobotAdapter(RobotAdapter):
             if key in payload and not future.done():
                 response = payload[key]
                 matcher = self._pending_reply_matchers.get(key)
+                pending_epoch = self._pending_connection_epochs.get(
+                    key,
+                    frame_connection_epoch,
+                )
+                if pending_epoch != frame_connection_epoch:
+                    continue
                 if matcher is None or matcher(response):
+                    if key == "robot_video_record":
+                        pending_recording = self._pending_recording_reply
+                        if (
+                            pending_recording is None
+                            or pending_recording[0] is not future
+                            or pending_recording[3] != frame_connection_epoch
+                            or not self._commit_recording_reply(
+                                pending_recording[1],
+                                pending_recording[2],
+                                response,
+                                require_echo=True,
+                                connection_epoch=frame_connection_epoch,
+                            )
+                        ):
+                            continue
                     future.set_result(response)
                     resolved = True
                     recording_reply_resolved = (
@@ -1047,7 +1631,10 @@ class HardwareRobotAdapter(RobotAdapter):
         recovered_recording_reply = False
         record = payload.get("robot_video_record")
         if isinstance(record, dict) and not recording_reply_resolved:
-            recovered_recording_reply = self._recover_recording_reply(record)
+            recovered_recording_reply = self._recover_recording_reply(
+                record,
+                connection_epoch=frame_connection_epoch,
+            )
             if not recovered_recording_reply:
                 log_event(
                     "warning",
@@ -1061,12 +1648,85 @@ class HardwareRobotAdapter(RobotAdapter):
                     ),
                 )
 
-        state_changed = self._apply_protocol_state(payload)
+        state_changed = self._apply_protocol_state(
+            payload,
+            connection_epoch=frame_connection_epoch,
+        )
         if resolved or recovered_recording_reply or state_changed:
             self._touch()
             await self._publish_state()
 
-    def _recover_recording_reply(self, response: dict[str, Any]) -> bool:
+    def _log_heartbeat_frame(
+        self,
+        payload: dict[str, Any],
+        connection_epoch: int,
+    ) -> None:
+        """Log raw protocol-owned fields without flooding on unchanged pose telemetry."""
+        heartbeat = {
+            key: deepcopy(payload[key])
+            for key in ("system", "map", "naviagtion", "navigation", "task", "gimbal")
+            if isinstance(payload.get(key), dict)
+        }
+        if not heartbeat:
+            return
+
+        semantic = deepcopy(heartbeat)
+        semantic_gimbal = semantic.get("gimbal")
+        if isinstance(semantic_gimbal, dict):
+            semantic_gimbal.pop("yaw", None)
+            semantic_gimbal.pop("pitch", None)
+        signature = json.dumps(
+            semantic,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        )
+        received_monotonic = time.monotonic()
+        if (
+            signature == self._last_heartbeat_log_signature
+            and received_monotonic - self._last_heartbeat_log_monotonic < 1.0
+        ):
+            self._suppressed_heartbeat_logs += 1
+            return
+
+        pending_goal = self._pending_goal
+        recovery = self._recording_reply_recovery
+        log_event(
+            "info",
+            "robot.heartbeat.received",
+            connection_epoch=connection_epoch,
+            received_monotonic_seconds=round(received_monotonic, 6),
+            suppressed_since_previous=self._suppressed_heartbeat_logs,
+            pending_goal=(
+                {
+                    "path_name": pending_goal.path_name,
+                    "goal_id": pending_goal.goal_id,
+                    "goal_object": pending_goal.goal_object,
+                    "write_confirmed": self._pending_goal_attempt is not None,
+                }
+                if pending_goal is not None
+                else None
+            ),
+            recording_revision=self._recording_command_revision,
+            recording_recovery=(
+                {"revision": recovery[0], "action": recovery[1]}
+                if recovery is not None
+                else None
+            ),
+            recording_stop_required=self._recording_stop_required,
+            payload=heartbeat,
+        )
+        self._last_heartbeat_log_signature = signature
+        self._last_heartbeat_log_monotonic = received_monotonic
+        self._suppressed_heartbeat_logs = 0
+
+    def _recover_recording_reply(
+        self,
+        response: dict[str, Any],
+        *,
+        connection_epoch: int,
+    ) -> bool:
         """Apply a late reply only while its abandoned command still owns recovery.
 
         The wire protocol has no request id, so a newer recording command is not allowed to
@@ -1074,10 +1734,42 @@ class HardwareRobotAdapter(RobotAdapter):
         """
         action = _video_record_action(response)
         recovery = self._recording_reply_recovery
-        if action is None or recovery is None:
+        if action is None:
             return False
+        if recovery is None:
+            metadata_owner = self._late_stop_metadata_owner
+            if (
+                action != "stop"
+                or metadata_owner is None
+                or metadata_owner
+                != (self._recording_command_revision, connection_epoch)
+                or response.get("stop") != 0
+                or not str(response.get("status") or "").strip()
+            ):
+                return False
+            if _response_ok(response):
+                record_url = _maybe_str(response.get("url"))
+                if record_url:
+                    self.state.media_url = record_url
+                    self._recording_media_url = None
+                    self.state.last_command = "video_record:stop"
+                    self._late_stop_metadata_owner = None
+                    self._late_stop_metadata_event.set()
+            else:
+                self._late_stop_metadata_event.set()
+            log_event(
+                "info",
+                "robot.reply.metadata_recovered",
+                response_key="robot_video_record",
+                action="stop",
+                revision=self._recording_command_revision,
+                success=_response_ok(response),
+            )
+            return True
         revision, expected_action = recovery
         if revision != self._recording_command_revision or action != expected_action:
+            return False
+        if self._recording_write_attempt_epoch != connection_epoch:
             return False
         if response.get(action) != 0:
             return False
@@ -1085,24 +1777,17 @@ class HardwareRobotAdapter(RobotAdapter):
         if not status:
             return False
 
+        if not self._commit_recording_reply(
+            revision,
+            action,
+            response,
+            require_echo=True,
+            connection_epoch=connection_epoch,
+        ):
+            return False
         self._recording_reply_recovery = None
-        self._recording_status_known = True
-        if _response_ok(response):
-            record_url = _maybe_str(response.get("url"))
-            if action == "start":
-                self.state.recording = True
-                self._recording_media_url = record_url
-                self.state.media_url = record_url
-            else:
-                self.state.recording = False
-                # Shared state.media_url may have been replaced by an in-recording photo. Only
-                # recording-owned URLs are safe fallbacks for a late Stop acknowledgement.
-                self.state.media_url = record_url or self._recording_media_url
-                self._recording_media_url = None
-            self.state.last_command = f"video_record:{action}"
-        else:
-            # A definitive rejection means the camera stayed in its pre-command state.
-            self.state.recording = action == "stop"
+        if action == "stop" and self.state.media_url:
+            self._late_stop_metadata_owner = None
         log_event(
             "info",
             "robot.reply.recovered",
@@ -1155,7 +1840,12 @@ class HardwareRobotAdapter(RobotAdapter):
                     recovered_revision=recovered_revision,
                 )
 
-    def _apply_protocol_state(self, payload: dict[str, Any]) -> bool:
+    def _apply_protocol_state(
+        self,
+        payload: dict[str, Any],
+        *,
+        connection_epoch: int | None = None,
+    ) -> bool:
         changed = False
         map_changed = False
         system = payload.get("system") if isinstance(payload.get("system"), dict) else {}
@@ -1169,6 +1859,11 @@ class HardwareRobotAdapter(RobotAdapter):
         )
         task = payload.get("task") if isinstance(payload.get("task"), dict) else {}
         gimbal = payload.get("gimbal") if isinstance(payload.get("gimbal"), dict) else {}
+        frame_connection_epoch = (
+            self._connection_epoch
+            if connection_epoch is None
+            else connection_epoch
+        )
 
         heartbeat_payload = {
             key: deepcopy(payload[key])
@@ -1176,6 +1871,52 @@ class HardwareRobotAdapter(RobotAdapter):
             if isinstance(payload.get(key), dict)
         }
         heartbeat_received_at = utc_now() if heartbeat_payload else None
+        complete_map_frame = (
+            isinstance(payload.get("system"), dict)
+            and isinstance(payload.get("map"), dict)
+            and (
+                isinstance(payload.get("naviagtion"), dict)
+                or isinstance(payload.get("navigation"), dict)
+            )
+        )
+
+        # Preserve a coherent readiness frame across unrelated gimbal/task telemetry, but never
+        # preserve it across a newer explicit contradiction.
+        if self._latest_complete_map_heartbeat is not None:
+            proven_payload = self._latest_complete_map_heartbeat.payload
+            proven_map = (
+                proven_payload.get("map")
+                if isinstance(proven_payload.get("map"), dict)
+                else {}
+            )
+            contradicts_proof = False
+            if "status" in system:
+                contradicts_proof = (
+                    str(system.get("status") or "").strip().casefold() != "ready"
+                )
+            if "name" in current_map:
+                contradicts_proof = contradicts_proof or (
+                    _maybe_str(current_map.get("name"))
+                    != _maybe_str(proven_map.get("name"))
+                )
+            if "mode" in current_map:
+                contradicts_proof = contradicts_proof or (
+                    str(current_map.get("mode") or "").strip().casefold()
+                    != "localization"
+                )
+            if "status" in current_map:
+                contradicts_proof = contradicts_proof or (
+                    _normalize_failed(
+                        str(current_map.get("status") or "").strip().casefold() or None
+                    )
+                    != "ready"
+                )
+            if "status" in navigation:
+                contradicts_proof = contradicts_proof or (
+                    str(navigation.get("status") or "").strip().casefold() != "ready"
+                )
+            if contradicts_proof:
+                self._latest_complete_map_heartbeat = None
 
         if system or current_map or navigation or task or gimbal:
             self.state.connected = True
@@ -1193,8 +1934,11 @@ class HardwareRobotAdapter(RobotAdapter):
                 reported_map = _maybe_str(current_map.get("name"))
                 if reported_map != self.state.map_name:
                     # A task/path identity belongs to one map.  Do not carry the previous map's
-                    # last point into a newly confirmed map when the new heartbeat omits task.
+                    # last point or readiness into a newly reported map when split heartbeats
+                    # omit those blocks. The later fields in this same frame repopulate them.
                     map_changed = True
+                    self.state.map_mode = None
+                    self.state.map_status = None
                     self._clear_navigation_state()
                 self.state.map_name = reported_map
             if "mode" in current_map:
@@ -1229,18 +1973,117 @@ class HardwareRobotAdapter(RobotAdapter):
             # still protects the current goal from a delayed previous-point heartbeat.
             self._evaluate_arrival({**task, **navigation})
         if gimbal:
+            if "record_status" in gimbal:
+                raw_record_status = _maybe_str(gimbal.get("record_status"))
+                normalized_record_status = (
+                    raw_record_status.strip().casefold() if raw_record_status else None
+                )
+                if normalized_record_status not in {"recording", "idle"}:
+                    # Null/unknown vendor values are absence of evidence, never evidence that the
+                    # camera is idle.  Drop only this field so pose telemetry in the same frame is
+                    # still usable while recording recovery remains fail-closed.
+                    log_event(
+                        "warning",
+                        "robot.recording.heartbeat_ignored",
+                        reason="invalid_record_status",
+                        raw_record_status=gimbal.get("record_status"),
+                    )
+                    gimbal = {key: value for key, value in gimbal.items() if key != "record_status"}
+                elif normalized_record_status != gimbal.get("record_status"):
+                    gimbal = {**gimbal, "record_status": normalized_record_status}
             # Only when the field is actually there. Absent, `.get` returns None, which is not
             # "recording" and would silently rewrite a running recording as stopped — a
             # heartbeat carrying only yaw would do it. Nothing else now decides whether to
             # send the stop command, so a missing field must mean "unchanged", not "no".
             if "record_status" in gimbal:
-                self.state.recording = gimbal.get("record_status") == "recording"
+                reported_recording = gimbal.get("record_status") == "recording"
+                recovery = self._recording_reply_recovery
+                stop_recovery_idle = bool(
+                    recovery is not None
+                    and recovery[1] == "stop"
+                    and not reported_recording
+                )
+                if stop_recovery_idle:
+                    self._recording_stop_required = False
+                stop_required_idle = bool(
+                    self._recording_stop_required
+                    and not reported_recording
+                    and not stop_recovery_idle
+                )
+                guard = self._recording_heartbeat_guard
+                guarded_transition = (
+                    guard is not None
+                    and guard[0] == self._recording_command_revision
+                    and guard[3] == frame_connection_epoch
+                )
+                ignored_guard_conflict = False
+                accepted_heartbeat_state_known = True
+                if guarded_transition and reported_recording != guard[2]:
+                    self._recording_heartbeat_conflict_count += 1
+                    self._recording_heartbeat_conflict_state = reported_recording
+                    if self._recording_heartbeat_conflict_deadline <= 0:
+                        self._recording_heartbeat_conflict_deadline = (
+                            time.monotonic()
+                            + _RECORDING_TRANSITIONAL_HEARTBEAT_GRACE_SECONDS
+                        )
+                    if (
+                        self._recording_heartbeat_conflict_count
+                        < _RECORDING_TRANSITIONAL_HEARTBEAT_LIMIT
+                    ):
+                        ignored_guard_conflict = True
+                        log_event(
+                            "warning",
+                            "robot.recording.heartbeat_ignored",
+                            action=guard[1],
+                            revision=guard[0],
+                            reported_recording=reported_recording,
+                            conflict_count=self._recording_heartbeat_conflict_count,
+                            conflict_limit=_RECORDING_TRANSITIONAL_HEARTBEAT_LIMIT,
+                            reason="reply_commit_not_yet_observed",
+                        )
+                    else:
+                        # One delayed heartbeat from immediately before the ACK is common.
+                        # Repeated contradictory reports are stronger evidence that the robot
+                        # has changed state again, so stop trusting the transitional guard. An
+                        # idle contradiction after Start remains unsafe: retain recording=true
+                        # until an explicit Stop confirms the camera is idle.
+                        resolved_recording = bool(
+                            reported_recording or guard[1] == "start"
+                        )
+                        self.state.recording = resolved_recording
+                        accepted_heartbeat_state_known = reported_recording
+                        self._recording_heartbeat_guard = None
+                        self._reset_recording_heartbeat_conflict()
+                        log_event(
+                            "warning",
+                            "robot.recording.heartbeat_override",
+                            action=guard[1],
+                            revision=guard[0],
+                            reported_recording=reported_recording,
+                            resolved_recording=resolved_recording,
+                            reason="repeated_contradictory_heartbeat",
+                        )
+                else:
+                    if stop_required_idle:
+                        self.state.recording = True
+                        accepted_heartbeat_state_known = False
+                        log_event(
+                            "warning",
+                            "robot.recording.idle_requires_stop",
+                            revision=self._recording_command_revision,
+                            reason="start_acknowledged_without_stop_confirmation",
+                        )
+                    else:
+                        self.state.recording = reported_recording
+                    if guarded_transition:
+                        self._recording_heartbeat_guard = None
+                    self._reset_recording_heartbeat_conflict()
                 # A heartbeat can confirm an abandoned Start even when its ACK never arrives.
                 # In that case the caller is already gone, so compensate just as for a late ACK.
-                recovery = self._recording_reply_recovery
-                if recovery is not None:
+                if recovery is not None and not ignored_guard_conflict:
                     revision, action = recovery
-                    if action == "start" and self.state.recording:
+                    if action == "start" and reported_recording:
+                        self._recording_stop_required = True
                         self._recording_reply_recovery = None
                         self._schedule_orphaned_recording_stop(revision)
                     elif action == "stop" and not self.state.recording:
@@ -1251,7 +2094,11 @@ class HardwareRobotAdapter(RobotAdapter):
                         self._recording_reply_recovery = None
                 # The physical state is only safe for finalization when no written recording
                 # operation can still change it after this heartbeat.
-                self._recording_status_known = self._recording_reply_recovery is None
+                self._recording_status_known = (
+                    not ignored_guard_conflict
+                    and accepted_heartbeat_state_known
+                    and self._recording_reply_recovery is None
+                )
             if "yaw" in gimbal:
                 yaw = _maybe_float(gimbal.get("yaw"))
                 if yaw is not None:
@@ -1344,7 +2191,7 @@ class HardwareRobotAdapter(RobotAdapter):
                 if "mode" in gimbal and gimbal.get("mode") is not None:
                     raw_mode = gimbal.get("mode")
                     gimbal_mode = raw_mode if isinstance(raw_mode, (int, str)) else str(raw_mode)
-            self.state.diagnostics.last_heartbeat = RobotHeartbeatDiagnostic(
+            diagnostic = RobotHeartbeatDiagnostic(
                 sequence=(previous.sequence if previous else 0) + 1,
                 received_at=heartbeat_received_at,
                 yaw=yaw,
@@ -1365,6 +2212,9 @@ class HardwareRobotAdapter(RobotAdapter):
                 goal_id=goal_id,
                 payload=heartbeat_payload,
             )
+            self.state.diagnostics.last_heartbeat = diagnostic
+            if complete_map_frame:
+                self._latest_complete_map_heartbeat = diagnostic.model_copy(deep=True)
             changed = True
 
         photo = payload.get("robot_take_photo")
@@ -1384,7 +2234,15 @@ class HardwareRobotAdapter(RobotAdapter):
         self._heartbeat_revision = None
         self._heartbeat_yaw_pending = False
         self._heartbeat_pitch_pending = False
+        # A replaced socket cannot still own the previous connection's gimbal-busy state.
+        self._gimbal_inflight = False
+        self._gimbal_release_deadline = 0.0
+        self._gimbal_terminal_replies_trusted = True
+        self._gimbal_ready.set()
+        self._recording_heartbeat_guard = None
+        self._reset_recording_heartbeat_conflict()
         self._pending_goal_attempt = None
+        self._latest_complete_map_heartbeat = None
         self.state.diagnostics.last_goal_attempt = None
         self.state.diagnostics.last_goal_command = None
         self.state.diagnostics.last_heartbeat = None
@@ -1406,12 +2264,26 @@ class HardwareRobotAdapter(RobotAdapter):
         self.state.goal_id = None
         self.state.goal_object = None
 
-    def _fail_pending(self, exc: Exception) -> None:
-        for future in self._pending.values():
+    def _fail_pending(
+        self,
+        exc: Exception,
+        *,
+        include_unwritten: bool = False,
+    ) -> None:
+        failed_keys: list[str] = []
+        for key, future in list(self._pending.items()):
+            if (
+                self._pending_connection_epochs.get(key) is None
+                and not include_unwritten
+            ):
+                continue
             if not future.done():
                 future.set_exception(exc)
-        self._pending.clear()
-        self._pending_reply_matchers.clear()
+            failed_keys.append(key)
+        for key in failed_keys:
+            self._pending.pop(key, None)
+            self._pending_connection_epochs.pop(key, None)
+            self._pending_reply_matchers.pop(key, None)
         # Never leave a cruise blocked on an arrival that can no longer be reported.
         if self._pending_goal is not None:
             self._resolve_arrival("failed")
@@ -1424,6 +2296,9 @@ class HardwareRobotAdapter(RobotAdapter):
 
 
 class RobotService:
+    def set_capture_observer(self, observer: Callable[[dict], None] | None) -> None:
+        self.adapter.capture_observer = observer
+
     def __init__(
         self,
         events: EventHub,
@@ -1441,9 +2316,18 @@ class RobotService:
         # Map commands have no request id.  Keep manual and cruise switches serialized through
         # acknowledgement and (for a cruise) physical heartbeat confirmation.
         self._map_lock = asyncio.Lock()
+        # Choosing a predefined map and starting a cruise are two UI actions but one physical
+        # transition. Preserve the accepted manual switch boundary so cruise can wait for that
+        # same transition instead of sending a disruptive duplicate switch.
+        self._pending_map_switch_target: str | None = None
+        self._pending_map_switch_after: datetime | None = None
+        self._pending_map_switch_generation: int | None = None
         # A photo taken during recording replaces RobotState.media_url, so video recovery owns
         # a separate URL that survives a timed-out Stop acknowledgement.
         self._recoverable_video_url: str | None = None
+        # Only a local path restored from the durable capture session can be trusted while the
+        # robot is offline; a same-process transfer still requires confirmed physical idle.
+        self._restored_local_capture_path: str | None = None
         # HTTP transfers finish independently of WebSocket commands. Tokens stop a late photo
         # completion from publishing state owned by a newer Stop/start/photo operation.
         self._media_revision = 0
@@ -1452,6 +2336,9 @@ class RobotService:
     async def configure_websocket_url(self, websocket_url: str) -> RobotState:
         async with self._capture_lock:
             self._media_revision += 1
+            self._pending_map_switch_target = None
+            self._pending_map_switch_after = None
+            self._pending_map_switch_generation = None
             current = await self.adapter.status()
             if current.recording:
                 raise ValueError("录制进行中，无法更改机器人连接")
@@ -1459,6 +2346,7 @@ class RobotService:
             result = await self.adapter.configure_websocket_url(websocket_url)
             if websocket_url.strip() != previous_url:
                 self._recoverable_video_url = None
+                self._restored_local_capture_path = None
             return result
 
     async def configure_websocket_url_and_commit(
@@ -1476,6 +2364,9 @@ class RobotService:
         """
         async with self._capture_lock:
             self._media_revision += 1
+            self._pending_map_switch_target = None
+            self._pending_map_switch_after = None
+            self._pending_map_switch_generation = None
             current = await self.adapter.status()
             if current.recording:
                 raise ValueError("录制进行中，无法更改机器人连接")
@@ -1495,6 +2386,7 @@ class RobotService:
                     and not preserve_capture_recovery
                 ):
                     self._recoverable_video_url = None
+                    self._restored_local_capture_path = None
                 elif preserve_capture_recovery:
                     self._restore_preserved_capture_state(
                         configured_state,
@@ -1569,6 +2461,7 @@ class RobotService:
                 raise ConnectionError("正在等待机器人同步录制状态，请稍后再试")
             result = await commit()
             self._recoverable_video_url = None
+            self._restored_local_capture_path = None
             current.media_url = None
             current.media_local_path = None
             current.media_sync_error = None
@@ -1593,6 +2486,7 @@ class RobotService:
             and not _looks_like_image_url(str(saved_path))
         ):
             self.adapter.state.media_local_path = str(saved_path)
+            self._restored_local_capture_path = str(saved_path)
         self.adapter.state.media_sync_error = str(sync_error or "").strip() or None
 
     async def connect(self) -> RobotState:
@@ -1713,9 +2607,41 @@ class RobotService:
             return await self._switch_map_unlocked(map_name)
 
     async def _switch_map_unlocked(self, map_name: str) -> dict[str, Any]:
+        # A newer switch supersedes any earlier unconfirmed transition.
+        self._pending_map_switch_target = None
+        self._pending_map_switch_after = None
+        self._pending_map_switch_generation = None
+        switch_command_boundary = utc_now()
         result = await self.adapter.switch_map(map_name)
         await self.events.publish("ROBOT_COMMAND", {"type": "set_switch_map", "result": result})
+        if isinstance(result, dict) and result.get("ok") is True:
+            self._pending_map_switch_target = map_name.strip()
+            # Robot switch replies have no request id and only acknowledge the command. Use the
+            # pre-write operation boundary so a complete target heartbeat bundled with an
+            # immediate acknowledgement is not lost merely because the waiter resumes later.
+            self._pending_map_switch_after = switch_command_boundary
+            self._pending_map_switch_generation = self._adapter_connection_generation()
         return result
+
+    def _adapter_connection_generation(self) -> int | None:
+        reader = getattr(self.adapter, "connection_generation", None)
+        value = reader() if callable(reader) else None
+        return int(value) if value is not None else None
+
+    def _forget_pending_map_switch(
+        self,
+        target: str,
+        after: datetime | None,
+        generation: int | None,
+    ) -> None:
+        if (
+            self._pending_map_switch_target == target
+            and self._pending_map_switch_after == after
+            and self._pending_map_switch_generation == generation
+        ):
+            self._pending_map_switch_target = None
+            self._pending_map_switch_after = None
+            self._pending_map_switch_generation = None
 
     async def switch_map_and_confirm(
         self,
@@ -1734,39 +2660,79 @@ class RobotService:
             raise ValueError("巡游清单未指定地图")
 
         async with self._map_lock:
-            result = await self._switch_map_unlocked(target)
-            if not isinstance(result, dict) or result.get("ok") is not True:
-                raise ValueError(f"机器人拒绝切换到地图“{target}”")
+            current_generation = self._adapter_connection_generation()
+            if (
+                self._pending_map_switch_target == target
+                and self._pending_map_switch_generation == current_generation
+            ):
+                # Reuse the accepted manual command and its post-command readiness proof. Some
+                # firmware emits the complete system+map+navigation frame only once after a map
+                # transition, so demanding another complete frame at Cruise start would wedge a
+                # map that is already physically ready. The proof is still safely scoped by the
+                # original command boundary and connection generation; reconnects and newer
+                # contradictory telemetry invalidate it in the adapter.
+                after = self._pending_map_switch_after
+                switch_generation = self._pending_map_switch_generation
+                log_event(
+                    "info",
+                    "robot.map.switch.reused",
+                    map_name=target,
+                    reason="accepted_manual_switch",
+                )
+            else:
+                result = await self._switch_map_unlocked(target)
+                if not isinstance(result, dict) or result.get("ok") is not True:
+                    raise ValueError(f"机器人拒绝切换到地图“{target}”")
+                after = self._pending_map_switch_after
+                switch_generation = self._pending_map_switch_generation
 
-            # A heartbeat received before (or together with) the ACK cannot prove the accepted
-            # switch has completed.  Capture the boundary after acceptance and require a newer
-            # report.  received_at survives heartbeat sequence resets on reconnect.
-            acknowledged_state = await self.adapter.status()
-            previous = acknowledged_state.diagnostics.last_heartbeat
-            after = previous.received_at if previous is not None else None
             deadline = asyncio.get_running_loop().time() + max(0.0, timeout_s)
             last_observation = "尚未收到新的地图心跳"
 
-            while True:
-                state = await self.adapter.status()
-                ready, terminal_error, observation = _confirmed_cruise_map(
-                    state,
-                    target,
-                    after=after,
-                )
-                last_observation = observation or last_observation
-                if terminal_error:
-                    raise ValueError(terminal_error)
-                if ready:
-                    return state
-
-                remaining = deadline - asyncio.get_running_loop().time()
-                if remaining <= 0:
-                    raise TimeoutError(
-                        f"切换地图“{target}”后未在 {timeout_s:g} 秒内确认可巡游："
-                        f"{last_observation}"
+            try:
+                while True:
+                    if self._adapter_connection_generation() != switch_generation:
+                        raise ConnectionError("切换地图过程中机器人连接已重建，请重试")
+                    state = await self.adapter.status()
+                    complete_heartbeat_reader = getattr(
+                        self.adapter,
+                        "complete_map_heartbeat",
+                        None,
                     )
-                await asyncio.sleep(min(_MAP_SWITCH_CONFIRM_POLL_SECONDS, remaining))
+                    complete_heartbeat = (
+                        complete_heartbeat_reader()
+                        if callable(complete_heartbeat_reader)
+                        else state.diagnostics.last_heartbeat
+                    )
+                    ready, terminal_error, observation = _confirmed_cruise_map(
+                        state,
+                        target,
+                        after=after,
+                        heartbeat=complete_heartbeat,
+                    )
+                    last_observation = observation or last_observation
+                    if terminal_error:
+                        raise ValueError(terminal_error)
+                    if ready:
+                        self._forget_pending_map_switch(
+                            target,
+                            after,
+                            switch_generation,
+                        )
+                        return state
+
+                    remaining = deadline - asyncio.get_running_loop().time()
+                    if remaining <= 0:
+                        raise TimeoutError(
+                            f"切换地图“{target}”后未在 {timeout_s:g} 秒内确认可巡游："
+                            f"{last_observation}"
+                        )
+                    await asyncio.sleep(min(_MAP_SWITCH_CONFIRM_POLL_SECONDS, remaining))
+            except (Exception, asyncio.CancelledError):
+                # A failed/cancelled confirmation must not make later retries wait forever on
+                # an old accepted switch. The next attempt is then free to issue one fresh switch.
+                self._forget_pending_map_switch(target, after, switch_generation)
+                raise
 
     async def path_list(self, map_name: str) -> list[str]:
         return await self.adapter.path_list(map_name)
@@ -1808,9 +2774,25 @@ class RobotService:
         reader = getattr(self.adapter, "recording_status_known", None)
         return bool(reader()) if callable(reader) else True
 
+    def recording_stop_required(self) -> bool:
+        """Whether a Start write still owes the hardware an explicit Stop."""
+        reader = getattr(self.adapter, "recording_stop_required", None)
+        return bool(reader()) if callable(reader) else False
+
     def recording_operation_pending(self) -> bool:
         reader = getattr(self.adapter, "recording_operation_pending", None)
         return bool(reader()) if callable(reader) else False
+
+    def recording_idle_confirmed(self) -> bool:
+        """Atomically apply any guard expiry, then require a known physical idle state."""
+        known = self.recording_status_known()
+        state = getattr(self.adapter, "state", None)
+        return bool(
+            known
+            and not self.recording_stop_required()
+            and state is not None
+            and not state.recording
+        )
 
     async def stop_motion(self) -> RobotState:
         state = await self.adapter.stop_motion()
@@ -1861,6 +2843,7 @@ class RobotService:
             if current.recording:
                 raise ValueError("机器人已在录制，请先停止当前录制")
             self._recoverable_video_url = None
+            self._restored_local_capture_path = None
             await self._clear_media_state()
             state = await self.adapter.start_recording()
             result = state.model_copy(deep=True)
@@ -1888,11 +2871,31 @@ class RobotService:
             self._media_revision += 1
             current = await self.adapter.status()
             result = current.model_copy(deep=True)
-            # A verified local file was downloaded only after Stop was accepted. It is safe to
-            # finalize even before the first post-restart heartbeat.
+            # A local file proves transfer, not that the camera stayed idle. If a contradictory
+            # heartbeat arrived during that transfer, keep the file but repair physical state
+            # with the same one-shot cleanup Stop used by the normal Stop path.
             if result.media_local_path and Path(result.media_local_path).is_file():
-                return result
-            if current.recording:
+                if self.recording_idle_confirmed():
+                    return result
+                if (
+                    not current.connected
+                    and self._restored_local_capture_path == result.media_local_path
+                ):
+                    # This file was durably recorded before process restart. Offline recovery
+                    # must not require a fresh robot heartbeat merely to expose that verified
+                    # local result; same-process downloads never receive this trust marker.
+                    return result
+                robot_url = self._select_video_url(
+                    str(result.media_url or ""),
+                    prefer_state=True,
+                )
+                return await self._stabilize_stop_after_media_sync(
+                    result,
+                    robot_url,
+                    sync_media=True,
+                    on_media_url=on_media_url,
+                )
+            if current.recording or self.recording_stop_required():
                 return await self._stop_recording_locked(
                     sync_media=True,
                     on_media_url=on_media_url,
@@ -1912,7 +2915,12 @@ class RobotService:
             self._recoverable_video_url = robot_url
             self._notify_media_url(on_media_url, robot_url)
             await self._sync_robot_media(result, robot_url, "video")
-            live_result = await self._mirror_media_result(result, recording=False)
+            live_result = await self._stabilize_stop_after_media_sync(
+                result,
+                robot_url,
+                sync_media=True,
+                on_media_url=on_media_url,
+            )
             await self.events.publish("ROBOT_STATE", live_result.model_dump(mode="json"))
             return live_result
 
@@ -1925,7 +2933,7 @@ class RobotService:
         # Clear local outcomes before stop so only values deliberately produced by this stop can
         # survive. Keep media_url: some firmware returns it at start and omits it at stop.
         before_stop = await self.adapter.status()
-        if not before_stop.recording:
+        if not before_stop.recording and not self.recording_stop_required():
             raise ValueError("机器人当前未在录制")
         before_stop.media_local_path = None
         before_stop.media_sync_error = None
@@ -1943,7 +2951,12 @@ class RobotService:
             # robot accepted stop, a network/routing failure must not rewrite that success as
             # "recording failed"; callers can keep the capture session for a save retry.
             await self._sync_robot_media(result, robot_url, "video")
-        live_result = await self._mirror_media_result(result, recording=result.recording)
+        live_result = await self._stabilize_stop_after_media_sync(
+            result,
+            robot_url,
+            sync_media=sync_media,
+            on_media_url=on_media_url,
+        )
         log_event(
             "info",
             "capture.recording.stopped",
@@ -2053,17 +3066,75 @@ class RobotService:
     async def _mirror_media_result(
         self,
         result: RobotState,
-        *,
-        recording: bool | None = None,
     ) -> RobotState:
-        """Copy only this operation's owned fields back to the adapter's live state."""
+        """Copy only media fields back; heartbeat-owned recording state stays live."""
         live = await self.adapter.status()
-        if recording is not None:
-            live.recording = recording
         live.media_url = result.media_url
         live.media_local_path = result.media_local_path
         live.media_sync_error = result.media_sync_error
         return live.model_copy(deep=True)
+
+    async def _stabilize_stop_after_media_sync(
+        self,
+        result: RobotState,
+        robot_url: str,
+        *,
+        sync_media: bool,
+        on_media_url: Callable[[str], None] | None = None,
+    ) -> RobotState:
+        """Confirm idle after a long transfer, issuing at most one cleanup Stop."""
+        live = await self._mirror_media_result(result)
+        if self.recording_idle_confirmed() and not live.recording:
+            return live
+
+        log_event(
+            "warning",
+            "capture.recording.cleanup_stop_started",
+            robot_url=robot_url,
+            local_path=result.media_local_path,
+            recording=live.recording,
+            recording_status_known=self.recording_status_known(),
+        )
+        try:
+            cleanup_state = await self.adapter.stop_recording()
+        except Exception as exc:
+            log_event(
+                "error",
+                "capture.recording.cleanup_stop_failed",
+                robot_url=robot_url,
+                local_path=result.media_local_path,
+                error=str(exc),
+            )
+            raise RuntimeError(
+                "保存视频后仍未确认机器人已停止录制，补发停止指令失败"
+            ) from exc
+
+        cleanup_url = self._select_video_url(
+            str(cleanup_state.media_url or ""),
+            prefer_state=True,
+        )
+        if cleanup_url and cleanup_url != robot_url:
+            # A camera that kept recording after the first accepted Stop may finalize a second
+            # physical file. The first download is already registered in the media library; make
+            # the cleanup file the recoverable run result instead of silently overwriting its URL.
+            result.media_url = cleanup_url
+            result.media_local_path = None
+            result.media_sync_error = None
+            self._recoverable_video_url = cleanup_url
+            self._notify_media_url(on_media_url, cleanup_url)
+            if sync_media:
+                await self._sync_robot_media(result, cleanup_url, "video")
+
+        live = await self._mirror_media_result(result)
+        if live.recording or not self.recording_idle_confirmed():
+            raise RuntimeError("补发停止指令后仍未确认机器人已停止录制")
+        log_event(
+            "info",
+            "capture.recording.cleanup_stop_finished",
+            robot_url=robot_url,
+            local_path=result.media_local_path,
+        )
+        return live
 
     async def _sync_robot_media(
         self,
@@ -2248,14 +3319,17 @@ def _confirmed_cruise_map(
     target: str,
     *,
     after: datetime | None,
+    heartbeat: RobotHeartbeatDiagnostic | None = None,
 ) -> tuple[bool, str | None, str]:
     """Interpret only a post-ACK heartbeat as physical map readiness."""
     if not state.connected:
         return False, None, "机器人连接已断开"
-    heartbeat = state.diagnostics.last_heartbeat
+    heartbeat = heartbeat or state.diagnostics.last_heartbeat
     if heartbeat is None or (after is not None and heartbeat.received_at <= after):
         return False, None, "尚未收到新的地图心跳"
 
+    # Reuse only one complete physical report. Merging readiness fields across frames can combine
+    # the old map's localization status with the new map's name and create a false confirmation.
     payload = heartbeat.payload
     current_map = payload.get("map") if isinstance(payload.get("map"), dict) else None
     system = payload.get("system") if isinstance(payload.get("system"), dict) else None
@@ -2358,6 +3432,39 @@ def _gimbal_num(value: Any) -> int | float:
     """
     number = float(value)
     return int(number) if number.is_integer() else number
+
+
+def _gimbal_command_budget_seconds(payload: dict[str, Any]) -> float:
+    """Conservative no-ACK fallback based on the command's physical travel."""
+    command = payload.get("gimbal_control")
+    if not isinstance(command, dict):
+        return _GIMBAL_COMMAND_SETTLE_MARGIN_SECONDS
+
+    durations = [0.0]
+    for axis in ("yaw", "pitch"):
+        start = _maybe_float(command.get(f"{axis}_start"))
+        end = _maybe_float(command.get(f"{axis}_end"))
+        speed = _maybe_float(command.get(f"{axis}_speed"))
+        if start is None or end is None:
+            continue
+        distance = abs(end - start)
+        if distance <= 0:
+            continue
+        durations.append(
+            distance / abs(speed)
+            if speed is not None and abs(speed) > 0
+            else _GIMBAL_PREVIOUS_COMMAND_WAIT_SECONDS
+        )
+
+    zoom_start = _maybe_float(command.get("zoom_start"))
+    zoom_end = _maybe_float(command.get("zoom_end"))
+    if zoom_start is not None and zoom_end is not None and zoom_start != zoom_end:
+        durations.append(_GIMBAL_PREVIOUS_COMMAND_WAIT_SECONDS)
+
+    return min(
+        max(durations) + _GIMBAL_COMMAND_SETTLE_MARGIN_SECONDS,
+        _GIMBAL_COMMAND_MAX_BUDGET_SECONDS,
+    )
 
 
 def _maybe_str(value: Any) -> str | None:

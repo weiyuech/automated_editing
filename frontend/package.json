@@ -50,6 +50,10 @@
       {
         "from": "../THIRD_PARTY_NOTICES.md",
         "to": "THIRD_PARTY_NOTICES.md"
+      },
+      {
+        "from": "../scripts/Collect-AVE-RobotDiagnostics.ps1",
+        "to": "support/Collect-AVE-RobotDiagnostics.ps1"
       }
     ],
     "win": {

@@ -241,6 +241,8 @@ class CaptureSession(BaseModel):
     # If stop/download must be retried later, the recovery path can still write the same
     # transit/dwell evidence instead of silently treating the file as ordinary footage.
     segments: list[dict[str, Any]] = Field(default_factory=list)
+    recording_events: list[dict[str, Any]] = Field(default_factory=list)
+    recording_clock: dict[str, Any] = Field(default_factory=dict)
     # Physical heartbeat samples belong to the capture until its video is safely local.  Keeping
     # them here lets a later save retry write the same motion evidence as an immediate stop.
     gimbal_samples: list[tuple[float, float, float]] = Field(default_factory=list)
@@ -458,9 +460,18 @@ DEFAULT_OUTPUT_HEIGHT = 720
 OutputAspectRatio = Literal["16:9", "9:16"]
 
 
+class CaptureSelection(BaseModel):
+    """One recording remains one source, with an explicit selection of its children."""
+
+    capture_id: str = Field(min_length=1, max_length=200)
+    include_full: bool = False
+    segment_ids: list[str] = Field(default_factory=list, max_length=1000)
+
+
 class EditJobRequest(BaseModel):
     title: str = "Untitled edit"
     media_ids: list[str] = Field(default_factory=list)
+    capture_selections: list[CaptureSelection] = Field(default_factory=list, max_length=20)
     music_media_id: str | None = None
     voiceover_media_id: str | None = None
     output_name: str = ""
@@ -515,6 +526,7 @@ class EditJobRequest(BaseModel):
 class EditBatchRequest(BaseModel):
     title: str = "Automation batch"
     media_ids: list[str] = Field(default_factory=list, min_length=1, max_length=20)
+    capture_selections: list[CaptureSelection] = Field(default_factory=list, max_length=20)
     music_media_ids: list[str] = Field(default_factory=list, max_length=100)
     voiceover_media_ids: list[str] = Field(default_factory=list, max_length=100)
     output_count: int = Field(default=1, ge=1, le=100)
@@ -569,6 +581,7 @@ class EditBatchRequest(BaseModel):
 class TimelineDraftRequest(BaseModel):
     title: str = "Timeline draft"
     media_ids: list[str] = Field(default_factory=list, min_length=1, max_length=20)
+    capture_selections: list[CaptureSelection] = Field(default_factory=list, max_length=20)
     music_media_id: str | None = None
     voiceover_media_id: str | None = None
     target_duration_seconds: float = Field(default=30.0, ge=1.0, le=180.0)
@@ -773,6 +786,7 @@ class MediaAsset(BaseModel):
     export_group: str = ""
     variant: str = ""
     variant_label: str = ""
+    capture_group: dict[str, Any] | None = None
 
 
 class MediaCalendarDay(BaseModel):

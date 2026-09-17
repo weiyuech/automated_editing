@@ -67,15 +67,23 @@ class MediaVaultService:
                     asset = self._asset_from_media_item(item)
                     if asset:
                         by_path[asset.path] = asset
+                        self._attach_group(asset, item)
                 else:
                     # A file inside a managed folder is found by scanning, and a scan sees only
                     # the filesystem. Anything the app recorded about it — here, which finished
                     # video it is half of — lives on the media item and has to be carried over,
                     # or the pairing is invisible to the library.
                     self._attach_group(by_path[item.path], item)
-        return sorted(by_path.values(), key=lambda item: item.modified_at, reverse=True)
+        return sorted(by_path.values(), key=lambda item: item.day, reverse=True)
 
     def _attach_group(self, asset: MediaAsset, item: MediaItem) -> None:
+        capture = item.metadata.get("capture_group")
+        if capture:
+            asset.capture_group = capture
+            try:
+                asset.day = _local_day(datetime.fromisoformat(capture["started_at"]))
+            except (ValueError, TypeError):
+                pass
         group = item.metadata.get("export_group")
         if not group:
             return
@@ -92,11 +100,14 @@ class MediaVaultService:
             day.assets.append(asset)
             day.asset_count += 1
             day.total_bytes += asset.size_bytes
+            if asset.capture_group:
+                day.total_bytes += sum(s.get("size_bytes", 0) for s in asset.capture_group["segments"])
         return list(grouped.values())
 
     def storage_report(self) -> StorageReport:
         assets = self.list_assets()
         buckets = [self._bucket(area, path) for area, path in MANAGED_AREAS.items()]
+        buckets.append(self._bucket("capture_segments", GENERATED_DIRS["data"] / "capture_segments"))
         total = sum(bucket.size_bytes for bucket in buckets)
         cleanup_candidates = [
             asset for asset in assets
@@ -137,6 +148,11 @@ class MediaVaultService:
                             pass
                 except OSError:
                     skipped_count += 1
+        if self.media is not None:
+            capture_deleted, capture_freed, capture_skipped = self.media.captures.cleanup_inputs()
+            deleted_count += capture_deleted
+            freed_bytes += capture_freed
+            skipped_count += capture_skipped
         return CleanupResult(deleted_count=deleted_count, freed_bytes=freed_bytes, skipped_count=skipped_count)
 
     def _scan_area(self, area: str, folder: Path) -> Iterable[MediaAsset]:
@@ -149,7 +165,9 @@ class MediaVaultService:
                     continue
                 # Capture timing/point notes belong to the downloaded recording. They are moved
                 # to the trash as its companion and must not appear as a second, unusable asset.
-                if area == "downloads" and path.name.endswith(".capture.json"):
+                if area == "downloads" and path.name.endswith(
+                    (".capture.json", ".gimbal.json")
+                ):
                     continue
                 # The subtitle layer belongs to its export, not beside it in the library. It is
                 # a couple of kilobytes of cue timings, and listing one per finished video would
@@ -191,6 +209,12 @@ class MediaVaultService:
     def _asset_from_media_item(self, item: MediaItem) -> MediaAsset | None:
         path = Path(item.path).expanduser()
         if not path.exists() or not path.is_file():
+            capture = item.metadata.get("capture_group")
+            if capture:
+                moment = item.created_at
+                return MediaAsset(id=item.id, name=capture["title"], path=str(path), role="raw_video", kind="video",
+                                  created_at=moment, modified_at=moment, day=_local_day(moment),
+                                  can_delete=False, can_rename=False, capture_group=capture)
             return None
         resolved = path.resolve()
         stat = resolved.stat()
