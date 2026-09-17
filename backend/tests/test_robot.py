@@ -374,7 +374,11 @@ async def test_complete_map_proof_survives_a_later_gimbal_only_heartbeat(
 
 
 @pytest.mark.asyncio
-async def test_map_ack_bundled_with_complete_target_heartbeat_is_not_missed():
+async def test_map_ack_bundled_with_complete_target_heartbeat_is_not_missed(monkeypatch):
+    # Windows can return the same wall-clock timestamp for the command boundary and an
+    # immediate bundled heartbeat. Physical frame order, not clock resolution, proves freshness.
+    frozen_wall_clock = robot_module.utc_now()
+    monkeypatch.setattr(robot_module, "utc_now", lambda: frozen_wall_clock)
     adapter = HardwareRobotAdapter(EventHub(), "ws://robot.local:8765")
     adapter.state.connected = True
     adapter.state.connection_status = "connected"
@@ -403,6 +407,86 @@ async def test_map_ack_bundled_with_complete_target_heartbeat_is_not_missed():
     state = await robot.switch_map_and_confirm("new-map", timeout_s=0.03)
 
     assert state.map_name == "new-map"
+
+
+@pytest.mark.asyncio
+async def test_same_timestamp_pre_switch_map_heartbeat_remains_stale(monkeypatch):
+    frozen_wall_clock = robot_module.utc_now()
+    monkeypatch.setattr(robot_module, "utc_now", lambda: frozen_wall_clock)
+    adapter = HardwareRobotAdapter(EventHub(), "ws://robot.local:8765")
+    adapter.state.connected = True
+    adapter.state.connection_status = "connected"
+    adapter._apply_protocol_state({
+        "system": {"status": "ready"},
+        "map": {
+            "mode": "localization",
+            "name": "new-map",
+            "status": "ready",
+        },
+        "naviagtion": {"status": "ready"},
+    })
+
+    async def connected():
+        return adapter.state
+
+    class AckOnlySocket:
+        async def send(self, _message):
+            await adapter._handle_message(json.dumps({"robot_switch_map": "true"}))
+
+    adapter.connect = connected
+    adapter.status = connected
+    adapter._socket = AckOnlySocket()
+    robot = RobotService(EventHub(), adapter=adapter)
+
+    with pytest.raises(TimeoutError, match="尚未收到新的地图心跳"):
+        await robot.switch_map_and_confirm("new-map", timeout_s=0.01)
+
+
+@pytest.mark.asyncio
+async def test_map_boundary_follows_reconnect_at_physical_write(monkeypatch):
+    frozen_wall_clock = robot_module.utc_now()
+    monkeypatch.setattr(robot_module, "utc_now", lambda: frozen_wall_clock)
+    adapter = HardwareRobotAdapter(EventHub(), "ws://robot.local:8765")
+    adapter.state.connected = True
+    adapter.state.connection_status = "connected"
+    adapter._connection_epoch = 3
+    for yaw in range(4):
+        adapter._apply_protocol_state({"gimbal": {"yaw": yaw, "pitch": 0}})
+
+    reconnected = False
+
+    async def reconnect_before_write():
+        nonlocal reconnected
+        if not reconnected:
+            reconnected = True
+            adapter._connection_epoch += 1
+            adapter._clear_heartbeat_diagnostics()
+            adapter.state.connected = True
+            adapter.state.connection_status = "connected"
+        return adapter.state
+
+    class ImmediateSwitchSocket:
+        async def send(self, _message):
+            await adapter._handle_message(json.dumps({
+                "robot_switch_map": "true",
+                "system": {"status": "ready"},
+                "map": {
+                    "mode": "localization",
+                    "name": "new-map",
+                    "status": "ready",
+                },
+                "naviagtion": {"status": "ready"},
+            }))
+
+    adapter.connect = reconnect_before_write
+    adapter.status = reconnect_before_write
+    adapter._socket = ImmediateSwitchSocket()
+    robot = RobotService(EventHub(), adapter=adapter)
+
+    state = await robot.switch_map_and_confirm("new-map", timeout_s=0.03)
+
+    assert state.map_name == "new-map"
+    assert adapter.map_switch_write_boundary() == (4, -1)
 
 
 @pytest.mark.asyncio

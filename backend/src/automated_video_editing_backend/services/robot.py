@@ -192,6 +192,10 @@ class HardwareRobotAdapter(RobotAdapter):
         # diagnostic heartbeat. Gimbal/task-only frames arrive much more frequently and must
         # not erase a coherent system+map+navigation report while map confirmation polls it.
         self._latest_complete_map_heartbeat: RobotHeartbeatDiagnostic | None = None
+        # Sequence and socket generation captured at the physical map-command write boundary.
+        # RobotService consumes this after the ACK so reconnecting inside _request cannot pair
+        # an old connection's sequence with the replacement connection's generation.
+        self._last_map_switch_write_boundary: tuple[int, int] | None = None
         # Incremented whenever a socket is installed or retired. Frames and accepted manual map
         # switches from an older physical connection cannot own work on its replacement.
         self._connection_epoch = 0
@@ -422,7 +426,19 @@ class HardwareRobotAdapter(RobotAdapter):
         return response if isinstance(response, list) else []
 
     async def switch_map(self, map_name: str) -> dict[str, Any]:
-        response = await self._request({"set_switch_map": map_name}, "robot_switch_map")
+        self._last_map_switch_write_boundary = None
+
+        def capture_write_boundary() -> None:
+            self._last_map_switch_write_boundary = (
+                self._connection_epoch,
+                self.heartbeat_sequence(),
+            )
+
+        response = await self._request(
+            {"set_switch_map": map_name},
+            "robot_switch_map",
+            on_write_started=capture_write_boundary,
+        )
         self.state.last_command = "set_switch_map"
         self._touch()
         await self._publish_state()
@@ -571,6 +587,15 @@ class HardwareRobotAdapter(RobotAdapter):
     def complete_map_heartbeat(self) -> RobotHeartbeatDiagnostic | None:
         """Newest coherent map-readiness report from one raw hardware frame."""
         return self._latest_complete_map_heartbeat
+
+    def heartbeat_sequence(self) -> int:
+        """Order of the newest raw heartbeat on this physical connection."""
+        heartbeat = self.state.diagnostics.last_heartbeat
+        return heartbeat.sequence if heartbeat is not None else -1
+
+    def map_switch_write_boundary(self) -> tuple[int, int] | None:
+        """Physical connection generation and heartbeat order at the latest map write."""
+        return self._last_map_switch_write_boundary
 
     def connection_generation(self) -> int:
         """Physical websocket generation used to scope request and map ownership."""
@@ -1082,6 +1107,7 @@ class HardwareRobotAdapter(RobotAdapter):
         payload: dict[str, Any],
         response_key: str,
         timeout_s: float = 5.0,
+        on_write_started: Callable[[], None] | None = None,
     ) -> Any:
         async with self._request_lock:
             await self.connect()
@@ -1128,6 +1154,8 @@ class HardwareRobotAdapter(RobotAdapter):
                         pending_recording[2],
                         self._connection_epoch,
                     )
+                if on_write_started is not None:
+                    on_write_started()
 
             try:
                 await self._send(payload, on_write_started=bind_reply_to_written_socket)
@@ -2321,6 +2349,7 @@ class RobotService:
         # same transition instead of sending a disruptive duplicate switch.
         self._pending_map_switch_target: str | None = None
         self._pending_map_switch_after: datetime | None = None
+        self._pending_map_switch_after_sequence: int | None = None
         self._pending_map_switch_generation: int | None = None
         # A photo taken during recording replaces RobotState.media_url, so video recovery owns
         # a separate URL that survives a timed-out Stop acknowledgement.
@@ -2338,6 +2367,7 @@ class RobotService:
             self._media_revision += 1
             self._pending_map_switch_target = None
             self._pending_map_switch_after = None
+            self._pending_map_switch_after_sequence = None
             self._pending_map_switch_generation = None
             current = await self.adapter.status()
             if current.recording:
@@ -2366,6 +2396,7 @@ class RobotService:
             self._media_revision += 1
             self._pending_map_switch_target = None
             self._pending_map_switch_after = None
+            self._pending_map_switch_after_sequence = None
             self._pending_map_switch_generation = None
             current = await self.adapter.status()
             if current.recording:
@@ -2610,9 +2641,23 @@ class RobotService:
         # A newer switch supersedes any earlier unconfirmed transition.
         self._pending_map_switch_target = None
         self._pending_map_switch_after = None
+        self._pending_map_switch_after_sequence = None
         self._pending_map_switch_generation = None
         switch_command_boundary = utc_now()
+        switch_heartbeat_boundary = self._adapter_heartbeat_sequence()
+        switch_generation = self._adapter_connection_generation()
         result = await self.adapter.switch_map(map_name)
+        physical_boundary = self._adapter_map_switch_write_boundary()
+        if physical_boundary is not None:
+            switch_generation, switch_heartbeat_boundary = physical_boundary
+        else:
+            # Duck-typed adapters do not expose a physical-write callback. Preserve their
+            # historical post-call generation. A sequence from before a reconnect cannot be
+            # compared with the replacement connection, so fall back to the wall-clock proof.
+            post_switch_generation = self._adapter_connection_generation()
+            if post_switch_generation != switch_generation:
+                switch_heartbeat_boundary = None
+            switch_generation = post_switch_generation
         await self.events.publish("ROBOT_COMMAND", {"type": "set_switch_map", "result": result})
         if isinstance(result, dict) and result.get("ok") is True:
             self._pending_map_switch_target = map_name.strip()
@@ -2620,7 +2665,8 @@ class RobotService:
             # pre-write operation boundary so a complete target heartbeat bundled with an
             # immediate acknowledgement is not lost merely because the waiter resumes later.
             self._pending_map_switch_after = switch_command_boundary
-            self._pending_map_switch_generation = self._adapter_connection_generation()
+            self._pending_map_switch_after_sequence = switch_heartbeat_boundary
+            self._pending_map_switch_generation = switch_generation
         return result
 
     def _adapter_connection_generation(self) -> int | None:
@@ -2628,19 +2674,46 @@ class RobotService:
         value = reader() if callable(reader) else None
         return int(value) if value is not None else None
 
+    def _adapter_map_switch_write_boundary(self) -> tuple[int, int] | None:
+        reader = getattr(self.adapter, "map_switch_write_boundary", None)
+        value = reader() if callable(reader) else None
+        if not isinstance(value, tuple) or len(value) != 2:
+            return None
+        try:
+            return int(value[0]), int(value[1])
+        except (TypeError, ValueError):
+            return None
+
+    def _adapter_heartbeat_sequence(self) -> int | None:
+        """Read the adapter's in-process heartbeat order without touching the transport."""
+        reader = getattr(self.adapter, "heartbeat_sequence", None)
+        if callable(reader):
+            value = reader()
+        else:
+            state = getattr(self.adapter, "state", None)
+            diagnostics = getattr(state, "diagnostics", None)
+            if diagnostics is None:
+                return None
+            heartbeat = getattr(diagnostics, "last_heartbeat", None)
+            value = heartbeat.sequence if heartbeat is not None else -1
+        return int(value) if value is not None else None
+
     def _forget_pending_map_switch(
         self,
         target: str,
         after: datetime | None,
+        after_sequence: int | None,
         generation: int | None,
     ) -> None:
         if (
             self._pending_map_switch_target == target
             and self._pending_map_switch_after == after
+            and self._pending_map_switch_after_sequence == after_sequence
             and self._pending_map_switch_generation == generation
         ):
             self._pending_map_switch_target = None
             self._pending_map_switch_after = None
+            self._pending_map_switch_after_sequence = None
             self._pending_map_switch_generation = None
 
     async def switch_map_and_confirm(
@@ -2672,6 +2745,7 @@ class RobotService:
                 # original command boundary and connection generation; reconnects and newer
                 # contradictory telemetry invalidate it in the adapter.
                 after = self._pending_map_switch_after
+                after_sequence = self._pending_map_switch_after_sequence
                 switch_generation = self._pending_map_switch_generation
                 log_event(
                     "info",
@@ -2684,6 +2758,7 @@ class RobotService:
                 if not isinstance(result, dict) or result.get("ok") is not True:
                     raise ValueError(f"机器人拒绝切换到地图“{target}”")
                 after = self._pending_map_switch_after
+                after_sequence = self._pending_map_switch_after_sequence
                 switch_generation = self._pending_map_switch_generation
 
             deadline = asyncio.get_running_loop().time() + max(0.0, timeout_s)
@@ -2708,6 +2783,7 @@ class RobotService:
                         state,
                         target,
                         after=after,
+                        after_sequence=after_sequence,
                         heartbeat=complete_heartbeat,
                     )
                     last_observation = observation or last_observation
@@ -2717,6 +2793,7 @@ class RobotService:
                         self._forget_pending_map_switch(
                             target,
                             after,
+                            after_sequence,
                             switch_generation,
                         )
                         return state
@@ -2731,7 +2808,12 @@ class RobotService:
             except (Exception, asyncio.CancelledError):
                 # A failed/cancelled confirmation must not make later retries wait forever on
                 # an old accepted switch. The next attempt is then free to issue one fresh switch.
-                self._forget_pending_map_switch(target, after, switch_generation)
+                self._forget_pending_map_switch(
+                    target,
+                    after,
+                    after_sequence,
+                    switch_generation,
+                )
                 raise
 
     async def path_list(self, map_name: str) -> list[str]:
@@ -3319,13 +3401,23 @@ def _confirmed_cruise_map(
     target: str,
     *,
     after: datetime | None,
+    after_sequence: int | None = None,
     heartbeat: RobotHeartbeatDiagnostic | None = None,
 ) -> tuple[bool, str | None, str]:
     """Interpret only a post-ACK heartbeat as physical map readiness."""
     if not state.connected:
         return False, None, "机器人连接已断开"
     heartbeat = heartbeat or state.diagnostics.last_heartbeat
-    if heartbeat is None or (after is not None and heartbeat.received_at <= after):
+    if heartbeat is None:
+        return False, None, "尚未收到新的地图心跳"
+    if after_sequence is not None:
+        is_new_heartbeat = heartbeat.sequence > after_sequence
+    else:
+        # Third-party/test adapters without the hardware heartbeat counter retain the legacy
+        # wall-clock boundary. Hardware uses sequence order because Windows' coarse wall clock
+        # can give a command and its immediate acknowledgement heartbeat the same timestamp.
+        is_new_heartbeat = after is None or heartbeat.received_at > after
+    if not is_new_heartbeat:
         return False, None, "尚未收到新的地图心跳"
 
     # Reuse only one complete physical report. Merging readiness fields across frames can combine
