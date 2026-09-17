@@ -57,10 +57,10 @@
           <p v-if="robotCommandStatus" class="inline-status" :class="robotCommandStatusKind">{{ robotCommandStatus }}</p>
         </Panel>
 
-        <Panel title="地图与路径文件">
+        <Panel title="机器人当前地图 / 手动切换">
           <div class="form-stack">
-            <select v-model="selectedRobotMap" class="field" :disabled="cruiseRunning">
-              <option value="">选择地图</option>
+            <select v-model="selectedRobotMap" class="field" :disabled="cruiseRunning || isRobotBusy">
+              <option value="">选择要查看或切换的地图</option>
               <option v-for="name in robotMaps" :key="name" :value="name">{{ name }}</option>
             </select>
             <div class="button-row">
@@ -70,7 +70,7 @@
             <p class="form-hint">
               路径文件：{{ robotPaths.length ? robotPaths.join('、') : '尚未加载' }}
             </p>
-            <p class="form-hint">点位的添加、试跑和成批运行都在「拍摄」页。</p>
+            <p class="form-hint">机器人当前：{{ robot.connected && robot.map_name ? robot.map_name : '未回报' }}。这里只手动查看或切换；巡游地图在「拍摄」页设置。</p>
           </div>
         </Panel>
 
@@ -190,13 +190,19 @@
             <div id="automatic-camerawork-settings" class="camera-settings-section">
               <div>
                 <strong>自动运镜（巡游）</strong>
-                <p class="form-hint">设置绝对角度范围与静止锚点。巡游移动时调整水平和俯仰；机器人停稳后才会变焦，运镜结束后回到锚点。</p>
+                <p class="form-hint">巡游时自动调整取景，并按设定占比回到锚点。</p>
               </div>
               <div class="gimbal-axis">
                 <span class="axis-name">锚点</span>
                 <label><small>水平 (−90~90)</small><input v-model.number="cameraworkForm.anchor_yaw" class="field" type="number" min="-90" max="90" step="1" @input="markCameraworkDirty" /></label>
                 <label><small>俯仰 (−60~15)</small><input v-model.number="cameraworkForm.anchor_pitch" class="field" type="number" min="-60" max="15" step="1" @input="markCameraworkDirty" /></label>
                 <label><small>变焦 (1~3.5)</small><input v-model.number="cameraworkForm.anchor_zoom" class="field" type="number" min="1" max="3.5" step="0.1" @input="markCameraworkDirty" /></label>
+              </div>
+              <div class="gimbal-axis">
+                <span class="axis-name">节奏</span>
+                <label><small>回到锚点的时间占比 (0~100%)</small><input v-model.number="cameraworkForm.anchor_time_percent" class="field" type="number" min="0" max="100" step="1" @input="markCameraworkDirty" /></label>
+                <label><small>每次回到锚点后停留（秒）</small><input v-model.number="cameraworkForm.anchor_dwell_seconds" class="field" type="number" min="0.5" max="120" step="0.5" @input="markCameraworkDirty" /></label>
+                <span class="axis-nospeed">到达锚点后开始计时</span>
               </div>
               <div class="gimbal-axis">
                 <span class="axis-name">水平</span>
@@ -220,7 +226,7 @@
                 <span class="axis-name">速度</span>
                 <label><small>最慢 (2~5°/秒)</small><input v-model.number="cameraworkForm.speed_min" class="field" type="number" min="2" max="5" step="1" @input="markCameraworkDirty" /></label>
                 <label><small>最快 (2~5°/秒)</small><input v-model.number="cameraworkForm.speed_max" class="field" type="number" min="2" max="5" step="1" @input="markCameraworkDirty" /></label>
-                <span class="axis-nospeed">大幅运镜不会提高速度</span>
+                <span class="axis-nospeed">水平/俯仰同速</span>
               </div>
               <div class="button-row">
                 <button :disabled="!heartbeatPoseFresh" @click="useCurrentCameraworkAnchor">使用当前水平/俯仰</button>
@@ -290,16 +296,23 @@
 
         <Panel :title="cruiseListTitle" class="wide">
           <div class="form-stack">
+            <div class="settings-group">本次巡游地图</div>
             <div class="settings-pair">
-              <select v-model="cruiseMap" class="field">
-                <option value="">地图</option>
+              <select :value="cruiseMap" class="field" :disabled="isCruiseBusy || cruiseRunning" @change="changeCruiseMap">
+                <option value="">选择地图</option>
+                <option v-if="cruiseMap && !robotMaps.includes(cruiseMap)" :value="cruiseMap">{{ cruiseMap }}（清单地图）</option>
                 <option v-for="name in robotMaps" :key="name" :value="name">{{ name }}</option>
               </select>
               <div class="button-row">
-                <button :disabled="isCruiseBusy" @click="refreshCruiseMaps">刷新地图</button>
-                <button :disabled="!cruiseMap || isCruiseBusy" @click="loadCruisePaths">刷新路径文件</button>
+                <button :disabled="isCruiseBusy || cruiseRunning" @click="refreshCruiseMaps">刷新地图</button>
+                <button :disabled="!cruiseMap || isCruiseBusy || cruiseRunning" @click="loadCruisePaths">刷新路径文件</button>
               </div>
             </div>
+
+            <p class="inline-status" :class="cruiseMapView.kind">{{ cruiseMapView.text }}</p>
+            <p v-if="['unavailable-map', 'stale-paths', 'invalid-goal'].includes(cruisePlanState.code)" class="inline-status danger">
+              {{ cruisePlanState.message }}
+            </p>
 
             <p class="form-hint">
               路径文件是设置的坐标表，清单是您自己排的拍摄顺序。
@@ -329,7 +342,7 @@
                 <span>{{ index + 1 }}</span>
                 <span>{{ point.path_name }} · #{{ point.goal_id }}</span>
                 <span class="asset-actions">
-                  <button :disabled="isCruiseBusy || cruiseRunning" @click="testCruisePoint(point)">试跑</button>
+                  <button :disabled="!canTestCruisePoint(point)" @click="testCruisePoint(point)">试跑</button>
                   <button :disabled="index === 0" @click="moveCruisePoint(index, -1)">上移</button>
                   <button :disabled="index === cruisePoints.length - 1" @click="moveCruisePoint(index, 1)">下移</button>
                   <button @click="removeCruisePoint(index)">删除</button>
@@ -342,31 +355,12 @@
         <Panel title="巡游设置">
           <div class="form-stack settings-form">
             <p class="form-hint">开始巡游即开始录制，全程只录一次，途中不中断。</p>
-            <div class="settings-pair">
-              <input v-model.number="cruiseDwellMin" class="field" type="number" min="0" max="120" step="0.5" placeholder="停留最短秒数" />
-              <input v-model.number="cruiseDwellMax" class="field" type="number" min="0" max="120" step="0.5" placeholder="停留最长秒数" />
-            </div>
-            <p class="form-hint">每到达一个点位随机停留 {{ cruiseDwellMin }}–{{ cruiseDwellMax }} 秒，避免刚到就转身、拍不到可用画面。</p>
-
             <label class="toggle-row"><input v-model="cruiseAutoCamerawork" type="checkbox" />自动运镜（使用「镜头设置」中的配置）</label>
             <template v-if="cruiseAutoCamerawork">
-              <p class="form-hint">巡游移动时缓慢调整水平和俯仰；到达点位并停稳后执行变焦，运镜结束后回到锚点。请先在「镜头设置」中完成配置。</p>
+              <p class="form-hint">巡游时自动调整取景，并按已保存的设置回到锚点。</p>
               <div class="button-row"><button @click="goToCameraworkSettings">前往镜头设置</button></div>
               <p v-if="!cameraworkConfigured" class="inline-status danger">尚未配置自动运镜，请先前往「镜头设置」。</p>
             </template>
-            <label class="toggle-row"><input v-model="cruiseScanEnabled" type="checkbox" :disabled="cruiseAutoCamerawork" />停留时云台缓慢扫视</label>
-            <template v-if="cruiseScanEnabled && !cruiseAutoCamerawork">
-              <div class="settings-pair">
-                <select v-model="cruiseScanDirection" class="field">
-                  <option value="right">向右扫视</option>
-                  <option value="left">向左扫视</option>
-                </select>
-                <input v-model.number="cruiseScanOffset" class="field" type="number" min="1" max="60" step="1" placeholder="扫视角度" />
-              </div>
-              <input v-model.number="cruiseScanSpeed" class="field" type="number" min="1" max="30" step="1" placeholder="扫视速度（度 / 秒）" />
-              <p class="form-hint">只在机器人停稳后扫视，去而复返回到原角度，不会边走边转。停留时间会自动不少于 {{ cruiseScanBudget }} 秒，避免扫到一半被打断。</p>
-            </template>
-            <p v-if="cruiseDwellWarning" class="inline-status danger">{{ cruiseDwellWarning }}</p>
           </div>
         </Panel>
 
@@ -385,9 +379,9 @@
                 <small>{{ route.request.points.length }} 个点位 · {{ route.request.map_name || '未指定地图' }}</small>
               </div>
               <div class="asset-actions">
-                <button @click="loadCruiseRoute(route)">载入</button>
+                <button :disabled="isCruiseBusy || cruiseRunning" @click="loadCruiseRoute(route)">载入</button>
                 <button :disabled="isCruiseBusy" @click="validateCruiseRoute(route)">校验</button>
-                <button :disabled="isCruiseBusy || cruiseRunning || framingTestBusy || framingTest.running" @click="startCruiseRoute(route)">直接开始</button>
+                <button :disabled="!canStartSavedCruiseRoute(route)" @click="startCruiseRoute(route)">直接开始</button>
                 <button @click="deleteCruiseRoute(route)">删除</button>
               </div>
             </div>
@@ -421,11 +415,11 @@
               </div>
 
               <div class="table cruise-run-table scroll-list">
-                <div class="table-row header"><span>顺序</span><span>路径文件 / 目标点</span><span>状态</span><span>到达 / 停留</span></div>
+                <div class="table-row header"><span>顺序</span><span>路径文件 / 目标点</span><span>状态</span><span>到达</span></div>
                 <div v-for="segment in cruiseRun.segments" :key="segment.index" class="table-row">
                   <span>{{ segment.index + 1 }}</span>
                   <span>{{ segment.path_name }} · #{{ segment.goal_id }}</span>
-                  <span>{{ cruiseSegmentLabel(segment.status) }}{{ segment.scanned ? ' · 已扫视' : '' }}</span>
+                  <span>{{ cruiseSegmentLabel(segment.status) }}</span>
                   <span>{{ cruiseSegmentTiming(segment) }}</span>
                 </div>
               </div>
@@ -1614,6 +1608,18 @@ import {
   resolveCaptureStoppedMedia
 } from './capture-policy.js'
 import {
+  cameraworkProfileWarning,
+  normalizeCameraworkProfile
+} from './camerawork-policy.js'
+import {
+  cruiseMapChangeDecision,
+  cruiseMapContext,
+  inspectCruisePlan,
+  isCurrentMapRequest,
+  isValidCruiseGoalId,
+  isSavedCruiseRequestReady
+} from './cruise-map-policy.js'
+import {
   HEARTBEAT_FRESH_MS,
   gimbalCommandValues,
   hasFreshHeartbeatPose,
@@ -1676,17 +1682,13 @@ const robotCommandStatus = ref('')
 const robotCommandStatusKind = ref('muted')
 const isRobotBusy = ref(false)
 const cruiseMap = ref('')
+const cruiseMapsVerified = ref(false)
 const cruisePaths = ref([])
+const cruisePathsLoadedForMap = ref('')
 const cruisePoints = ref([])
 const cruiseNewPath = ref('')
 const cruiseNewGoalId = ref(1)
-const cruiseDwellMin = ref(5)
-const cruiseDwellMax = ref(10)
 const cruiseAutoCamerawork = ref(false)
-const cruiseScanEnabled = ref(false)
-const cruiseScanDirection = ref('right')
-const cruiseScanOffset = ref(15)
-const cruiseScanSpeed = ref(5)
 const cruiseRoutes = ref([])
 const cruiseRouteName = ref('')
 const cruiseRun = ref(null)
@@ -1694,6 +1696,8 @@ const cruiseIssues = ref([])
 const cruiseStatus = ref('')
 const cruiseStatusKind = ref('muted')
 const isCruiseBusy = ref(false)
+let cruisePathsRequestId = 0
+let robotPathsRequestId = 0
 const nonRecordingCruiseLaunchPending = ref(false)
 const nonRecordingCruiseCaptureSessionId = ref('')
 const MAX_CRUISE_POINTS = 200
@@ -1724,13 +1728,7 @@ const gimbalForm = ref({
   pitch_start: 0, pitch_end: 0, pitch_speed: 5,
   zoom_start: 1, zoom_end: 1
 })
-const cameraworkForm = ref({
-  anchor_yaw: 0, anchor_pitch: 0, anchor_zoom: 1,
-  yaw_min: -60, yaw_max: 60,
-  pitch_min: -15, pitch_max: 15,
-  zoom_min: 1, zoom_max: 1.5,
-  speed_min: 2, speed_max: 5
-})
+const cameraworkForm = ref(normalizeCameraworkProfile())
 const cameraworkLoaded = ref(false)
 const cameraworkDirty = ref(false)
 const cameraworkSaving = ref(false)
@@ -2952,11 +2950,30 @@ const cruiseRunning = computed(() => cruiseRun.value?.status === 'running')
 const cruiseRunStatusLabel = computed(() => CRUISE_RUN_LABELS[cruiseRun.value?.status] || '—')
 const cruiseArrivedCount = computed(() => (cruiseRun.value?.segments || []).filter((item) => item.status === 'arrived').length)
 const cruiseFailedCount = computed(() => (cruiseRun.value?.segments || []).filter((item) => item.status === 'failed').length)
+const cruiseMapView = computed(() => cruiseMapContext(
+  robot.value?.connected ? robot.value?.map_name : '',
+  cruiseMap.value
+))
+const cruisePlanState = computed(() => inspectCruisePlan({
+  cruiseMap: cruiseMap.value,
+  mapsVerified: cruiseMapsVerified.value,
+  availableMaps: robotMaps.value,
+  loadedMap: cruisePathsLoadedForMap.value,
+  availablePaths: cruisePaths.value,
+  points: cruisePoints.value
+}))
 const canAddCruisePoint = computed(() => {
-  const goalId = Number(cruiseNewGoalId.value)
-  return Boolean(cruiseNewPath.value) && Number.isInteger(goalId) && goalId >= 0 && cruisePoints.value.length < MAX_CRUISE_POINTS
+  return cruisePathsLoadedForMap.value === cruiseMap.value
+    && cruisePaths.value.includes(cruiseNewPath.value)
+    && isValidCruiseGoalId(cruiseNewGoalId.value)
+    && cruisePoints.value.length < MAX_CRUISE_POINTS
+    && !isCruiseBusy.value && !cruiseRunning.value
 })
-const canSaveCruiseRoute = computed(() => cruiseRouteName.value.trim().length > 0 && cruisePoints.value.length > 0)
+const canSaveCruiseRoute = computed(() =>
+  cruiseRouteName.value.trim().length > 0
+  && cruisePlanState.value.ready
+  && (!cruiseAutoCamerawork.value || cameraworkConfigured.value)
+)
 // The count belongs in the title so the panel reads as a list even when it is empty.
 const cruiseListTitle = computed(() => `巡游清单（${cruisePoints.value.length} 个点位）`)
 
@@ -2983,23 +3000,8 @@ const recordingSourceLabel = computed(() => {
   if (robot.value.recording) return '手动录制'
   return ''
 })
-const cruiseDwellWarning = computed(() =>
-  Number(cruiseDwellMax.value) < Number(cruiseDwellMin.value) ? '停留最长秒数不能小于最短秒数。' : ''
-)
 const cameraworkConfigured = computed(() => Boolean(settings.value?.automation?.camerawork?.configured))
-const cameraworkWarning = computed(() => {
-  const form = cameraworkForm.value
-  if (Object.values(form).some((value) => !Number.isFinite(Number(value)))) return '所有自动运镜参数都必须是数字。'
-  if (![form.anchor_yaw, form.anchor_pitch, form.yaw_min, form.yaw_max, form.pitch_min, form.pitch_max].every(Number.isInteger)) return '水平和俯仰角度必须是整数。'
-  if (form.yaw_min < -90 || form.yaw_max > 90 || form.yaw_max <= form.yaw_min) return '水平范围必须在 −90°~90° 内，且左边界大于右边界。'
-  if (form.pitch_min < -60 || form.pitch_max > 15 || form.pitch_max <= form.pitch_min) return '俯仰范围必须在 −60°~15° 内，且下边界大于上边界。'
-  if (form.zoom_min < 1 || form.zoom_max > 3.5 || form.zoom_max <= form.zoom_min) return '变焦范围必须在 1~3.5 内，且最大值大于最小值。'
-  if (!Number.isInteger(form.speed_min) || !Number.isInteger(form.speed_max) || form.speed_min < 2 || form.speed_max > 5 || form.speed_max < form.speed_min) return '速度必须是 2~5°/秒内的整数，且最快速度不小于最慢速度。'
-  if (form.anchor_yaw < form.yaw_min || form.anchor_yaw > form.yaw_max) return '水平锚点必须位于水平范围内。'
-  if (form.anchor_pitch < form.pitch_min || form.anchor_pitch > form.pitch_max) return '俯仰锚点必须位于俯仰范围内。'
-  if (form.anchor_zoom < form.zoom_min || form.anchor_zoom > form.zoom_max) return '变焦锚点必须位于变焦范围内。'
-  return ''
-})
+const cameraworkWarning = computed(() => cameraworkProfileWarning(cameraworkForm.value))
 // A recording cruise needs sole ownership of the recording. Internal no-record trial sessions
 // are filtered by capture-policy; the cruiseRunning exclusion leaves only a manual session here.
 const manualCaptureActive = computed(() => Boolean(activeSession.value) && !cruiseRunning.value)
@@ -3047,26 +3049,16 @@ function heartbeatAxisLabel(axis) {
 }
 
 const canStartCruise = computed(() =>
-  cruisePoints.value.length > 0 && !cruiseRunning.value && !isCruiseBusy.value
+  cruisePlanState.value.ready && !cruiseRunning.value && !isCruiseBusy.value
   && !framingTestBusy.value && !framingTest.value.running
-  && !cruiseDwellWarning.value && !manualCaptureActive.value
+  && !manualCaptureActive.value
   && (!cruiseAutoCamerawork.value || cameraworkConfigured.value)
 )
-const cruiseScanBudget = computed(() => {
-  const speed = Math.max(1, Number(cruiseScanSpeed.value) || 1)
-  return (2 * (Number(cruiseScanOffset.value || 0) / speed + 0.8)).toFixed(1)
-})
-
-watch(cruiseAutoCamerawork, (enabled) => {
-  if (enabled) cruiseScanEnabled.value = false
-})
-
 function cruiseSegmentLabel(status) { return CRUISE_SEGMENT_LABELS[status] || status }
 
 function cruiseSegmentTiming(segment) {
   if (segment.arrived_at_seconds == null) return segment.error ? humanError(segment.error) : '—'
-  const arrived = `${segment.arrived_at_seconds.toFixed(1)}s`
-  return segment.dwell_seconds == null ? arrived : `${arrived} · 停留 ${segment.dwell_seconds.toFixed(1)}s`
+  return `${segment.arrived_at_seconds.toFixed(1)}s`
 }
 
 function cruiseIssueText(issue) {
@@ -3090,6 +3082,16 @@ function setCruiseStatus(kind, message) {
   cruiseStatus.value = message
 }
 
+function reportCruiseStartError(error) {
+  const issues = error.detail?.issues
+  if (Array.isArray(issues)) {
+    cruiseIssues.value = issues
+    setCruiseStatus('danger', '启动检查未通过，机器人未移动。')
+    return
+  }
+  setCruiseStatus('danger', `启动失败：${humanError(error.message)}`)
+}
+
 async function refreshCruiseRoutes() { cruiseRoutes.value = await api('/cruise/routes') }
 async function refreshCruiseRun() { applyCruiseRunState(await api('/cruise')) }
 async function refreshCruiseCaptureState() {
@@ -3105,17 +3107,42 @@ async function refreshCruiseMaps() {
   setCruiseStatus('muted', '正在加载机器人地图...')
   try {
     robotMaps.value = await api('/robot/maps')
-    setCruiseStatus('success', `已加载 ${robotMaps.value.length} 张机器人地图。`)
+    cruiseMapsVerified.value = true
+    if (cruiseMap.value && !robotMaps.value.includes(cruiseMap.value)) {
+      setCruiseStatus('danger', `机器人未提供本次巡游地图「${cruiseMap.value}」，请重新选择。`)
+    } else {
+      setCruiseStatus('success', `已加载 ${robotMaps.value.length} 张机器人地图。`)
+    }
   } catch (err) {
+    cruiseMapsVerified.value = false
     setCruiseStatus('danger', `地图加载失败：${humanError(err.message)}`)
   } finally {
     isCruiseBusy.value = false
   }
 }
 
+function canTestCruisePoint(point) {
+  return !isCruiseBusy.value
+    && !cruiseRunning.value
+    && cruisePathsLoadedForMap.value === cruiseMap.value
+    && cruisePaths.value.includes(point?.path_name)
+}
+
+function canStartSavedCruiseRoute(route) {
+  return isSavedCruiseRequestReady(route?.request)
+    && !isCruiseBusy.value
+    && !cruiseRunning.value
+    && !framingTestBusy.value
+    && !framingTest.value.running
+    && !manualCaptureActive.value
+}
+
 /** Run a single point with no recording: the only way to find out whether a goal_id is real. */
 async function testCruisePoint(point) {
-  if (isCruiseBusy.value || cruiseRunning.value) return
+  if (!canTestCruisePoint(point)) {
+    setCruiseStatus('danger', '该点位不属于当前已核对的巡游地图，请刷新路径或重新添加。')
+    return
+  }
   isCruiseBusy.value = true
   nonRecordingCruiseLaunchPending.value = true
   nonRecordingCruiseCaptureSessionId.value = ''
@@ -3129,10 +3156,8 @@ async function testCruisePoint(point) {
         map_name: cruiseMap.value || null,
         points: [{ path_name: point.path_name, goal_id: point.goal_id, goal_object: null }],
         record: false,
-        dwell_min_seconds: 0,
-        dwell_max_seconds: 0,
         arrival_timeout_seconds: CRUISE_ARRIVAL_TIMEOUT_SECONDS,
-        gimbal_scan: { enabled: false }
+        auto_camerawork: false
       })
     }))
     setCruiseStatus('muted', '试跑已开始，不录制。到达或失败会显示在「运行状态」。')
@@ -3145,26 +3170,85 @@ async function testCruisePoint(point) {
   }
 }
 
-async function loadCruisePaths() {
-  if (!cruiseMap.value || isCruiseBusy.value) return
+async function loadCruisePaths({ reportSuccess = true } = {}) {
+  const requestedMap = cruiseMap.value
+  if (!requestedMap || isCruiseBusy.value) return false
+  const requestId = ++cruisePathsRequestId
   isCruiseBusy.value = true
+  cruisePathsLoadedForMap.value = ''
   try {
-    cruisePaths.value = await api(`/robot/paths?map_name=${encodeURIComponent(cruiseMap.value)}`)
+    const paths = await api(`/robot/paths?map_name=${encodeURIComponent(requestedMap)}`)
+    if (!isCurrentMapRequest(requestedMap, cruiseMap.value, requestId, cruisePathsRequestId)) return false
+    cruisePaths.value = paths
+    cruisePathsLoadedForMap.value = requestedMap
     if (!cruiseNewPath.value && cruisePaths.value.length) cruiseNewPath.value = cruisePaths.value[0]
-    setCruiseStatus('success', `已加载 ${cruisePaths.value.length} 个路径文件。`)
+    if (reportSuccess) setCruiseStatus('success', `已加载 ${cruisePaths.value.length} 个路径文件。`)
+    return true
   } catch (err) {
-    setCruiseStatus('danger', `路径文件加载失败：${humanError(err.message)}`)
+    if (isCurrentMapRequest(requestedMap, cruiseMap.value, requestId, cruisePathsRequestId)) {
+      cruisePaths.value = []
+      cruisePathsLoadedForMap.value = ''
+      setCruiseStatus('danger', `路径文件加载失败：${humanError(err.message)}`)
+    }
+    return false
   } finally {
-    isCruiseBusy.value = false
+    if (requestId === cruisePathsRequestId) isCruiseBusy.value = false
   }
 }
 
-// Opening 巡游拍摄 with no map chosen inherits whatever the robot is already on, so the
-// map is not picked twice across the two pages. Still freely overridable.
+async function changeCruiseMap(event) {
+  const nextMap = String(event?.target?.value || '')
+  const previousMap = cruiseMap.value
+  if (nextMap === previousMap) return
+
+  const pointCount = cruisePoints.value.length
+  const decision = cruiseMapChangeDecision(previousMap, nextMap, pointCount)
+  if (decision.requiresConfirmation && !window.confirm(`切换本次巡游地图会清空当前 ${pointCount} 个点位，避免误用旧地图路径。继续吗？`)) {
+    event.target.value = previousMap
+    return
+  }
+
+  cruiseMap.value = nextMap
+  cruisePaths.value = []
+  cruisePathsLoadedForMap.value = ''
+  cruiseNewPath.value = ''
+  if (decision.clearPoints) cruisePoints.value = []
+  cruiseIssues.value = []
+  if (!nextMap) {
+    setCruiseStatus('muted', decision.clearPoints ? `已清空 ${pointCount} 个旧地图点位。` : '请选择本次巡游地图。')
+    return
+  }
+
+  const loaded = await loadCruisePaths({ reportSuccess: false })
+  if (loaded) {
+    if (decision.preservePoints) {
+      const state = cruisePlanState.value
+      setCruiseStatus(
+        state.ready ? 'success' : 'danger',
+        state.ready
+          ? `已为旧清单指定地图「${nextMap}」并保留 ${pointCount} 个点位；路径已重新核对。`
+          : `已为旧清单指定地图「${nextMap}」并保留 ${pointCount} 个点位；${state.message}`
+      )
+      return
+    }
+    setCruiseStatus(
+      'success',
+      `${decision.clearPoints ? `已清空 ${pointCount} 个旧地图点位；` : ''}已加载「${nextMap}」的 ${cruisePaths.value.length} 个路径文件。`
+    )
+  }
+}
+
+// Use only the connected robot's reported map as an initial suggestion. The manual browser
+// selection on 镜头设置 is deliberately not a cruise configuration source.
 watch(active, (page) => {
   if (page !== 'shoot' || cruiseMap.value) return
-  const inherited = robot.value?.map_name || selectedRobotMap.value
-  if (inherited) cruiseMap.value = inherited
+  const inherited = robot.value?.connected ? robot.value?.map_name : ''
+  if (!inherited) return
+  cruiseMap.value = inherited
+  cruisePaths.value = []
+  cruisePathsLoadedForMap.value = ''
+  cruiseNewPath.value = ''
+  loadCruisePaths()
 })
 
 // Settings access lasts for one visit only. Leaving immediately restores the lock and revokes
@@ -3192,10 +3276,8 @@ watch(tuneSourceId, () => {
   tuneOut.value = 0
 })
 
-watch(cruiseMap, () => {
-  cruisePaths.value = []
-  cruiseNewPath.value = ''
-  if (cruiseMap.value) loadCruisePaths()
+watch(selectedRobotMap, () => {
+  robotPaths.value = []
 })
 
 function addCruisePoint() {
@@ -3218,6 +3300,7 @@ function moveCruisePoint(index, delta) {
 }
 
 function buildCruiseRequest() {
+  if (!cruisePlanState.value.ready) throw new Error(cruisePlanState.value.message)
   return {
     title: cruiseRouteName.value.trim() || '巡游',
     map_name: cruiseMap.value || null,
@@ -3227,32 +3310,20 @@ function buildCruiseRequest() {
       goal_object: null
     })),
     record: true,
-    dwell_min_seconds: Number(cruiseDwellMin.value),
-    dwell_max_seconds: Number(cruiseDwellMax.value),
     arrival_timeout_seconds: CRUISE_ARRIVAL_TIMEOUT_SECONDS,
-    gimbal_scan: {
-      enabled: cruiseScanEnabled.value && !cruiseAutoCamerawork.value,
-      direction: cruiseScanDirection.value,
-      yaw_offset_deg: Number(cruiseScanOffset.value),
-      yaw_speed_deg_s: Number(cruiseScanSpeed.value)
-    },
     auto_camerawork: cruiseAutoCamerawork.value
   }
 }
 
 function applyCruiseRequest(request) {
   cruiseMap.value = request.map_name || ''
+  cruisePaths.value = []
+  cruisePathsLoadedForMap.value = ''
+  cruiseNewPath.value = ''
   // Old saved routes may still contain goal_object. Keep cruise navigation-only when loading
   // them so legacy data cannot silently restore robot-owned alignment.
   cruisePoints.value = (request.points || []).map((point) => ({ ...point, goal_object: null }))
-  cruiseDwellMin.value = request.dwell_min_seconds
-  cruiseDwellMax.value = request.dwell_max_seconds
   cruiseAutoCamerawork.value = Boolean(request.auto_camerawork)
-  const scan = request.gimbal_scan || {}
-  cruiseScanEnabled.value = Boolean(scan.enabled) && !cruiseAutoCamerawork.value
-  cruiseScanDirection.value = scan.direction || 'right'
-  cruiseScanOffset.value = scan.yaw_offset_deg ?? 15
-  cruiseScanSpeed.value = scan.yaw_speed_deg_s ?? 5
 }
 
 async function saveCruiseRoute() {
@@ -3272,14 +3343,20 @@ async function saveCruiseRoute() {
   }
 }
 
-function loadCruiseRoute(route) {
+async function loadCruiseRoute(route) {
+  if (isCruiseBusy.value || cruiseRunning.value) return
   applyCruiseRequest(route.request)
   cruiseRouteName.value = route.name
   cruiseIssues.value = []
-  // The cruiseMap watch reloads paths when the map actually changed; load here only when
-  // it did not, so a route on the current map still gets its path list.
-  if (cruiseMap.value && !cruisePaths.value.length) loadCruisePaths()
-  setCruiseStatus('muted', `已载入清单「${route.name}」，共 ${route.request.points.length} 个点位。`)
+  const loaded = cruiseMap.value
+    ? await loadCruisePaths({ reportSuccess: false })
+    : false
+  if (loaded || !cruiseMap.value) {
+    setCruiseStatus(
+      cruiseMap.value ? 'success' : 'danger',
+      `已载入清单「${route.name}」，共 ${route.request.points.length} 个点位${cruiseMap.value ? '，地图路径已核对' : '，但未指定地图'}。`
+    )
+  }
 }
 
 async function deleteCruiseRoute(route) {
@@ -3319,7 +3396,7 @@ async function startCruiseRoute(route) {
     setCruiseStatus('danger', '原地采集进行中，请先停止采集再开始巡游。')
     return
   }
-  if (isCruiseBusy.value || cruiseRunning.value) return
+  if (!canStartSavedCruiseRoute(route)) return
   isCruiseBusy.value = true
   const startsWithoutRecording = route.request?.record === false
   nonRecordingCruiseLaunchPending.value = startsWithoutRecording
@@ -3337,13 +3414,7 @@ async function startCruiseRoute(route) {
       nonRecordingCruiseCaptureSessionId.value = ''
     }
     // A 409 carries the validation payload, so the operator sees which rows are wrong.
-    const issues = err.detail?.issues
-    if (Array.isArray(issues)) {
-      cruiseIssues.value = issues
-      setCruiseStatus('danger', '校验未通过，机器人未移动。')
-    } else {
-      setCruiseStatus('danger', `启动失败：${humanError(err.message)}`)
-    }
+    reportCruiseStartError(err)
   } finally {
     isCruiseBusy.value = false
   }
@@ -3363,7 +3434,7 @@ async function startCruise() {
     applyCruiseRunState(await api('/cruise/start', { method: 'POST', body: JSON.stringify(buildCruiseRequest()) }))
     setCruiseStatus('success', `巡游已开始，共 ${cruisePoints.value.length} 个点位。`)
   } catch (err) {
-    setCruiseStatus('danger', `启动失败：${humanError(err.message)}`)
+    reportCruiseStartError(err)
   } finally {
     isCruiseBusy.value = false
   }
@@ -3424,11 +3495,17 @@ async function refreshRobotMaps(allowBusy = false) {
   robotCommandStatus.value = '正在加载机器人地图...'
   try {
     robotMaps.value = await api('/robot/maps')
-    if (!selectedRobotMap.value && robotMaps.value.length) selectedRobotMap.value = robotMaps.value[0]
+    cruiseMapsVerified.value = true
+    if (!robotMaps.value.includes(selectedRobotMap.value)) {
+      selectedRobotMap.value = robotMaps.value.includes(robot.value?.map_name)
+        ? robot.value.map_name
+        : (robotMaps.value[0] || '')
+    }
     robotCommandStatusKind.value = 'success'
     robotCommandStatus.value = `已加载 ${robotMaps.value.length} 张机器人地图。`
     if (selectedRobotMap.value) await refreshRobotPaths(false, true)
   } catch (err) {
+    cruiseMapsVerified.value = false
     robotCommandStatusKind.value = 'danger'
     robotCommandStatus.value = `地图加载失败：${humanError(err.message)}`
   } finally {
@@ -3452,8 +3529,15 @@ async function switchRobotMap() {
       body: JSON.stringify({ map_name: selectedRobotMap.value })
     })
     await refreshRobot()
+    const heartbeatConfirmed = result.ok
+      && robot.value.connected
+      && robot.value.map_name === selectedRobotMap.value
     robotCommandStatusKind.value = result.ok ? 'success' : 'danger'
-    robotCommandStatus.value = result.ok ? `机器人地图已切换到 ${selectedRobotMap.value}。` : `机器人拒绝切换到地图 ${selectedRobotMap.value}。`
+    robotCommandStatus.value = !result.ok
+      ? `机器人拒绝切换到地图 ${selectedRobotMap.value}。`
+      : heartbeatConfirmed
+        ? `机器人回报当前地图为 ${selectedRobotMap.value}。`
+        : '切换指令已接受，实际地图以机器人回报为准。'
     if (result.ok) await refreshRobotPaths(false, true)
   } catch (err) {
     robotCommandStatusKind.value = 'danger'
@@ -3464,24 +3548,31 @@ async function switchRobotMap() {
 }
 
 async function refreshRobotPaths(showStatus = true, allowBusy = false) {
-  if (!selectedRobotMap.value || (isRobotBusy.value && !allowBusy)) return
+  const requestedMap = selectedRobotMap.value
+  if (!requestedMap || (isRobotBusy.value && !allowBusy)) return
+  const requestId = ++robotPathsRequestId
   const previousBusy = isRobotBusy.value
   isRobotBusy.value = true
   if (showStatus) {
     robotCommandStatusKind.value = 'muted'
-    robotCommandStatus.value = `正在加载 ${selectedRobotMap.value} 的路径...`
+    robotCommandStatus.value = `正在加载 ${requestedMap} 的路径...`
   }
   try {
-    robotPaths.value = await api(`/robot/paths?map_name=${encodeURIComponent(selectedRobotMap.value)}`)
+    const paths = await api(`/robot/paths?map_name=${encodeURIComponent(requestedMap)}`)
+    if (!isCurrentMapRequest(requestedMap, selectedRobotMap.value, requestId, robotPathsRequestId)) return
+    robotPaths.value = paths
     if (showStatus) {
       robotCommandStatusKind.value = 'success'
       robotCommandStatus.value = `已加载 ${robotPaths.value.length} 条路径。`
     }
   } catch (err) {
-    robotCommandStatusKind.value = 'danger'
-    robotCommandStatus.value = `路径文件加载失败：${humanError(err.message)}`
+    if (isCurrentMapRequest(requestedMap, selectedRobotMap.value, requestId, robotPathsRequestId)) {
+      robotPaths.value = []
+      robotCommandStatusKind.value = 'danger'
+      robotCommandStatus.value = `路径文件加载失败：${humanError(err.message)}`
+    }
   } finally {
-    isRobotBusy.value = previousBusy
+    if (requestId === robotPathsRequestId) isRobotBusy.value = previousBusy
   }
 }
 
@@ -3492,19 +3583,7 @@ function sendGimbal() { sendWs('ROBOT_GIMBAL', { ...gimbalForm.value }) }
 function loadCameraworkFromSettings() {
   const saved = settings.value?.automation?.camerawork
   if (!saved) return
-  cameraworkForm.value = {
-    anchor_yaw: Number(saved.anchor_yaw ?? 0),
-    anchor_pitch: Number(saved.anchor_pitch ?? 0),
-    anchor_zoom: Number(saved.anchor_zoom ?? 1),
-    yaw_min: Number(saved.yaw_min ?? -60),
-    yaw_max: Number(saved.yaw_max ?? 60),
-    pitch_min: Number(saved.pitch_min ?? -15),
-    pitch_max: Number(saved.pitch_max ?? 15),
-    zoom_min: Number(saved.zoom_min ?? 1),
-    zoom_max: Number(saved.zoom_max ?? 1.5),
-    speed_min: Number(saved.speed_min ?? 2),
-    speed_max: Number(saved.speed_max ?? 5)
-  }
+  cameraworkForm.value = normalizeCameraworkProfile(saved)
   cameraworkLoaded.value = true
   cameraworkDirty.value = false
 }
@@ -5426,7 +5505,6 @@ function humanError(message) {
     'Only app-managed media files can be moved to the trash': '外部导入文件只能移出媒体库，不能由本应用删除。',
     'Voiceover needs text': '请填写旁白文案或大模型提示词。',
     'Nothing usable was found in the text': '文案里没有可用于口播的内容，请补充后再试。',
-    'dwell_max_seconds must be >= dwell_min_seconds': '停留最长秒数不能小于最短秒数。',
     'Robot websocket URL is not configured': '未配置机器人 WebSocket 地址',
     'Robot websocket was reconfigured': '机器人 WebSocket 地址已重新配置',
     'Only direct http(s) media URLs are supported': '仅支持直接 http(s) 媒体链接',

@@ -91,7 +91,8 @@ test('gimbal diagnostics preserve context and compare target with physical pose'
       zoom_end: 1,
     } },
   }
-  assert.equal(commandContextLabel(command.context), '点位回到锚点')
+  assert.equal(commandContextLabel(command.context), '回到锚点')
+  assert.equal(commandContextLabel('cruise_stationary_camerawork'), '自动运镜')
   assert.equal(gimbalCommandValues(command).mode, 1)
   assert.deepEqual(poseDelta(command, { yaw: -2, pitch: 1 }), { yaw: 2, pitch: 1 })
   assert.equal(poseDelta(command, { yaw: null, pitch: null }), null)
@@ -702,7 +703,7 @@ test('camera verdict distinguishes missing telemetry, expected travel, and real 
     command,
     applicationPhaseKey: 'cruise_stationary',
     now,
-  }).label, '应用已进入停留，但机器人仍回报行进')
+  }).label, '应用已到达点位，但机器人仍回报行进')
 
   const staleMovement = {
     ...heartbeat,
@@ -714,7 +715,7 @@ test('camera verdict distinguishes missing telemetry, expected travel, and real 
     command,
     applicationPhaseKey: 'cruise_stationary',
     now,
-  }).label, '应用已进入停留，但机器人心跳未持续回报到点')
+  }).label, '应用已到达点位，但机器人心跳未持续回报到点')
 
   const stalePose = {
     ...heartbeat,
@@ -756,7 +757,7 @@ test('camera verdict compares cruise phase even when automatic camerawork sent n
     command: null,
     applicationPhaseKey: 'cruise_stationary',
     now,
-  }).label, '应用已进入停留，但机器人仍回报行进')
+  }).label, '应用已到达点位，但机器人仍回报行进')
 
   assert.equal(cameraDiagnosticVerdict({
     connected: true,

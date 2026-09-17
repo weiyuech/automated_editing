@@ -160,7 +160,7 @@ summary{ cursor:pointer; color:var(--text-muted); font-size:12px; font-weight:70
       </section>
 
       <section class="tab-panel" id="autoPanel" role="tabpanel" aria-labelledby="tabAuto" hidden>
-        <p class="hint direction-note">复现正式应用的巡游行进逻辑：50% 单次运镜、30% 左右往返、20% 回锚点；已经在锚点时不会原地等待。</p>
+        <p class="hint direction-note">复现正式应用的巡游自动运镜：镜头在允许范围内持续移动，并按设置返回锚点。</p>
         <div class="group">
           <span class="group-title">锚点</span>
           <div class="form-grid">
@@ -204,6 +204,19 @@ summary{ cursor:pointer; color:var(--text-muted); font-size:12px; font-weight:70
           </div>
         </div>
 
+        <div class="group">
+          <span class="group-title">锚点节奏</span>
+          <div class="form-grid">
+            <label class="field">锚点停留时间占比（0～100%）
+              <input class="auto-input" id="anchorTimePercent" type="number" min="0" max="100" step="1" value="20">
+            </label>
+            <label class="field">每次回到锚点后停留（秒）
+              <input class="auto-input" id="anchorDwellSeconds" type="number" min="0.5" max="120" step="0.5" value="5">
+            </label>
+          </div>
+          <p class="hint">回到锚点后才开始计时；返回过程不占用停留时间。</p>
+        </div>
+
         <div class="row" style="margin-bottom:8px">
           <button id="saveAutoConfig">保存自动运镜设置</button>
           <span class="mode-pill" id="configState">尚未保存</span>
@@ -213,7 +226,7 @@ summary{ cursor:pointer; color:var(--text-muted); font-size:12px; font-weight:70
           <button id="autoArrive" disabled>模拟到达点位</button>
           <button class="danger" id="autoStop" disabled>停止并回锚点</button>
         </div>
-        <p class="status-line" id="autoStatus">保存设置后，开始前会先回锚点；模拟到达后也会回锚点。</p>
+        <p class="status-line" id="autoStatus">模拟到达只切换底盘状态，自动运镜会继续；停止时才回锚点。</p>
       </section>
     </main>
 
@@ -257,14 +270,9 @@ summary{ cursor:pointer; color:var(--text-muted); font-size:12px; font-weight:70
   var LEG_MARGIN_SECONDS = 0.6;
   var HEARTBEAT_MAX_AGE_MS = 5000;
   var CONNECTION_NOTICE_MS = 5000;
-  var MODE_WEIGHTS = [["wander", 50], ["pingpong", 30], ["anchor", 20]];
-  var OPPOSITE_PROBABILITY = 0.80;
-  var OPPOSITE_DISTANCE = [0.60, 0.90];
-  var OUTWARD_DISTANCE = [0.10, 0.30];
-  var CENTER_DISTANCE = [0.40, 0.80];
-  // Direction selection only; targets still use the complete configured yaw range.
-  var DIRECTION_ROOM_DEG = 10;
-  var CONFIG_STORAGE_KEY = "robot_camerawork_yaw_pitch_v1";
+  var ANCHOR_DWELL_JITTER = 0.30;
+  var CONFIG_STORAGE_KEY = "robot_camerawork_yaw_pitch_v2";
+  var LEGACY_CONFIG_STORAGE_KEY = "robot_camerawork_yaw_pitch_v1";
 
   var ws = null;
   var connectionNoticeTimer = null;
@@ -283,6 +291,9 @@ summary{ cursor:pointer; color:var(--text-muted); font-size:12px; font-weight:70
   var autoToken = 0;
   var manualToken = 0;
   var activeAutoConfig = null;
+  var autoSchedule = null;
+  var lastAutoQuadrant = null;
+  var autoStationary = false;
   var autoConfigured = false;
   var $ = function(id){ return document.getElementById(id); };
 
@@ -666,7 +677,9 @@ summary{ cursor:pointer; color:var(--text-muted); font-size:12px; font-weight:70
       anchorYaw: numberFrom("anchorYaw"), anchorPitch: numberFrom("anchorPitch"),
       yawMin: numberFrom("yawMin"), yawMax: numberFrom("yawMax"),
       pitchMin: numberFrom("pitchMin"), pitchMax: numberFrom("pitchMax"),
-      speedMin: numberFrom("speedMin"), speedMax: numberFrom("speedMax")
+      speedMin: numberFrom("speedMin"), speedMax: numberFrom("speedMax"),
+      anchorTimePercent: numberFrom("anchorTimePercent"),
+      anchorDwellSeconds: numberFrom("anchorDwellSeconds")
     };
   }
 
@@ -678,6 +691,8 @@ summary{ cursor:pointer; color:var(--text-muted); font-size:12px; font-weight:70
     if(config.anchorYaw < config.yawMin || config.anchorYaw > config.yawMax) return "锚点水平角必须位于水平范围内。";
     if(config.anchorPitch < config.pitchMin || config.anchorPitch > config.pitchMax) return "锚点俯仰角必须位于俯仰范围内。";
     if(!isWholeSpeed(config.speedMin) || !isWholeSpeed(config.speedMax) || config.speedMax < config.speedMin) return "速度范围必须是 2～5 的整数，且最快不能小于最慢。";
+    if(!Number.isInteger(config.anchorTimePercent) || config.anchorTimePercent < 0 || config.anchorTimePercent > 100) return "锚点停留时间占比必须是 0～100% 内的整数。";
+    if(!Number.isFinite(config.anchorDwellSeconds) || config.anchorDwellSeconds < .5 || config.anchorDwellSeconds > 120) return "每次回到锚点后停留时间必须在 0.5～120 秒内。";
     return "";
   }
 
@@ -708,26 +723,53 @@ summary{ cursor:pointer; color:var(--text-muted); font-size:12px; font-weight:70
     refreshButtons();
   }
 
+  function normalizeSavedAutoConfig(value){
+    if(!value || typeof value !== "object" || Array.isArray(value)) return null;
+    var config = {
+      anchorYaw: savedNumber(value.anchorYaw), anchorPitch: savedNumber(value.anchorPitch),
+      yawMin: savedNumber(value.yawMin), yawMax: savedNumber(value.yawMax),
+      pitchMin: savedNumber(value.pitchMin), pitchMax: savedNumber(value.pitchMax),
+      speedMin: savedNumber(value.speedMin), speedMax: savedNumber(value.speedMax),
+      anchorTimePercent: value.anchorTimePercent === undefined ? 20 : savedNumber(value.anchorTimePercent),
+      anchorDwellSeconds: value.anchorDwellSeconds === undefined ? 5 : savedNumber(value.anchorDwellSeconds)
+    };
+    return validateAutoGeometry(config) ? null : config;
+  }
+
+  function parseSavedAutoConfig(raw){
+    if(!raw) return null;
+    try { return normalizeSavedAutoConfig(JSON.parse(raw)); }
+    catch(error){ return null; }
+  }
+
+  function applyAutoConfig(config){
+    $("anchorYaw").value = config.anchorYaw;
+    $("anchorPitch").value = config.anchorPitch;
+    $("yawMin").value = config.yawMin;
+    $("yawMax").value = config.yawMax;
+    $("pitchMin").value = config.pitchMin;
+    $("pitchMax").value = config.pitchMax;
+    $("speedMin").value = config.speedMin;
+    $("speedMax").value = config.speedMax;
+    $("anchorTimePercent").value = config.anchorTimePercent;
+    $("anchorDwellSeconds").value = config.anchorDwellSeconds;
+  }
+
   function loadAutoConfig(){
-    var raw = storageGet(CONFIG_STORAGE_KEY);
-    if(!raw) return;
-    try {
-      var config = JSON.parse(raw);
-      if(validateAutoGeometry(config)) return;
-      $("anchorYaw").value = config.anchorYaw;
-      $("anchorPitch").value = config.anchorPitch;
-      $("yawMin").value = config.yawMin;
-      $("yawMax").value = config.yawMax;
-      $("pitchMin").value = config.pitchMin;
-      $("pitchMax").value = config.pitchMax;
-      $("speedMin").value = config.speedMin;
-      $("speedMax").value = config.speedMax;
-      autoConfigured = true;
-      $("configState").textContent = "已保存";
-      setAutoStatus("已载入保存的自动运镜设置。", "success");
-    } catch(error){
-      storageRemove(CONFIG_STORAGE_KEY);
+    var currentRaw = storageGet(CONFIG_STORAGE_KEY);
+    var config = parseSavedAutoConfig(currentRaw);
+    var migrated = false;
+    if(!config){
+      if(currentRaw) storageRemove(CONFIG_STORAGE_KEY);
+      config = parseSavedAutoConfig(storageGet(LEGACY_CONFIG_STORAGE_KEY));
+      migrated = Boolean(config);
     }
+    if(!config) return;
+    applyAutoConfig(config);
+    if(migrated) storageSet(CONFIG_STORAGE_KEY, JSON.stringify(config));
+    autoConfigured = true;
+    $("configState").textContent = "已保存";
+    setAutoStatus(migrated ? "已沿用原设置，并补充新的锚点节奏。" : "已载入保存的自动运镜设置。", "success");
   }
 
   function startAutomatic(){
@@ -740,6 +782,7 @@ summary{ cursor:pointer; color:var(--text-muted); font-size:12px; font-weight:70
     autoRunning = true;
     autoBusy = true;
     activeAutoConfig = config;
+    autoStationary = false;
     setAutoInputsDisabled(true);
     refreshButtons();
     runAutomatic(token, config);
@@ -753,41 +796,41 @@ summary{ cursor:pointer; color:var(--text-muted); font-size:12px; font-weight:70
       "正在模拟巡游行进；无完整心跳，按预计行程执行水平＋俯仰运镜。" :
       "正在模拟巡游行进，持续执行水平＋俯仰运镜。", anchorResult === "estimated" ? "warn" : "success");
 
+    autoSchedule = createCameraworkSchedule(config, Date.now());
+    lastAutoQuadrant = null;
+    // Starting the run already completed a return to anchor. At 100%, begin a
+    // complete hold now instead of sending the same target again.
+    var handledAnchorSerial = autoSchedule.phase === "anchor" ? autoSchedule.serial : -1;
     while(isAutoTokenActive(token)){
-      var mode = pickCameraworkMode();
-      var pose = commandStartPose();
-      var currentYaw = clamp(pose.yaw, config.yawMin, config.yawMax);
-      var currentPitch = clamp(pose.pitch, config.pitchMin, config.pitchMax);
-      var targets;
-      var anchorFallback = false;
-      if(mode === "anchor"){
-        if(Math.abs(currentYaw - config.anchorYaw) <= POSE_TOLERANCE && Math.abs(currentPitch - config.anchorPitch) <= POSE_TOLERANCE){
-          targets = [wanderPose(currentYaw, config)];
-          anchorFallback = true;
+      advanceCameraworkSchedule(autoSchedule, config, Date.now());
+      if(autoSchedule.phase === "anchor"){
+        if(handledAnchorSerial !== autoSchedule.serial){
+          handledAnchorSerial = autoSchedule.serial;
+          var anchorSerial = autoSchedule.serial;
+          await moveAutoTarget(config.anchorYaw, config.anchorPitch, config.speedMax, (autoStationary ? "停稳" : "行进") + " · 锚点", token, config);
+          if(!isAutoTokenActive(token) || !autoSchedule) return;
+          if(autoSchedule.phase === "anchor" && autoSchedule.serial === anchorSerial){
+            // Arrival confirmation (or the full estimated travel budget) ends
+            // before the hold clock begins, so travel never consumes the hold.
+            beginAnchorHold(autoSchedule, Date.now());
+          }
         }
-        else targets = [[config.anchorYaw, config.anchorPitch]];
-      } else if(mode === "pingpong") targets = pingpongPoses(currentYaw, config);
-      else targets = [wanderPose(currentYaw, config)];
-
-      var label = mode === "anchor" ? "20% 回锚点" : (mode === "pingpong" ? "30% 左右往返" : "50% 单次运镜");
-      if(anchorFallback) label = "20% 已在锚点，继续单次运镜";
-      for(var index = 0; index < targets.length && isAutoTokenActive(token); index += 1){
-        var speed = randomInteger(config.speedMin, config.speedMax);
-        await moveAutoTarget(targets[index][0], targets[index][1], speed, label, token, config, mode !== "anchor" || anchorFallback);
+        await waitForScheduleBoundary(token, autoSchedule);
+        continue;
       }
+      var quadrant = chooseNextQuadrant(lastAutoQuadrant);
+      lastAutoQuadrant = quadrant;
+      var target = quadrantPose(quadrant, config);
+      var speed = randomInteger(config.speedMin, config.speedMax);
+      await moveAutoTarget(target[0], target[1], speed, (autoStationary ? "停稳" : "行进") + " · 自动运镜", token, config);
     }
   }
 
-  async function moveAutoTarget(targetYaw, targetPitch, speed, kind, token, config, separateTarget){
+  async function moveAutoTarget(targetYaw, targetPitch, speed, kind, token, config){
     if(!isAutoTokenActive(token)) return "canceled";
     var pose = commandStartPose();
     var startYaw = clamp(pose.yaw, config.yawMin, config.yawMax);
     var startPitch = clamp(pose.pitch, config.pitchMin, config.pitchMax);
-    if(separateTarget){
-      var target = separateCameraworkTarget(targetYaw, targetPitch, startYaw, startPitch, config);
-      targetYaw = target[0];
-      targetPitch = target[1];
-    }
     var startRevisions = poseRevisions();
     if(!sendGimbal(targetYaw, targetPitch, speed, speed, kind, { yaw:startYaw, pitch:startPitch })){
       cancelAutomatic("指令发送失败，自动运镜已经停止。", false);
@@ -799,31 +842,18 @@ summary{ cursor:pointer; color:var(--text-muted); font-size:12px; font-weight:70
   }
 
   function simulateArrival(){
-    if(!autoRunning || !activeAutoConfig) return;
-    var config = activeAutoConfig;
-    autoRunning = false;
-    autoBusy = true;
-    autoToken += 1;
-    var token = autoToken;
-    setAutoStatus("已模拟到达点位，正在回锚点。", "warn");
-    setAutoInputsDisabled(true);
+    if(!autoRunning || !activeAutoConfig || autoStationary) return;
+    autoStationary = true;
+    setAutoStatus("已模拟到达点位；底盘停稳，自动运镜沿用当前节奏继续。", "success");
     refreshButtons();
-    returnToAnchor(config, token, "到达后回锚点", function(){ return token === autoToken && isSocketOpen(); }).then(function(result){
-      if(token !== autoToken) return;
-      activeAutoConfig = null;
-      autoBusy = false;
-      setAutoInputsDisabled(false);
-      refreshButtons();
-      if(result === "reached") setAutoStatus("已到达锚点；yaw/pitch 停留测试完成。", "success");
-      else if(result === "estimated") setAutoStatus("锚点指令已发送；没有完整心跳，已按预计行程完成。", "warn");
-      else if(result === "canceled") setAutoStatus("连接已断开，无法继续回到锚点。", "error");
-      else setAutoStatus("已经发送锚点，但实测位置仍有偏差。", "warn");
-    });
   }
 
   function cancelAutomatic(message, returnAnchor){
     var config = activeAutoConfig || readAutoConfig();
     autoRunning = false;
+    autoSchedule = null;
+    lastAutoQuadrant = null;
+    autoStationary = false;
     autoToken += 1;
     var token = autoToken;
     activeAutoConfig = null;
@@ -868,79 +898,79 @@ summary{ cursor:pointer; color:var(--text-muted); font-size:12px; font-weight:70
     return lastResult;
   }
 
-  function pickCameraworkMode(){
-    var roll = Math.random() * 100;
-    var cumulative = 0;
-    for(var index = 0; index < MODE_WEIGHTS.length; index += 1){
-      cumulative += MODE_WEIGHTS[index][1];
-      if(roll <= cumulative) return MODE_WEIGHTS[index][0];
-    }
-    return "wander";
+  function sampleCameraworkCycle(config){
+    var anchorMs = config.anchorDwellSeconds * 1000 * randomBetween(1 - ANCHOR_DWELL_JITTER, 1 + ANCHOR_DWELL_JITTER);
+    var share = config.anchorTimePercent;
+    var roamMs = share <= 0 ? Infinity : (share >= 100 ? 0 : anchorMs * (100 - share) / share);
+    return { anchorMs:anchorMs, roamMs:roamMs };
   }
 
-  function adaptiveYawTarget(current, config){
-    var low = config.yawMin;
-    var high = config.yawMax;
-    current = clamp(current, low, high);
-    if(current > 0){
-      var rightwardRoom = current - low;
-      var fartherLeftRoom = high - current;
-      var goOpposite = rightwardRoom > DIRECTION_ROOM_DEG && (fartherLeftRoom <= DIRECTION_ROOM_DEG || Math.random() < OPPOSITE_PROBABILITY);
-      if(goOpposite) return Math.round(clamp(current - Math.max(1, randomRange(OPPOSITE_DISTANCE) * rightwardRoom), low, high));
-      return Math.round(clamp(current + Math.max(1, randomRange(OUTWARD_DISTANCE) * fartherLeftRoom), low, high));
+  function createCameraworkSchedule(config, now){
+    if(config.anchorTimePercent <= 0){
+      return { phase:"quadrants", deadline:Infinity, cycle:{ anchorMs:0, roamMs:Infinity }, serial:0 };
     }
-    if(current < 0){
-      var leftwardRoom = high - current;
-      var fartherRightRoom = current - low;
-      var goOtherSide = leftwardRoom > DIRECTION_ROOM_DEG && (fartherRightRoom <= DIRECTION_ROOM_DEG || Math.random() < OPPOSITE_PROBABILITY);
-      if(goOtherSide) return Math.round(clamp(current + Math.max(1, randomRange(OPPOSITE_DISTANCE) * leftwardRoom), low, high));
-      return Math.round(clamp(current - Math.max(1, randomRange(OUTWARD_DISTANCE) * fartherRightRoom), low, high));
+    var cycle = sampleCameraworkCycle(config);
+    if(config.anchorTimePercent >= 100){
+      return { phase:"anchor", deadline:now + cycle.anchorMs, cycle:cycle, serial:1 };
     }
-    var rightRoom = current - low;
-    var leftRoom = high - current;
-    var chooseRight = rightRoom > DIRECTION_ROOM_DEG && (leftRoom <= DIRECTION_ROOM_DEG || Math.random() < .5);
-    if(chooseRight) return Math.round(clamp(current - Math.max(1, randomRange(CENTER_DISTANCE) * rightRoom), low, high));
-    return Math.round(clamp(current + Math.max(1, randomRange(CENTER_DISTANCE) * leftRoom), low, high));
+    // A new run always begins with a complete roaming interval. In particular,
+    // it must never appear halfway through an anchor hold.
+    return { phase:"quadrants", deadline:now + cycle.roamMs, cycle:cycle, serial:0 };
   }
 
-  function wanderPose(currentYaw, config){
-    return [adaptiveYawTarget(currentYaw, config), randomInteger(config.pitchMin, config.pitchMax)];
-  }
-
-  function separateCameraworkTarget(targetYaw, targetPitch, currentYaw, currentPitch, config){
-    currentYaw = clamp(currentYaw, config.yawMin, config.yawMax);
-    currentPitch = clamp(currentPitch, config.pitchMin, config.pitchMax);
-    var yaw = Math.round(clamp(targetYaw, config.yawMin, config.yawMax));
-    var pitch = Math.round(clamp(targetPitch, config.pitchMin, config.pitchMax));
-    var yawMid = (config.yawMin + config.yawMax) / 2;
-    var pitchMid = (config.pitchMin + config.pitchMax) / 2;
-    var yawChangesHalf = (yaw >= yawMid) !== (currentYaw >= yawMid);
-    function acceptable(candidate){
-      return yawChangesHalf || ((candidate >= pitchMid) !== (currentPitch >= pitchMid));
-    }
-    if(!acceptable(pitch)){
-      // Crossing either midpoint is sufficient; the opposite pitch endpoint changes half.
-      var choices = [];
-      for(var candidate = config.pitchMin; candidate <= config.pitchMax; candidate += 1){
-        if(acceptable(candidate)) choices.push(candidate);
+  function advanceCameraworkSchedule(schedule, config, now){
+    if(schedule.phase === "anchor" && !Number.isFinite(schedule.deadline)) return schedule;
+    if(now < schedule.deadline) return schedule;
+    if(schedule.phase === "quadrants"){
+      schedule.phase = "anchor";
+      schedule.serial += 1;
+      // No deadline runs while the camera is returning to the anchor.
+      schedule.deadline = null;
+    } else {
+      schedule.cycle = sampleCameraworkCycle(config);
+      if(config.anchorTimePercent >= 100){
+        // The camera is already at the anchor. Renew a complete hold without a
+        // redundant movement command or carrying overdue time into the hold.
+        schedule.deadline = now + schedule.cycle.anchorMs;
+      } else {
+        schedule.phase = "quadrants";
+        schedule.deadline = now + schedule.cycle.roamMs;
       }
-      pitch = choices[randomInteger(0, choices.length - 1)];
     }
-    return [yaw, pitch];
+    return schedule;
   }
 
-  function pingpongPoses(currentYaw, config){
-    var midpoint = (config.yawMin + config.yawMax) / 2;
-    var quarter = (config.yawMax - config.yawMin) * .25;
-    var rightHigh = Math.min(0, midpoint - quarter);
-    if(rightHigh <= config.yawMin) rightHigh = config.yawMin + quarter;
-    var leftLow = Math.max(0, midpoint + quarter);
-    if(leftLow >= config.yawMax) leftLow = config.yawMax - quarter;
-    var right = [Math.round(randomBetween(config.yawMin, rightHigh)), randomInteger(config.pitchMin, config.pitchMax)];
-    var left = [Math.round(randomBetween(leftLow, config.yawMax)), randomInteger(config.pitchMin, config.pitchMax)];
-    if(currentYaw > 0) return [right, left];
-    if(currentYaw < 0) return [left, right];
-    return Math.random() < .5 ? [right, left] : [left, right];
+  function beginAnchorHold(schedule, now){
+    if(schedule.phase === "anchor" && !Number.isFinite(schedule.deadline)){
+      schedule.deadline = now + schedule.cycle.anchorMs;
+    }
+    return schedule;
+  }
+
+  function waitForScheduleBoundary(token, schedule){
+    return new Promise(function(resolve){
+      function check(){
+        if(!isAutoTokenActive(token) || Date.now() >= schedule.deadline){ resolve(); return; }
+        window.setTimeout(check, Math.min(200, schedule.deadline - Date.now()));
+      }
+      check();
+    });
+  }
+
+  function chooseNextQuadrant(previous){
+    var choices = [0, 1, 2, 3].filter(function(value){ return value !== previous; });
+    return choices[randomInteger(0, choices.length - 1)];
+  }
+
+  function integerHalfBounds(low, high, upperHalf){
+    var firstUpper = Math.ceil((low + high) / 2);
+    return upperHalf ? [firstUpper, high] : [low, firstUpper - 1];
+  }
+
+  function quadrantPose(quadrant, config){
+    var yawBounds = integerHalfBounds(config.yawMin, config.yawMax, Boolean(quadrant & 1));
+    var pitchBounds = integerHalfBounds(config.pitchMin, config.pitchMax, Boolean(quadrant & 2));
+    return [randomInteger(yawBounds[0], yawBounds[1]), randomInteger(pitchBounds[0], pitchBounds[1])];
   }
 
   function setAutoStatus(text, kind){
@@ -959,7 +989,8 @@ summary{ cursor:pointer; color:var(--text-muted); font-size:12px; font-weight:70
     $("manualSend").disabled = !ready || autoRunning || autoBusy;
     $("manualCenter").disabled = !ready || autoRunning || autoBusy;
     $("autoStart").disabled = !ready || autoRunning || autoBusy || !autoConfigured;
-    $("autoArrive").disabled = !autoRunning;
+    $("autoArrive").disabled = !autoRunning || autoStationary;
+    $("autoArrive").textContent = autoStationary ? "已模拟到达" : "模拟到达点位";
     $("autoStop").disabled = !autoRunning;
     $("useActualAnchor").disabled = autoRunning || autoBusy || !hasFreshPose();
   }
@@ -1011,10 +1042,13 @@ summary{ cursor:pointer; color:var(--text-muted); font-size:12px; font-weight:70
     var result = Number(value);
     return Number.isFinite(result) ? result : null;
   }
+  function savedNumber(value){
+    var result = toNumber(value);
+    return result === null ? NaN : result;
+  }
   function isWholeSpeed(value){ return Number.isInteger(value) && value >= 2 && value <= 5; }
   function clamp(value, low, high){ return Math.min(high, Math.max(low, value)); }
   function randomBetween(low, high){ return low + Math.random() * (high - low); }
-  function randomRange(range){ return randomBetween(range[0], range[1]); }
   function randomInteger(low, high){ return Math.floor(randomBetween(low, high + 1)); }
   function round1(value){ return Math.round(value * 10) / 10; }
   function formatAngle(value){ return Number.isFinite(value) ? round1(value).toFixed(1) + "°" : "–"; }

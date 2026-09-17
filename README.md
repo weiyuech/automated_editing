@@ -53,7 +53,6 @@ The Ping button is only a local connection check: it sends a WebSocket `PING` an
 
 Beat detection is installed through the `backend[beat]` extra. It pins `librosa`, `numba`, and `llvmlite` to versions with prebuilt Python 3.12 macOS x86_64 wheels, avoiding local LLVM source builds. The backend sets `NUMBA_CACHE_DIR` to `.cache/numba` so compiled beat-analysis functions stay inside the app folder.
 
-
 - FFmpeg: trimming, transitions, audio mixing, encoding, export.
 - PySceneDetect: scene boundary detection.
 - librosa: music beat and onset detection.
@@ -71,272 +70,116 @@ Provider credentials are owned by the backend `SettingsService` and stored local
 
 The timed voiceover path uses Volcengine's fast sync TTS endpoint with `with_timestamp=1`. It writes the generated audio and matching word-timing JSON under `data/tts/`, then registers the audio as a voiceover asset. Render jobs keep background music and voiceover separate so the voice can sit above lowered music instead of replacing it.
 
-## 机器人运镜：查看下发、理解逻辑与修改位置
+## 巡游自动运镜
 
-以下说明依据 2026-09-16 的工作区源码，供现场检查和调整使用。旧安装包不一定已经包含这些改动；源码逻辑与机器人实际执行结果需要分别查看。
+以下说明对应当前源码。自动运镜默认关闭；开启后使用「镜头设置」里保存的一套配置。核心规划位于 [cruise.py](backend/src/automated_video_editing_backend/services/cruise.py)，协议发送位于 [robot.py](backend/src/automated_video_editing_backend/services/robot.py)。
 
-### 先看整体关系
+### 内部目标选择和锚点
 
-自动运镜的核心文件是 [backend/src/automated_video_editing_backend/services/cruise.py](backend/src/automated_video_editing_backend/services/cruise.py)。它负责选动作、计算目标、安排变焦和等待；[robot.py](backend/src/automated_video_editing_backend/services/robot.py) 负责把指令转换成机器人协议并通过 WebSocket 发送。
+界面不会向使用者解释区域编号；使用者只需要设置允许范围、锚点、速度，以及
+回到锚点的节奏。以下区域划分只是实现与测试说明。
 
-| 概念 | 决定什么 |
-| --- | --- |
-| 一条云台指令 | 从哪些 yaw / pitch / zoom 起点移动到哪些终点，以及水平、俯仰速度 |
-| 50 / 30 / 20 | 本轮做单次运镜、左右往返，还是回锚点 |
-| 80 / 20 | 进入自适应单次运镜后，水平大幅反向还是小幅继续向外；受 10° 空间门槛约束 |
-| 四个角度分区 | 随机目标只需换到不同分区，跨过中线即可；不额外限制最小移动距离 |
-| 变焦 zoom | 自动运镜开启时，由巡游到点后的流程单独安排，行进中的 50/30/20 保持当前倍率 |
+用户设置的 yaw 与 pitch 范围分别从中点切成两半，组合成四个区域：
+
+| | yaw 较小的一半 | yaw 较大的一半 |
+| --- | --- | --- |
+| pitch 较小的一半 | 区域 1 | 区域 2 |
+| pitch 较大的一半 | 区域 3 | 区域 4 |
+
+- 第一个区域从四个区域中随机选择。
+- 此后每个区域都从上一个区域以外的三个区域中等概率选择；锚点阶段不会清除这个记忆。因此 `1 → 4 → 1 → 4` 合法，`1 → 1` 不合法。
+- 选定区域后，yaw 与 pitch 都在该区域的整数角度范围内随机选择。目标始终在用户保存的总范围内。
+- 普通目标没有停留阶段：连续两次新心跳进入目标 ±2°，或完整预计行程时间结束后，
+  立即选择下一个目标。
+- 锚点是唯一带有明确停留时间的目标，不是「随机停在某个角度」。
+
+已退役的方向策略只保存在 [docs/archive/camerawork-directional-v1.md](docs/archive/camerawork-directional-v1.md)，不会参与运行。
+
+### 锚点时间怎样计算
+
+界面只提供两个节奏参数：
+
+- `anchor_time_percent`：回到锚点并停留的计划时间占比，默认 20%。
+- `anchor_dwell_seconds`：每次确认回到锚点后停留的基准时长，默认 5 秒。
+
+每个周期先在基准时长的 ±30% 内生成实际锚点时长 `A`，再按时间比例计算四区域时长：
 
 ```text
-开始巡游 → 回锚点 → 开始录制并导航
-                         ↓
-                  行进中抽 50/30/20
-                         ↓
-                     选目标、检查分区
-                         ↓
-                发一条云台指令 → 等待
-                         ↓
-          继续本轮下一段，或重新抽下一种动作
-
-底盘报告到点 → 结束行进运镜 → 回锚点 → 变焦 → 恢复锚点倍率
+Q = A × (100 - anchor_time_percent) / anchor_time_percent
 ```
 
-等待可以由新心跳确认到位而结束，也可以因预计时间用完而结束；发送成功、等待结束、物理到位是不同状态。随机抽选按每个动作块进行，不保证每十次正好是五次、三次、两次。
+一个周期先执行 `Q 秒普通自动运镜`，再发送回锚点指令。只有连续两次新心跳进入
+锚点 ±2°，或完整预计返回时间结束后，才开始完整的 `A 秒锚点停留`。返回路程不占用
+这段停留时间。普通运镜预算如果在一次移动途中结束，会先完成该次移动，再回锚点；
+不会截断移动，也不会为了追赶旧时间线而缩短或跳过锚点停留。
 
-### 在哪里看应用下发和机器人实测
+`anchor_time_percent` 划分的是计划中的普通运镜和锚点停留时间；回锚点的路程属于转换
+开销，因此真实墙钟占比会有轻微差异。完整动作和完整停留优先于机械追求百分比。
+每个锚点停留结束后才生成下一周期。内部的 ±30% 变化不作为额外界面设置。
 
-正式应用中打开 **镜头设置 → 镜头控制 → 底部「拍摄诊断」**。非巡游和巡游共用这一处；巡游开始后也可以切换到这里查看。
+- 设为 0%：只做四区域运镜。
+- 设为 100%：开始前回到锚点并连续续接完整停留；不会反复发送无意义的回锚指令。
+- 其他数值：按计划时间分配，不是按指令条数抽签。
+
+开始前和录制停止后的安全回锚点不属于这个随机周期，也不会污染成片中的锚点时间占比。
+
+### 行进、到点和变焦
+
+同一套时间状态跨越底盘行进与到点停留，不会在每个点额外强塞一段锚点画面：
+
+- 普通自动运镜：底盘行进或停稳时都可以缓慢改变 yaw/pitch；到达一个目标后立即继续，
+  不增加额外停顿。
+- 回锚点、底盘行进时：只回到并保持锚点 yaw/pitch，zoom 保持当前值。
+- 已到锚点、底盘停稳时：完整锚点停留已经开始，此时才允许变焦，并在离开前恢复
+  完整锚点。
+
+因此「锚点停留时间」包含停稳时的锚点变焦时间，而不是另设一个静止概率。变焦没有
+机器人心跳回传；应用只能记录最近下发的倍率。已经退役的到点扫视不会参与运行。
+
+机器人到达路线点位后仍会保留一小段内部取景窗口，默认以 7.5 秒为中心做 ±30% 变化；
+这是底盘停稳的拍摄窗口，不是镜头目标停顿，也不作为用户设置。不开录像的「试跑」会
+完全跳过这段窗口。
+
+巡游到点始终只依据 `goal_status`。应用不会等待 `object_status`，并会在下发前移除旧清单里的 `goal_object`；目标物识别或对准失败不能阻止拍摄。这是高于旧协议数据的产品规则。
+
+### 如何核对应用与机器人
+
+在正式应用打开「镜头设置 → 镜头控制 → 拍摄诊断」：
 
 | 项目 | 应用下发 | 机器人心跳 |
 | --- | --- | --- |
-| 水平 yaw | 起点 → 目标角度 | 实测角度 |
-| 俯仰 pitch | 起点 → 目标角度 | 实测角度 |
-| 变焦 zoom | 起点 → 目标倍率 | 不回传 |
+| 水平 yaw | 最近一条指令的起点与目标 | 实测角度 |
+| 俯仰 pitch | 最近一条指令的起点与目标 | 实测角度 |
+| 变焦 zoom | 应用内部记录 | 机器人不回传 |
 
-- 「应用下发」在机器人 WebSocket 写入成功后才更新，证明指令已发送，不证明机器人已经到位。
-- 「机器人心跳」来自独立收到的反馈。断开连接，或该轴超过 5 秒没有更新时，界面显示「未实时回报」。
-- 起点与终点相同时只显示一个值。这张卡片保留最近一条云台指令，后续指令会覆盖它，不是完整历史。
-- 手动控制、取景测试、巡游行进、回锚点、停稳后的变焦和到点扫描，都使用这份最近指令快照。
-- 完整发送历史和 JSON 可在运行数据目录的 `logs/diagnostics.log` 中搜索 `robot.command.sent`、`gimbal_control`。开发运行与安装版的数据目录可能不同。
+「已下发」只证明 WebSocket 写入成功，不证明机器人已经执行。完整记录在运行数据目录的 `logs/diagnostics.log`，可搜索 `robot.command.sent` 和 `gimbal_control`。断开连接或心跳过旧时，界面不会把应用保存的目标伪装成实测值。
 
-界面位于 [App.vue](frontend/src/renderer/src/App.vue) 的「拍摄诊断」区，数据处理入口是 `lastGimbalCommand`、`appTargetLabel()`、`heartbeatAxisLabel()`。发送快照在 [robot.py](backend/src/automated_video_editing_backend/services/robot.py) 的 `_send()` 中记录为 `diagnostics.last_gimbal_command`；实测数据为 `diagnostics.last_heartbeat`。
+### 独立 HTML 调试页
 
-不要把通用的 `state.yaw` / `state.pitch` 当成纯实测，因为发送函数也会把它们写成目标值。核对实际位置时，应使用心跳快照或 `heartbeat_yaw()` / `heartbeat_pitch()`。
+[tools/robot-control-console.html](tools/robot-control-console.html) 直接连接机器人 WebSocket，
+不经过 Python 后端。它保留手动 yaw/pitch 控制、心跳实测和目标偏差，并用与正式应用
+相同的自动运镜与锚点计时逻辑模拟巡游。
 
-### 非巡游与巡游分别采用什么逻辑
+- 调试页只验证 yaw/pitch；界面不展示变焦，发送包固定为 1×。
+- 配置使用本地存储 v2；旧 v1 的锚点、角度范围和速度会安全迁移，并补上默认 20% / 5 秒。已退役字段不会迁入新规划器。
+- 「模拟到达点位」只把底盘状态从行进切为停稳；它不重置时间阶段、区域历史或自动运镜，也不会额外发送一个目标。「停止并回锚点」才会结束模拟并回锚点。
+- 修改 HTML 不会自动修改正式应用；两份实现必须一起维护。
 
-| 场景 | 当前行为 | 是否使用「大幅反向 / 小幅同向」 |
-| --- | --- | --- |
-| 手动「发送镜头控制」 | 按表单中的 yaw / pitch 起点、终点、速度，以及 zoom 起点、终点发送 | 否 |
-| 原地采集 | 开始录制，本身不启动随机运镜 | 否 |
-| 取景测试 | 执行预设测试扫动，之后恢复原来的水平角 | 否 |
-| 巡游开启「自动运镜」 | 开始回锚点，行进中选择动作，到点后回锚点及变焦 | 是，用于自适应单次运镜 |
-| 巡游关闭自动运镜、开启到点扫描 | 到点后按指定方向、偏移、速度扫动，再返回起始水平角 | 否，使用固定扫描规则 |
-| 巡游两个运镜选项都关闭 | 这两个运镜流程都不启动 | 否 |
+### 主要修改位置和测试
 
-巡游或取景测试运行时，手动镜头控制被禁用，后端也会拒绝竞争控制。相关检查在 [api/ws.py](backend/src/automated_video_editing_backend/api/ws.py) 的 `camera_commands` 分支中。
-
-### 「偏左向右大幅、向左小幅」如何实现
-
-这条建议已经实现在 [cruise.py](backend/src/automated_video_editing_backend/services/cruise.py) 的 `_adaptive_yaw_target()` 中。
-
-本协议规定 **yaw 正数表示左、负数表示右；pitch 负数表示上、正数表示下**。左右判断依据协议的 0°，不是锚点，也不是配置范围的中点；函数会先把当前角度限制到允许范围内。
-
-两侧剩余空间都大于 10° 时，自适应单次运镜这样选择：
-
-| 当前水平角 | 80% 的选择 | 20% 的选择 |
-| --- | --- | --- |
-| 正数，偏左 | 向右运动该方向可用距离的 60%～90% | 继续向左运动剩余距离的 10%～30% |
-| 负数，偏右 | 向左运动该方向可用距离的 60%～90% | 继续向右运动剩余距离的 10%～30% |
-
-例如允许范围为 **−60°～+60°**，当前角度为 **+30°，偏左**：向右可走 90°，大幅目标约为 **−24°～−51°**；继续向左可走 30°，小幅目标约为 **+33°～+39°**。
-
-目标角度取整数并限制在配置范围内。代码设置至少 1° 的候选位移，但边界会限制最终位移。方向选择的空间门槛从 0.1° 改为 **10°**：继续向外的空间小于或等于 10°，且反方向空间大于 10° 时，直接选择大幅反向，不再抽签。例如范围 ±60°、当前 +52°，继续向左只剩 8°，会直接选择向右。
-
-当前为 0° 时也使用同一门槛：右侧大于 10° 且左侧小于或等于 10° 时直接向右；两侧都大于 10° 时等概率选择，并运动该侧可用距离的 40%～80%。**10° 只决定方向分支，不是固定步长，也不是目标必须避开的边界区。** 判断结构保持不变：如果两侧空间都不大于 10°，会走原有的外摆分支（居中时为向左分支），目标仍限制在原范围内。不对称或单侧范围不保证每次跨过 0°。
-
-**80/20 是进入自适应规则后的分支概率，不是全部巡游动作的比例。** 行进中的上一层选择是：
-
-1. **50% 自适应单次运镜**：调用上述左右规则；俯仰目标在设置范围内随机取整数，发送前再检查下面的换区约束。
-2. **30% 左右往返**：当前偏左就先向右，当前偏右就先向左；端点由 `_pingpong_poses()` 另行生成，不套用上述 60%～90% 的公式。
-3. **20% 回锚点**：回锚点一次后继续选择动作。如果已经在锚点附近，就改做自适应单次运镜，不原地空等。
-
-每段速度从保存的 `speed_min`～`speed_max` 中随机取整数，范围限制为 2～5°/秒。该段水平和俯仰使用同一个速度；**大幅运动不会因此加速**，行进中变焦保持不变。
-
-巡游开始会先回保存的锚点，再开始录制和导航；随后每段重新判断当前角度。因此锚点为 0° 时，第一段通常从居中分支开始，不会一直沿用启动前的偏左或偏右角度。
-
-每段优先读取最近收到的心跳角度；没有该轴心跳值时，使用内部保存的上一目标。动作等待会核对新的完整 yaw/pitch 心跳，误差容限为 2°，连续两次达标；没有反馈时按距离 / 速度加余量等待。规划器读取最近心跳值的函数本身没有套用界面的 5 秒新鲜度判断，不能把它描述成始终取得实时实测。
-
-到点后取消行进运镜、回锚点，再在锚点姿态上变焦并返回完整锚点。如果心跳明确显示回锚点失败，不继续添加变焦。**巡游到点只依据 `goal_status`，不等待 `object_status`；巡游下发会去掉 `goal_object`，旧路线也不能恢复目标物对准等待。** 这是产品优先规则。更多巡游流程说明见 [docs/cruise_capture.md](docs/cruise_capture.md)。
-
-### 什么时候选择下一目标，以及四象限约束
-
-**象限的英文是 quadrant，四象限是 four quadrants。** 这里的坐标是云台的 yaw × pitch，不是底盘在地图上的位置。
-
-yaw 与 pitch 两个角度描述一个观看方向，不包含物体距离：同一方向上，物体可能在 2 米外，也可能在 20 米外。代码划分的是用户允许的**二维角度范围**，不是把真实三维场景切成四块。两条中线划出四个区域，每个区域都包含很多候选角度。
-
-| | yaw 小于中线 | yaw 大于等于中线 |
-| --- | --- | --- |
-| pitch 大于等于中线 | 区域 A | 区域 B |
-| pitch 小于中线 | 区域 C | 区域 D |
-
-换角度分区不代表一定拍到另一个物体。判断真实场景或物体覆盖，需要额外的位置、深度或画面内容信息。
-
-50% 表示这一轮抽中了「单次运镜」，不是到点后固定执行的动作。它先选目标、发送一条云台指令，再等待到位反馈或预计时间结束，然后重新抽取 50/30/20 中的下一种动作。30% 的左右往返会顺序发送两段，每段都有等待；底盘到达巡游点时则停止行进运镜，转入回锚点流程。超时后仍可能继续下一条，不能把顺序等待理解为每条都已确认物理到位。
-
-为让连续随机目标进入不同角度分区，发送前检查以下约束：
-
-- **按用户范围中点划分四个区域**：分界线为 `(yaw_min + yaw_max) / 2` 和 `(pitch_min + pitch_max) / 2`。例如 yaw 范围 −60°～+60°、pitch 范围 −20°～+10°，分界线是 yaw=0°、pitch=−5°，不是统一使用协议 0°。恰好在中线时归入数值较大的一半。
-- **下一目标必须属于不同区域**，但不要求每次都去对角区域，也不要求依次走完四个区域。
-- **只要水平或俯仰跨到中线另一侧就算换区**，不再额外要求移动范围的 25%。中线附近的小幅跨区也接受；原有水平大幅/小幅选点规则仍然适用。
-- **保留原先选出的水平目标**，在范围内选择满足约束的整数俯仰目标。因此 80/20 的水平方向选择、10° 门槛及水平幅度规则继续有效；俯仰的选择会受新约束影响。
-- 约束用于 50% 单次运镜、30% 左右往返的每一段，以及已经在锚点附近时改做的单次运镜。每段发送前使用最近的位置重新检查，包括往返第二段。真正的回锚点动作直接使用保存的锚点，不套用这个约束。
-
-例如当前为 `(yaw=+30°, pitch=+5°)`，原规则选择了小幅向左的 `yaw=+36°`，则可搭配 `pitch=−6°` 跨过 −5° 的俯仰中线。若当前在俯仰 −4°，目标 −6° 也算换区，即使只相差 2°。**所有目标仍在用户选择的角度范围内**。约束依据本次采用的起始位置计算；最近心跳及无心跳时的上一目标回退机制保持不变。
-
-当前实现**不是先从其他三个象限中等概率抽一个，再在里面随机选点**。它先沿用水平选点规则，并在范围内随机取整数 pitch：如果水平已经跨中线，任意范围内的 pitch 都可以；如果水平没有跨中线，pitch 就必须落在另一半，原 pitch 不合格时从合格整数角度中随机重选。因此三个可去分区不保证各占三分之一。
-
-### 单次运镜结束后会不会停顿
-
-50% 单次运镜完成等待后，会直接进入下一轮动作选择，没有另外添加静止停留。30% 往返的两段之间、20% 行进中回锚点完成后，也没有额外的静止停留。
-
-但当前仍是逐条指令衔接：每段等待新的 yaw/pitch 心跳连续两次进入 2° 容差范围，或等到约「最大轴角度变化 / 速度 + 0.6 秒」的预算结束；检查间隔为 0.2 秒。反馈确认、通信和设备执行可能造成短暂间隔，应用没有做跨指令的连续速度或加速度规划，因此不能仅凭源码保证真机完全无停顿。底盘到点后的停留、变焦等待及锚点保持属于另一阶段。
-
-### 变焦由谁控制，在哪个文件
-
-下面三个函数**全部在同一个文件**：[backend/src/automated_video_editing_backend/services/cruise.py](backend/src/automated_video_editing_backend/services/cruise.py)。行号是本次整理时的位置，后续代码增减时可直接搜索函数名。
-
-| 函数 | 当前行号 | 作用 |
-| --- | --- | --- |
-| `_parked_zoom_target()` | 777 | 在用户的变焦范围内选择目标倍率 |
-| `_parked_zoom_and_anchor()` | 784 | 回锚点、发送变焦、等待，再恢复锚点倍率 |
-| `_return_to_anchor()` | 817 | 恢复保存的水平、俯仰及变焦锚点 |
-
-**50% 单次、30% 往返、20% 行进中回锚点都不随机改变倍率。** 它们经过 `_camerawork_leg()`，其中起始和目标 zoom 相同：
-
-```python
-zoom_start=self._cw_zoom,
-zoom_end=self._cw_zoom,
-```
-
-真正的自动变焦由到点停留流程 `_dwell()` 调用 `_parked_zoom_and_anchor()`，顺序是：
-
-1. 回到保存的完整锚点。如果取消，或回锚点流程未通过，则跳过这次变焦。
-2. `_parked_zoom_target()` 根据 `zoom_min`、`zoom_max` 和 `anchor_zoom` 选择倍率。
-3. 保持 yaw、pitch 为锚点角度，发送新的 zoom 目标。
-4. 等待 `_CW_ZOOM_SETTLE_SECONDS`，当前为 1 秒，然后恢复完整锚点。
-
-倍率选择代码是：
-
-```python
-midpoint = (config.zoom_min + config.zoom_max) / 2.0
-if config.anchor_zoom <= midpoint:
-    return round(random.uniform(midpoint, config.zoom_max), 2)
-return round(random.uniform(config.zoom_min, midpoint), 2)
-```
-
-含义是：锚点倍率在较小的一半，就从较大的一半选目标；锚点倍率在较大的一半，就从较小的一半选目标。倍率保留两位小数，仍在用户范围内。
-
-例如范围 **1×～1.5×**、锚点 **1×**：中点为 1.25×，目标从 1.25×～1.5× 随机选，一次指令流程可能是 **1× → 1.4× → 1×**。
-
-机器人心跳不回传 zoom，`_cw_zoom` 记录的是应用最近下发的倍率，1 秒等待也不是实际变焦到位证明。底层协议中的 `zoom_speed` 固定为 0，应用没有单独提供变焦速度调节。手动镜头控制可直接设置 zoom 起点和终点；独立 HTML 调试页则固定发送 1×，不演示这套到点变焦流程。
-
-### 如何按代码块阅读
-
-下面这些函数都在 [cruise.py](backend/src/automated_video_editing_backend/services/cruise.py) 的 `CruiseService` 类中，可在编辑器按函数名搜索：
-
-| 阅读顺序 | 函数 | 先理解的问题 |
-| --- | --- | --- |
-| 1 | `_run_camerawork()` | 一轮怎样抽动作、怎样安排一个或两个目标 |
-| 2 | `_adaptive_yaw_target()` | 当前偏左或偏右时，怎样计算水平目标 |
-| 3 | `_separate_camerawork_target()` | 初选目标是否换区；不合格时怎样重选俯仰 |
-| 4 | `_camerawork_leg()` | 怎样把角度和速度装进一条指令，并在发送后等待 |
-| 5 | `_await_camerawork_pose()` | 怎样区分新的心跳、连续到位反馈和等待超时 |
-| 6 | `_parked_zoom_target()`、`_parked_zoom_and_anchor()` | 到点后怎样选择并发送倍率，再恢复锚点 |
-
-新增的 `_separate_camerawork_target()` 可以分成三块阅读：
-
-1. **整理输入和中线**：`target[0]` 是水平角，`target[1]` 是俯仰角；`_clamp()` 把数值限制在用户范围内，`yaw_mid` / `pitch_mid` 计算两条中线。
-2. **判断是否换区**：`(yaw >= yaw_mid) != (current_yaw >= yaw_mid)` 比较新旧水平是否在中线不同侧。`!=` 表示两边答案不同；水平或俯仰任一轴换侧即可换区。
-3. **替换不合格的俯仰**：如果原 pitch 没能让目标换区，就遍历范围内的整数角度，留下 `acceptable(candidate)` 为真的候选，再用 `random.choice(choices)` 随机选一个。最终返回 `(yaw, pitch)`，保留原先选出的水平目标。不再检查额外的最小距离。
-
-沿用 yaw −60°～+60°、pitch −20°～+10° 的范围：从 `(30, 5)` 到 `(36, 6)` 没换区，不合格；改成 `(36, −6)` 后，俯仰跨过 −5° 中线，因此合格。这里的 `or` 表示水平或俯仰任一轴换侧即可。
-
-### 从界面操作到机器人发送
-
-手动镜头控制的调用路径：
-
-```text
-App.vue: sendGimbal()
-  → ROBOT_GIMBAL
-  → api/ws.py
-  → RobotService.set_gimbal()
-  → 适配器 set_gimbal()
-  → _send()
-  → 机器人 WebSocket
-```
-
-巡游自动运镜的调用路径：
-
-```text
-App.vue: buildCruiseRequest()
-  → /api/cruise/start
-  → CruiseService.start()
-  → _run_segment()
-  → _run_camerawork()
-  → 随机目标先经 _separate_camerawork_target() 检查
-  → _camerawork_leg()
-  → 同一个 RobotService.set_gimbal()
-  → 适配器 set_gimbal() → _send() → 机器人 WebSocket
-```
-
-保存自动运镜设置只保存配置，不发送云台动作。配置保存在 `settings.automation.camerawork`，巡游开始时读取；运行中修改配置，下一次巡游才使用新值。
-
-### 按修改目的查找文件
-
-| 想修改什么 | 文件与入口 |
+| 内容 | 位置 |
 | --- | --- |
-| 用户可调的锚点、允许范围、速度 | 先在应用「镜头设置 → 自动运镜（巡游）」修改并保存，无须改代码 |
-| 提前转向的空间门槛（当前 10°） | [cruise.py](backend/src/automated_video_editing_backend/services/cruise.py) 顶部的 `_CW_DIRECTION_ROOM_DEG` |
-| 按用户范围中点换区 | 同文件 `_separate_camerawork_target()`；由 `_run_camerawork()` 在每段随机目标发送前调用，无额外最小距离门槛 |
-| 50/30/20、80/20、大幅/小幅距离比例 | [cruise.py](backend/src/automated_video_editing_backend/services/cruise.py) 顶部的 `_CAMERAWORK_MODES`、`_CW_OPPOSITE_PROB`、`_CW_OPPOSITE_DISTANCE`、`_CW_OUTWARD_DISTANCE`、`_CW_CENTER_DISTANCE` |
-| 偏左、偏右、居中时如何选目标 | 同文件 `_adaptive_yaw_target()` |
-| 往返顺序和端点 | 同文件 `_pingpong_poses()` |
-| 如何循环选动作、每段速度 | 同文件 `_run_camerawork()` |
-| 巡游每段实际发送哪些参数 | 同文件 `_camerawork_leg()` |
-| 选择变焦倍率 | [cruise.py](backend/src/automated_video_editing_backend/services/cruise.py) 的 `_parked_zoom_target()`；范围和锚点来自用户保存配置 |
-| 到点后执行变焦、回锚点 | [cruise.py](backend/src/automated_video_editing_backend/services/cruise.py) 的 `_parked_zoom_and_anchor()`、`_return_to_anchor()`；由 `_dwell()` 调用 |
-| 到点变焦后的等待时间 | 同文件 `_CW_ZOOM_SETTLE_SECONDS`，当前为 1 秒 |
-| 到点固定扫描 | 同文件 `_scan()` |
-| 手动表单、自动运镜设置、诊断对照界面 | [App.vue](frontend/src/renderer/src/App.vue) 中的「镜头控制」「自动运镜（巡游）」「拍摄诊断」 |
-| 手动发送入口 | 同文件 `sendGimbal()` → [api/ws.py](backend/src/automated_video_editing_backend/api/ws.py) 的 `ROBOT_GIMBAL` 分支 |
-| 自动运镜开关怎样进入请求 | `App.vue` 的 `buildCruiseRequest()` → [api/routes.py](backend/src/automated_video_editing_backend/api/routes.py) 的 `cruise_start()` |
-| 保存自动运镜配置 | `App.vue` 的 `saveCameraworkPreference()` → `api/routes.py` 的 `camerawork_preference_save()` |
-| 共用云台 JSON 字段、固定 `mode=1` | [robot.py](backend/src/automated_video_editing_backend/services/robot.py) 的适配器 `set_gimbal()`；单角度设置和扫动另有 `set_camera_angle()`、`sweep_camera()` 构造指令 |
-| 最终网络发送、记录最近指令 | 同文件 `_send()` |
-| 心跳角度解析 | 同文件 `_handle_message()` 中的 `gimbal` 解析 |
-| 默认值、允许范围和后端校验 | [models.py](backend/src/automated_video_editing_backend/core/models.py) 的 `GimbalMoveRequest`、`CameraworkProfile`；同时对应 `App.vue` 输入框与 `cameraworkWarning` 校验 |
-| 固定取景测试动作 | [framing_test.py](backend/src/automated_video_editing_backend/services/framing_test.py) 的 `_run_test()` |
+| 配置模型、默认值与范围 | [models.py](backend/src/automated_video_editing_backend/core/models.py) 的 `CameraworkConfig` |
+| 内部目标选择、锚点计时、停稳变焦 | [cruise.py](backend/src/automated_video_editing_backend/services/cruise.py) |
+| 自动运镜设置与拍摄诊断 | [App.vue](frontend/src/renderer/src/App.vue) |
+| 机器人命令、心跳和最近下发快照 | [robot.py](backend/src/automated_video_editing_backend/services/robot.py) |
+| 独立现场调试页 | [tools/robot-control-console.html](tools/robot-control-console.html) |
 
-修改 `models.py` 的默认值不会自动覆盖用户已经保存的设置。若要调整已保存的锚点或范围，应在应用中重新保存。
+修改后至少运行：
 
-### HTML 调试页是独立实现
+```bash
+.venv/bin/python -m pytest backend/tests/test_cruise_camerawork.py backend/tests/test_robot.py
+node --test tools/tests/robot-control-console.test.mjs
+```
 
-[tools/robot-control-console.html](tools/robot-control-console.html) 直接连接机器人 WebSocket，不经过正式应用的 Python 后端。
-
-- 右侧「心跳实测位置」「发送目标与实测偏差」用于查看；展开「通信记录」可以查看发送记录。
-- `MODE_WEIGHTS`、`OPPOSITE_PROBABILITY`、`OPPOSITE_DISTANCE`、`OUTWARD_DISTANCE`、`CENTER_DISTANCE` 控制权重和幅度。
-- `DIRECTION_ROOM_DEG = 10` 是方向选择的空间门槛，与正式应用保持一致。
-- `separateCameraworkTarget()` 检查目标是否跨过范围中线进入不同分区；`moveAutoTarget()` 在发送随机目标前调用，固定锚点除外，没有额外最小距离门槛。
-- `adaptiveYawTarget()` 实现左右规则，`runAutomatic()` 循环选择动作。
-- `sendGimbal()` 构造指令，`sendObject()` 实际发送。
-- 自动页模拟行进/到达阶段，不等于实际底盘导航。页面隐藏变焦，但实际发送包仍固定 `zoom_start=1`、`zoom_end=1`；可见通信记录省略了 zoom 字段。
-
-**修改 HTML 不会修改正式应用的 Python 运镜逻辑。** 如果现场用 HTML 验证方案，并要求正式应用采用同样行为，需要同步修改两份实现中的对应规则。
-
-### 修改后应查看的现有测试
-
-- [backend/tests/test_cruise_camerawork.py](backend/tests/test_cruise_camerawork.py)：左右大幅/小幅、模式比例、不对称范围、往返顺序、回锚点与反馈等待。
-- [backend/tests/test_robot.py](backend/tests/test_robot.py)：机器人协议发送和反馈处理。
-- [frontend/tests/robot-diagnostics.test.mjs](frontend/tests/robot-diagnostics.test.mjs)：诊断数据与心跳判断。
-- [tools/tests/robot-control-console.test.mjs](tools/tests/robot-control-console.test.mjs)：独立 HTML 调试工具。
+更完整的巡游生命周期、故障策略和接口说明见 [docs/cruise_capture.md](docs/cruise_capture.md)。

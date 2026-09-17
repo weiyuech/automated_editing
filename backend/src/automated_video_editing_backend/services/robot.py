@@ -6,6 +6,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from copy import deepcopy
+from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit
@@ -36,6 +37,17 @@ from automated_video_editing_backend.services.media_download import (
 if TYPE_CHECKING:
     from automated_video_editing_backend.core.models import MediaItem
     from automated_video_editing_backend.services.media import MediaService
+
+
+_RECORDING_REPLY_TIMEOUT_SECONDS = 8.0
+_RECORDING_LATE_REPLY_GRACE_SECONDS = 8.0
+_RECORDING_SHUTDOWN_TIMEOUT_SECONDS = 18.0
+_MAP_SWITCH_CONFIRM_TIMEOUT_SECONDS = 10.0
+_MAP_SWITCH_CONFIRM_POLL_SECONDS = 0.1
+
+
+class _ReplyDeadlineExpired(Exception):
+    """The local wait elapsed while its shared reply future was still pending."""
 
 
 class RobotCommandNotSentError(ConnectionError):
@@ -128,11 +140,18 @@ class HardwareRobotAdapter(RobotAdapter):
         self._connection_task: asyncio.Task[None] | None = None
         self._request_lock = asyncio.Lock()
         self._send_lock = asyncio.Lock()
+        # Recording acknowledgements have no request id. Serialize the whole request -> state
+        # commit boundary so a later opposite command cannot start while the prior caller is
+        # still applying its accepted reply.
+        self._recording_lock = asyncio.Lock()
         # set_goal mutates arrival ownership before it enters the generic request lock. Keep
         # that whole arm -> write -> acknowledgement transaction single-owner as well, or a
         # concurrent caller can make an old heartbeat resolve a goal that has not been sent.
         self._goal_lock = asyncio.Lock()
         self._pending: dict[str, asyncio.Future[Any]] = {}
+        # Some protocol operations share one top-level response key. Keep the matcher beside
+        # the future so, for example, a delayed Start reply cannot complete a later Stop wait.
+        self._pending_reply_matchers: dict[str, Callable[[Any], bool]] = {}
         self._reconnect_delay_s = 1.0
         self._max_reconnect_delay_s = 10.0
         self._pending_goal: RobotGoalCommand | None = None
@@ -152,6 +171,18 @@ class HardwareRobotAdapter(RobotAdapter):
         # process restart we must wait for a heartbeat/reply before deciding a persisted URL is
         # a finished file that is safe to download.
         self._recording_status_known = False
+        # A timed-out/cancelled command may still have reached the camera. Keep that ambiguous
+        # operation as the explicit recovery owner; recording retries and endpoint replacement
+        # are refused until a matching reply or authoritative heartbeat resolves it.
+        self._recording_command_revision = 0
+        self._recording_reply_recovery: tuple[int, str] | None = None
+        # A cancellation is ambiguous only once execution has reached the physical socket write.
+        # Keep this separate from the operation revision: a task can be cancelled while queued
+        # behind another request, in which case no recording command was sent and no recovery or
+        # compensating Stop is safe.
+        self._recording_write_attempt_revision: int | None = None
+        self._recording_compensation_task: asyncio.Task[None] | None = None
+        self._last_shutdown_recording_confirmed_idle = True
 
     async def configure_websocket_url(self, websocket_url: str) -> RobotState:
         next_url = websocket_url.strip()
@@ -159,6 +190,11 @@ class HardwareRobotAdapter(RobotAdapter):
             if next_url:
                 self._start_connection_loop()
             return self.state
+
+        if self.recording_operation_pending():
+            raise ValueError("上一条录制指令仍在确认中，暂时不能更改机器人连接")
+        if self.state.recording:
+            raise ValueError("录制进行中，无法更改机器人连接")
 
         await self._stop_connection_loop()
         self._recording_media_url = None
@@ -196,6 +232,10 @@ class HardwareRobotAdapter(RobotAdapter):
         return self.state
 
     async def disconnect(self) -> RobotState:
+        if self.state.recording:
+            raise ValueError("机器人仍在录制，请先停止录制再断开连接")
+        if self.recording_operation_pending():
+            raise ValueError("上一条录制指令仍在确认中，暂时不能断开机器人连接")
         await self._stop_connection_loop()
         self._recording_media_url = None
         self._recording_status_known = False
@@ -205,6 +245,93 @@ class HardwareRobotAdapter(RobotAdapter):
         self._touch()
         await self._publish_state()
         return self.state
+
+    async def shutdown(self, *, require_idle: bool = False) -> RobotState:
+        """Best-effort camera-safe process teardown, distinct from user Disconnect.
+
+        A written Start whose reply was lost still precedes this final Stop on the same websocket.
+        Superseding its recovery is safe only here: the process is exiting and the required final
+        hardware state is unconditionally idle. Transport closure happens even when Stop cannot be
+        confirmed, and that failure remains explicit in diagnostics/state.
+        """
+        cleanup_error = ""
+        cleanup_unconfirmed = False
+        cleanup_needed = (
+            self.state.recording
+            or self.recording_operation_pending()
+            or (require_idle and not self._recording_status_known)
+        )
+        self._last_shutdown_recording_confirmed_idle = not cleanup_needed
+        try:
+            async with asyncio.timeout(_RECORDING_SHUTDOWN_TIMEOUT_SECONDS):
+                async with self._recording_lock:
+                    cleanup_needed = (
+                        self.state.recording
+                        or self._recording_reply_recovery is not None
+                        or (require_idle and not self._recording_status_known)
+                    )
+                    self._last_shutdown_recording_confirmed_idle = not cleanup_needed
+                    if cleanup_needed:
+                        abandoned = self._recording_reply_recovery
+                        self._recording_reply_recovery = None
+                        try:
+                            await self._stop_recording_operation()
+                        except Exception as exc:
+                            cleanup_error = str(exc)
+                            cleanup_unconfirmed = (
+                                self.state.recording or not self._recording_status_known
+                            )
+                            self._last_shutdown_recording_confirmed_idle = (
+                                not cleanup_unconfirmed
+                            )
+                            log_event(
+                                "error" if cleanup_unconfirmed else "warning",
+                                (
+                                    "robot.shutdown.recording_stop_unconfirmed"
+                                    if cleanup_unconfirmed
+                                    else "robot.shutdown.recording_media_incomplete"
+                                ),
+                                abandoned_operation=abandoned,
+                                error=cleanup_error,
+                            )
+                        else:
+                            self._last_shutdown_recording_confirmed_idle = (
+                                not self.state.recording and self._recording_status_known
+                            )
+                compensation = self._recording_compensation_task
+                if compensation is not None and not compensation.done():
+                    with suppress(asyncio.CancelledError, Exception):
+                        await compensation
+        except TimeoutError:
+            cleanup_error = (
+                f"安全停止超过 {_RECORDING_SHUTDOWN_TIMEOUT_SECONDS:g} 秒"
+            )
+            cleanup_unconfirmed = cleanup_needed
+            self._last_shutdown_recording_confirmed_idle = not cleanup_needed
+            log_event(
+                "error",
+                "robot.shutdown.recording_stop_unconfirmed",
+                error=cleanup_error,
+            )
+        finally:
+            await self._stop_connection_loop()
+            self.state.connected = False
+            self.state.connection_status = "disconnected"
+            self.state.error = (
+                (
+                    f"关闭前未能确认停止录制：{cleanup_error}"
+                    if cleanup_unconfirmed
+                    else f"录制已停止，但文件信息不完整：{cleanup_error}"
+                )
+                if cleanup_error
+                else None
+            )
+            self._touch()
+            await self._publish_state()
+        return self.state
+
+    def shutdown_recording_confirmed_idle(self) -> bool:
+        return self._last_shutdown_recording_confirmed_idle
 
     async def status(self) -> RobotState:
         if self.websocket_url:
@@ -225,10 +352,12 @@ class HardwareRobotAdapter(RobotAdapter):
 
     async def switch_map(self, map_name: str) -> dict[str, Any]:
         response = await self._request({"set_switch_map": map_name}, "robot_switch_map")
-        self.state.map_name = map_name
         self.state.last_command = "set_switch_map"
         self._touch()
         await self._publish_state()
+        # ``robot_switch_map`` acknowledges only that the requested file exists.  It is not
+        # evidence that localization has moved to that map; only a later heartbeat may update
+        # RobotState.map_name.
         return {"map_name": map_name, "ok": _truthy(response), "raw": response}
 
     async def path_list(self, map_name: str) -> list[str]:
@@ -523,34 +652,89 @@ class HardwareRobotAdapter(RobotAdapter):
         await self._publish_state()
         return self.state
 
-    async def start_recording(self) -> RobotState:
-        # A new capture must never inherit the previous file as its recovery candidate. Clear
-        # before sending because send/ack failure is precisely where stale fallback is unsafe.
-        self._recording_media_url = None
-        response = await self._request(
-            {"video_record": {"start": 0, "resolution": 4}},
-            "robot_video_record",
-            timeout_s=8.0,
-        )
-        if not _response_ok(response):
-            self.state.recording = False
-            self._recording_status_known = True
-            raise ValueError(f"机器人拒绝开始录制：{_response_error(response)}")
-        self.state.recording = True
-        self._recording_status_known = True
-        self._recording_media_url = str(response.get("url") or "").strip() or None
-        self.state.media_url = self._recording_media_url
-        self.state.last_command = "video_record:start"
-        self._touch()
-        await self._publish_state()
-        return self.state
+    def _begin_recording_operation(self, action: str) -> int:
+        if self._recording_reply_recovery is not None:
+            action_name = "开始录制" if action == "start" else "停止录制"
+            raise ValueError(
+                f"上一条录制指令仍在确认中，请等待机器人同步状态后再{action_name}"
+            )
+        self._recording_command_revision += 1
+        revision = self._recording_command_revision
+        self._recording_write_attempt_revision = None
+        return revision
 
-    async def stop_recording(self) -> RobotState:
-        response = await self._request(
-            {"video_record": {"stop": 0}},
-            "robot_video_record",
-            timeout_s=8.0,
+    def recording_operation_pending(self) -> bool:
+        """Whether disconnect/reconfiguration could discard recording command ownership."""
+        compensation = self._recording_compensation_task
+        return (
+            self._recording_lock.locked()
+            or self._recording_reply_recovery is not None
+            or (compensation is not None and not compensation.done())
         )
+
+    def _abandon_recording_operation(self, revision: int, action: str) -> None:
+        if revision != self._recording_command_revision:
+            return
+        if self._recording_write_attempt_revision != revision:
+            # Cancellation before socket.send is definitive: this operation did not reach the
+            # robot, so a later heartbeat must not be interpreted as its result.
+            return
+        self._recording_reply_recovery = (revision, action)
+        # Until either the matching late reply or a heartbeat showing the command's resulting
+        # state arrives, the process does not know whether the camera applied the command.
+        self._recording_status_known = False
+
+    async def start_recording(self) -> RobotState:
+        async with self._recording_lock:
+            revision = self._begin_recording_operation("start")
+            # A new capture must never inherit the previous file as its recovery candidate.
+            # Clear before sending because send/ack failure is precisely where stale fallback
+            # is unsafe.
+            self._recording_media_url = None
+            try:
+                response = await self._request(
+                    {"video_record": {"start": 0, "resolution": 4}},
+                    "robot_video_record",
+                    timeout_s=_RECORDING_REPLY_TIMEOUT_SECONDS,
+                )
+            except RobotCommandNotSentError:
+                raise
+            except asyncio.CancelledError:
+                self._abandon_recording_operation(revision, "start")
+                raise
+            except Exception:
+                self._abandon_recording_operation(revision, "start")
+                raise
+            if not _response_ok(response):
+                self.state.recording = False
+                self._recording_status_known = True
+                raise ValueError(f"机器人拒绝开始录制：{_response_error(response)}")
+            self.state.recording = True
+            self._recording_status_known = True
+            self._recording_media_url = str(response.get("url") or "").strip() or None
+            self.state.media_url = self._recording_media_url
+            self.state.last_command = "video_record:start"
+            self._touch()
+            await self._publish_state()
+            return self.state
+
+    async def _stop_recording_operation(self) -> RobotState:
+        """Perform one serialized Stop; caller owns ``_recording_lock``."""
+        revision = self._begin_recording_operation("stop")
+        try:
+            response = await self._request(
+                {"video_record": {"stop": 0}},
+                "robot_video_record",
+                timeout_s=_RECORDING_REPLY_TIMEOUT_SECONDS,
+            )
+        except RobotCommandNotSentError:
+            raise
+        except asyncio.CancelledError:
+            self._abandon_recording_operation(revision, "stop")
+            raise
+        except Exception:
+            self._abandon_recording_operation(revision, "stop")
+            raise
         if not _response_ok(response):
             raise ValueError(f"机器人拒绝停止录制：{_response_error(response)}")
         self.state.recording = False
@@ -565,6 +749,20 @@ class HardwareRobotAdapter(RobotAdapter):
         self._touch()
         await self._publish_state()
         return self.state
+
+    async def stop_recording(self) -> RobotState:
+        async with self._recording_lock:
+            # An orphan-cleanup Stop can win the lock just before an operator/finalizer Stop.
+            # Treat that exact, already-confirmed result as idempotent instead of sending an
+            # invalid duplicate command to an idle camera.
+            if (
+                not self.state.recording
+                and self._recording_status_known
+                and self.state.last_command == "video_record:stop"
+                and bool(self.state.media_url)
+            ):
+                return self.state
+            return await self._stop_recording_operation()
 
     async def capture_photo(self) -> dict[str, Any]:
         response = await self._request(
@@ -598,23 +796,60 @@ class HardwareRobotAdapter(RobotAdapter):
             loop = asyncio.get_running_loop()
             future: asyncio.Future[Any] = loop.create_future()
             self._pending[response_key] = future
+            reply_matcher = _reply_matcher(payload, response_key)
+            if reply_matcher is not None:
+                self._pending_reply_matchers[response_key] = reply_matcher
+            late_reply_grace_s = (
+                _RECORDING_LATE_REPLY_GRACE_SECONDS
+                if reply_matcher is not None
+                else 0.0
+            )
             try:
                 await self._send(payload)
                 try:
-                    return await asyncio.wait_for(future, timeout=timeout_s)
-                except TimeoutError as exc:
+                    # Shielding is essential: wait_for otherwise cancels the shared future at
+                    # the primary deadline, making a slightly late hardware acknowledgement
+                    # impossible to reconcile with the operation that sent the command.
+                    return await _wait_for_reply(future, timeout_s)
+                except _ReplyDeadlineExpired as exc:
+                    if late_reply_grace_s > 0:
+                        log_event(
+                            "warning",
+                            "robot.reply.delayed",
+                            response_key=response_key,
+                            primary_timeout_seconds=timeout_s,
+                            grace_seconds=late_reply_grace_s,
+                        )
+                        try:
+                            response = await _wait_for_reply(future, late_reply_grace_s)
+                        except _ReplyDeadlineExpired:
+                            pass
+                        else:
+                            log_event(
+                                "info",
+                                "robot.reply.reconciled",
+                                response_key=response_key,
+                                primary_timeout_seconds=timeout_s,
+                            )
+                            return response
                     log_event(
                         "error",
                         "robot.reply.timeout",
                         response_key=response_key,
-                        timeout_seconds=timeout_s,
+                        timeout_seconds=timeout_s + late_reply_grace_s,
+                        primary_timeout_seconds=timeout_s,
+                        grace_seconds=late_reply_grace_s,
                     )
                     raise TimeoutError(
-                        f"等待机器人回复超时：{response_key}（{timeout_s:g} 秒）"
+                        "等待机器人回复超时："
+                        f"{response_key}（{timeout_s + late_reply_grace_s:g} 秒）"
                     ) from exc
             finally:
                 if self._pending.get(response_key) is future:
                     self._pending.pop(response_key, None)
+                self._pending_reply_matchers.pop(response_key, None)
+                if not future.done():
+                    future.cancel()
 
     async def _send(self, payload: dict[str, Any], *, context: str = "") -> None:
         await self.connect()
@@ -636,6 +871,11 @@ class HardwareRobotAdapter(RobotAdapter):
             # process an immediate reply before send() resumes, but the public diagnostic is
             # still created only after the write succeeds.
             sent_at = utc_now()
+            video_record = payload.get("video_record")
+            if _video_record_action(video_record) is not None:
+                # Mark immediately before the real write. Cancellation anywhere earlier is
+                # definitively pre-send; cancellation inside send remains correctly ambiguous.
+                self._recording_write_attempt_revision = self._recording_command_revision
             await self._socket.send(json.dumps(payload, ensure_ascii=False))
             log_event("info", "robot.command.sent", payload=payload)
             if isinstance(gimbal, dict):
@@ -645,7 +885,7 @@ class HardwareRobotAdapter(RobotAdapter):
                 if normalized_context == "cruise_moving":
                     base_motion_intent = "moving"
                 elif normalized_context in {
-                    "cruise_stationary_scan",
+                    "cruise_stationary_camerawork",
                     "cruise_stationary_anchor",
                     "cruise_stationary_zoom",
                     "framing_test",
@@ -686,6 +926,11 @@ class HardwareRobotAdapter(RobotAdapter):
         self._connection_task = asyncio.create_task(self._connection_loop())
 
     async def _stop_connection_loop(self) -> None:
+        # Replies queued on the old socket must never recover or complete work on a replacement
+        # connection.
+        self._recording_command_revision += 1
+        self._recording_reply_recovery = None
+        self._recording_write_attempt_revision = None
         self._recording_status_known = False
         self._clear_heartbeat_diagnostics()
         self._fail_pending(ConnectionError("Robot websocket was reconfigured"))
@@ -753,7 +998,12 @@ class HardwareRobotAdapter(RobotAdapter):
                 self._touch()
                 self._fail_pending(exc)
                 await self._publish_state()
-                log_event("error", "robot.websocket.error", error=str(exc), websocket_url=self.websocket_url)
+                log_event(
+                    "error",
+                    "robot.websocket.error",
+                    error=str(exc),
+                    websocket_url=self.websocket_url,
+                )
                 await asyncio.sleep(self._reconnect_delay_s)
                 self._reconnect_delay_s = min(
                     self._max_reconnect_delay_s,
@@ -782,18 +1032,132 @@ class HardwareRobotAdapter(RobotAdapter):
             log_event("info", "robot.reply.received", reply=replies)
 
         resolved = False
+        recording_reply_resolved = False
         for key, future in list(self._pending.items()):
             if key in payload and not future.done():
-                future.set_result(payload[key])
-                resolved = True
+                response = payload[key]
+                matcher = self._pending_reply_matchers.get(key)
+                if matcher is None or matcher(response):
+                    future.set_result(response)
+                    resolved = True
+                    recording_reply_resolved = (
+                        recording_reply_resolved or key == "robot_video_record"
+                    )
+
+        recovered_recording_reply = False
+        record = payload.get("robot_video_record")
+        if isinstance(record, dict) and not recording_reply_resolved:
+            recovered_recording_reply = self._recover_recording_reply(record)
+            if not recovered_recording_reply:
+                log_event(
+                    "warning",
+                    "robot.reply.quarantined",
+                    response_key="robot_video_record",
+                    action=_video_record_action(record),
+                    reason=(
+                        "no_matching_recovery"
+                        if self._recording_reply_recovery is None
+                        else "action_mismatch_or_ambiguous"
+                    ),
+                )
 
         state_changed = self._apply_protocol_state(payload)
-        if resolved or state_changed:
+        if resolved or recovered_recording_reply or state_changed:
             self._touch()
             await self._publish_state()
 
+    def _recover_recording_reply(self, response: dict[str, Any]) -> bool:
+        """Apply a late reply only while its abandoned command still owns recovery.
+
+        The wire protocol has no request id, so a newer recording command is not allowed to
+        replace this ownership. Replies without the documented Start/Stop echo are never guessed.
+        """
+        action = _video_record_action(response)
+        recovery = self._recording_reply_recovery
+        if action is None or recovery is None:
+            return False
+        revision, expected_action = recovery
+        if revision != self._recording_command_revision or action != expected_action:
+            return False
+        if response.get(action) != 0:
+            return False
+        status = str(response.get("status") or "").strip()
+        if not status:
+            return False
+
+        self._recording_reply_recovery = None
+        self._recording_status_known = True
+        if _response_ok(response):
+            record_url = _maybe_str(response.get("url"))
+            if action == "start":
+                self.state.recording = True
+                self._recording_media_url = record_url
+                self.state.media_url = record_url
+            else:
+                self.state.recording = False
+                # Shared state.media_url may have been replaced by an in-recording photo. Only
+                # recording-owned URLs are safe fallbacks for a late Stop acknowledgement.
+                self.state.media_url = record_url or self._recording_media_url
+                self._recording_media_url = None
+            self.state.last_command = f"video_record:{action}"
+        else:
+            # A definitive rejection means the camera stayed in its pre-command state.
+            self.state.recording = action == "stop"
+        log_event(
+            "info",
+            "robot.reply.recovered",
+            response_key="robot_video_record",
+            action=action,
+            revision=revision,
+            success=_response_ok(response),
+        )
+        if action == "start" and _response_ok(response):
+            # The caller has already given up, so nothing else owns cleanup. Stop this orphaned
+            # recording exactly once unless a newer user operation supersedes its revision.
+            self._schedule_orphaned_recording_stop(revision)
+        return True
+
+    def _schedule_orphaned_recording_stop(self, recovered_revision: int) -> None:
+        current = self._recording_compensation_task
+        if current is not None and not current.done():
+            return
+        task = asyncio.create_task(self._compensate_orphaned_recording(recovered_revision))
+        self._recording_compensation_task = task
+        task.add_done_callback(self._forget_recording_compensation_task)
+
+    def _forget_recording_compensation_task(self, task: asyncio.Task[None]) -> None:
+        if self._recording_compensation_task is task:
+            self._recording_compensation_task = None
+
+    async def _compensate_orphaned_recording(self, recovered_revision: int) -> None:
+        """Stop a Start that succeeded only after its caller timed out or was cancelled."""
+        async with self._recording_lock:
+            if (
+                recovered_revision != self._recording_command_revision
+                or not self.state.recording
+            ):
+                return
+            try:
+                await self._stop_recording_operation()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                log_event(
+                    "error",
+                    "robot.recording.orphan_stop_failed",
+                    recovered_revision=recovered_revision,
+                    error=str(exc),
+                )
+            else:
+                log_event(
+                    "info",
+                    "robot.recording.orphan_stopped",
+                    recovered_revision=recovered_revision,
+                )
+
     def _apply_protocol_state(self, payload: dict[str, Any]) -> bool:
         changed = False
+        map_changed = False
         system = payload.get("system") if isinstance(payload.get("system"), dict) else {}
         current_map = payload.get("map") if isinstance(payload.get("map"), dict) else {}
         navigation = (
@@ -826,7 +1190,13 @@ class HardwareRobotAdapter(RobotAdapter):
                 self.state.system_status = _maybe_str(system.get("status"))
         if current_map:
             if "name" in current_map:
-                self.state.map_name = _maybe_str(current_map.get("name"))
+                reported_map = _maybe_str(current_map.get("name"))
+                if reported_map != self.state.map_name:
+                    # A task/path identity belongs to one map.  Do not carry the previous map's
+                    # last point into a newly confirmed map when the new heartbeat omits task.
+                    map_changed = True
+                    self._clear_navigation_state()
+                self.state.map_name = reported_map
             if "mode" in current_map:
                 self.state.map_mode = _maybe_str(current_map.get("mode"))
             if "status" in current_map:
@@ -865,7 +1235,23 @@ class HardwareRobotAdapter(RobotAdapter):
             # send the stop command, so a missing field must mean "unchanged", not "no".
             if "record_status" in gimbal:
                 self.state.recording = gimbal.get("record_status") == "recording"
-                self._recording_status_known = True
+                # A heartbeat can confirm an abandoned Start even when its ACK never arrives.
+                # In that case the caller is already gone, so compensate just as for a late ACK.
+                recovery = self._recording_reply_recovery
+                if recovery is not None:
+                    revision, action = recovery
+                    if action == "start" and self.state.recording:
+                        self._recording_reply_recovery = None
+                        self._schedule_orphaned_recording_stop(revision)
+                    elif action == "stop" and not self.state.recording:
+                        # Only the command's resulting state is causal evidence. An idle heartbeat
+                        # can precede a queued Start, and a recording heartbeat can precede a queued
+                        # Stop; clearing ownership on either would let their late ACK be mistaken
+                        # for a retry of the same action.
+                        self._recording_reply_recovery = None
+                # The physical state is only safe for finalization when no written recording
+                # operation can still change it after this heartbeat.
+                self._recording_status_known = self._recording_reply_recovery is None
             if "yaw" in gimbal:
                 yaw = _maybe_float(gimbal.get("yaw"))
                 if yaw is not None:
@@ -911,6 +1297,20 @@ class HardwareRobotAdapter(RobotAdapter):
             object_status_identity = previous.object_status_identity if previous else None
             path_file = previous.path_file if previous else None
             goal_id = previous.goal_id if previous else None
+            if map_changed:
+                # Keep independent gimbal samples, but never attach a previous map's task or
+                # navigation identity to the first heartbeat for the newly reported map.
+                task_goal_status = None
+                task_goal_status_received_at = None
+                task_goal_status_identity = None
+                navigation_goal_status = None
+                navigation_goal_status_received_at = None
+                navigation_goal_status_identity = None
+                object_status = None
+                object_status_received_at = None
+                object_status_identity = None
+                path_file = None
+                goal_id = None
             if "goal_status" in task:
                 task_goal_status = _normalize_failed(_maybe_str(task.get("goal_status")))
                 task_goal_status_received_at = heartbeat_received_at
@@ -967,20 +1367,6 @@ class HardwareRobotAdapter(RobotAdapter):
             )
             changed = True
 
-        record = payload.get("robot_video_record")
-        if isinstance(record, dict):
-            record_url = _maybe_str(record.get("url"))
-            if _response_ok(record) and "stop" in record:
-                self.state.recording = False
-                self._recording_status_known = True
-                self._recording_media_url = record_url or self._recording_media_url
-            elif _response_ok(record):
-                self.state.recording = True
-                self._recording_status_known = True
-                self._recording_media_url = record_url or self._recording_media_url
-            self.state.media_url = record_url or self.state.media_url
-            changed = True
-
         photo = payload.get("robot_take_photo")
         if isinstance(photo, dict):
             # Only the live request owns shared photo state. A delayed/duplicate photo reply
@@ -1003,12 +1389,29 @@ class HardwareRobotAdapter(RobotAdapter):
         self.state.diagnostics.last_goal_command = None
         self.state.diagnostics.last_heartbeat = None
         self.state.diagnostics.last_gimbal_command = None
+        # These fields are heartbeat-owned physical state.  Keeping them across a socket
+        # replacement would make an old map look current before the new robot has reported.
+        self.state.system_status = None
+        self.state.map_name = None
+        self.state.map_mode = None
+        self.state.map_status = None
+        self._clear_navigation_state()
+
+    def _clear_navigation_state(self) -> None:
+        self.state.moving = False
+        self.state.navigation_status = None
+        self.state.goal_status = None
+        self.state.object_status = None
+        self.state.path_file = None
+        self.state.goal_id = None
+        self.state.goal_object = None
 
     def _fail_pending(self, exc: Exception) -> None:
         for future in self._pending.values():
             if not future.done():
                 future.set_exception(exc)
         self._pending.clear()
+        self._pending_reply_matchers.clear()
         # Never leave a cruise blocked on an arrival that can no longer be reported.
         if self._pending_goal is not None:
             self._resolve_arrival("failed")
@@ -1035,12 +1438,16 @@ class RobotService:
         # Serializing that boundary prevents a later start/photo from clearing or replacing the
         # shared adapter state while an earlier REC_xxxx file is still being downloaded.
         self._capture_lock = asyncio.Lock()
+        # Map commands have no request id.  Keep manual and cruise switches serialized through
+        # acknowledgement and (for a cruise) physical heartbeat confirmation.
+        self._map_lock = asyncio.Lock()
         # A photo taken during recording replaces RobotState.media_url, so video recovery owns
         # a separate URL that survives a timed-out Stop acknowledgement.
         self._recoverable_video_url: str | None = None
         # HTTP transfers finish independently of WebSocket commands. Tokens stop a late photo
         # completion from publishing state owned by a newer Stop/start/photo operation.
         self._media_revision = 0
+        self._last_shutdown_recording_confirmed_idle = True
 
     async def configure_websocket_url(self, websocket_url: str) -> RobotState:
         async with self._capture_lock:
@@ -1180,7 +1587,11 @@ class RobotService:
             self._recoverable_video_url = candidate
             self.adapter.state.media_url = candidate
         saved_path = Path(str(local_path or ""))
-        if local_path and saved_path.is_file():
+        if (
+            local_path
+            and saved_path.is_file()
+            and not _looks_like_image_url(str(saved_path))
+        ):
             self.adapter.state.media_local_path = str(saved_path)
         self.adapter.state.media_sync_error = str(sync_error or "").strip() or None
 
@@ -1190,17 +1601,172 @@ class RobotService:
         return state
 
     async def disconnect(self) -> RobotState:
-        state = await self.adapter.disconnect()
-        await self.events.publish("ROBOT_STATE", state.model_dump(mode="json"))
-        return state
+        async with self._capture_lock:
+            current = await self.adapter.status()
+            if current.recording:
+                raise ValueError("机器人仍在录制，请先停止录制再断开连接")
+            pending_reader = getattr(self.adapter, "recording_operation_pending", None)
+            if callable(pending_reader) and bool(pending_reader()):
+                raise ValueError("上一条录制指令仍在确认中，暂时不能断开机器人连接")
+            state = await self.adapter.disconnect()
+            await self.events.publish("ROBOT_STATE", state.model_dump(mode="json"))
+            return state
+
+    async def shutdown(
+        self,
+        on_media_url: Callable[[str], None] | None = None,
+        *,
+        require_idle: bool = False,
+        sync_media: bool = True,
+    ) -> RobotState:
+        """Finalize camera ownership for application exit and always close the transport."""
+        capture_lock_acquired = False
+        try:
+            try:
+                await asyncio.wait_for(
+                    self._capture_lock.acquire(),
+                    timeout=_RECORDING_SHUTDOWN_TIMEOUT_SECONDS,
+                )
+                capture_lock_acquired = True
+            except TimeoutError:
+                # A capture request may itself be stuck in websocket.send(). Lifecycle shutdown
+                # must still reach the adapter's independently bounded final Stop/transport close.
+                log_event(
+                    "error",
+                    "robot.shutdown.capture_owner_stalled",
+                    timeout_seconds=_RECORDING_SHUTDOWN_TIMEOUT_SECONDS,
+                )
+            current = await self.adapter.status()
+            pending_reader = getattr(self.adapter, "recording_operation_pending", None)
+            cleanup_needed = current.recording or (
+                callable(pending_reader) and bool(pending_reader())
+            )
+            known_reader = getattr(self.adapter, "recording_status_known", None)
+            cleanup_needed = cleanup_needed or (
+                require_idle and callable(known_reader) and not bool(known_reader())
+            )
+            if cleanup_needed:
+                # Shared media state may currently describe a photo taken during this recording,
+                # or an older transfer. It is not evidence that the recording being stopped here
+                # is already local. Only a path produced after this boundary may suppress a video
+                # download.
+                current.media_local_path = None
+                current.media_sync_error = None
+            shutdown = getattr(self.adapter, "shutdown", None)
+            if callable(shutdown):
+                if isinstance(self.adapter, HardwareRobotAdapter):
+                    state = await shutdown(require_idle=require_idle)
+                else:
+                    state = await shutdown()
+            else:
+                # Non-hardware test/custom adapters have no ambiguous websocket ownership.
+                state = await self.adapter.disconnect()
+
+            result = state.model_copy(deep=True)
+            confirmed_reader = getattr(
+                self.adapter,
+                "shutdown_recording_confirmed_idle",
+                None,
+            )
+            confirmed_idle = (
+                bool(confirmed_reader())
+                if callable(confirmed_reader)
+                else not result.recording
+            )
+            self._last_shutdown_recording_confirmed_idle = confirmed_idle
+            if cleanup_needed:
+                robot_url = self._select_video_url(str(result.media_url or ""), prefer_state=True)
+                result.media_url = robot_url or None
+                self._recoverable_video_url = robot_url or self._recoverable_video_url
+                self._notify_media_url(on_media_url, robot_url)
+                if (
+                    confirmed_idle
+                    and not result.recording
+                    and robot_url
+                    and not result.media_local_path
+                    and sync_media
+                ):
+                    await self._sync_robot_media(result, robot_url, "video")
+                elif not confirmed_idle or result.recording:
+                    result.media_sync_error = (
+                        result.media_sync_error
+                        or result.error
+                        or "关闭应用前未能确认机器人已停止录制"
+                    )
+                state.media_url = result.media_url
+                state.media_local_path = result.media_local_path
+                state.media_sync_error = result.media_sync_error
+            await self.events.publish("ROBOT_STATE", result.model_dump(mode="json"))
+            return result
+        finally:
+            if capture_lock_acquired:
+                self._capture_lock.release()
+
+    def shutdown_recording_confirmed_idle(self) -> bool:
+        return self._last_shutdown_recording_confirmed_idle
 
     async def map_list(self) -> list[str]:
         return await self.adapter.map_list()
 
     async def switch_map(self, map_name: str) -> dict[str, Any]:
+        async with self._map_lock:
+            return await self._switch_map_unlocked(map_name)
+
+    async def _switch_map_unlocked(self, map_name: str) -> dict[str, Any]:
         result = await self.adapter.switch_map(map_name)
         await self.events.publish("ROBOT_COMMAND", {"type": "set_switch_map", "result": result})
         return result
+
+    async def switch_map_and_confirm(
+        self,
+        map_name: str,
+        *,
+        timeout_s: float = _MAP_SWITCH_CONFIRM_TIMEOUT_SECONDS,
+    ) -> RobotState:
+        """Select a map and require a later, navigation-ready heartbeat for that map.
+
+        The scalar switch reply means only that the file exists.  A cruise must not record or
+        dispatch a goal until the robot itself reports the requested map in localization mode.
+        The lock also prevents a manual switch from interleaving with this confirmation window.
+        """
+        target = map_name.strip()
+        if not target:
+            raise ValueError("巡游清单未指定地图")
+
+        async with self._map_lock:
+            result = await self._switch_map_unlocked(target)
+            if not isinstance(result, dict) or result.get("ok") is not True:
+                raise ValueError(f"机器人拒绝切换到地图“{target}”")
+
+            # A heartbeat received before (or together with) the ACK cannot prove the accepted
+            # switch has completed.  Capture the boundary after acceptance and require a newer
+            # report.  received_at survives heartbeat sequence resets on reconnect.
+            acknowledged_state = await self.adapter.status()
+            previous = acknowledged_state.diagnostics.last_heartbeat
+            after = previous.received_at if previous is not None else None
+            deadline = asyncio.get_running_loop().time() + max(0.0, timeout_s)
+            last_observation = "尚未收到新的地图心跳"
+
+            while True:
+                state = await self.adapter.status()
+                ready, terminal_error, observation = _confirmed_cruise_map(
+                    state,
+                    target,
+                    after=after,
+                )
+                last_observation = observation or last_observation
+                if terminal_error:
+                    raise ValueError(terminal_error)
+                if ready:
+                    return state
+
+                remaining = deadline - asyncio.get_running_loop().time()
+                if remaining <= 0:
+                    raise TimeoutError(
+                        f"切换地图“{target}”后未在 {timeout_s:g} 秒内确认可巡游："
+                        f"{last_observation}"
+                    )
+                await asyncio.sleep(min(_MAP_SWITCH_CONFIRM_POLL_SECONDS, remaining))
 
     async def path_list(self, map_name: str) -> list[str]:
         return await self.adapter.path_list(map_name)
@@ -1237,6 +1803,14 @@ class RobotService:
     def heartbeat_revision(self) -> int | None:
         reader = getattr(self.adapter, "heartbeat_revision", None)
         return reader() if callable(reader) else None
+
+    def recording_status_known(self) -> bool:
+        reader = getattr(self.adapter, "recording_status_known", None)
+        return bool(reader()) if callable(reader) else True
+
+    def recording_operation_pending(self) -> bool:
+        reader = getattr(self.adapter, "recording_operation_pending", None)
+        return bool(reader()) if callable(reader) else False
 
     async def stop_motion(self) -> RobotState:
         state = await self.adapter.stop_motion()
@@ -1603,15 +2177,134 @@ def _looks_like_image_url(url: str) -> bool:
     return path.endswith((".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif", ".tif", ".tiff"))
 
 
+async def _wait_for_reply(future: asyncio.Future[Any], timeout_s: float) -> Any:
+    """Wait for our deadline without relabelling a TimeoutError delivered by the socket.
+
+    ``asyncio.wait_for`` raises the same exception type both when its own timer expires and when
+    the awaited future has already completed with ``TimeoutError``. Inspecting the shielded
+    future at the boundary preserves the latter as the real transport failure.
+    """
+    try:
+        return await asyncio.wait_for(asyncio.shield(future), timeout=timeout_s)
+    except TimeoutError as exc:
+        if future.done():
+            return future.result()
+        raise _ReplyDeadlineExpired from exc
+
+
+def _video_record_action(value: Any) -> str | None:
+    if not isinstance(value, dict):
+        return None
+    has_start = "start" in value
+    has_stop = "stop" in value
+    if has_start == has_stop:
+        # Both and neither are ambiguous. The documented protocol makes these fields mutually
+        # exclusive, and the real robot log echoes ``start`` on Start acknowledgements.
+        return None
+    return "start" if has_start else "stop"
+
+
+def _reply_matcher(
+    request_payload: dict[str, Any],
+    response_key: str,
+) -> Callable[[Any], bool] | None:
+    """Match replies for commands that share one protocol response key."""
+    if response_key != "robot_video_record":
+        return None
+    command = request_payload.get("video_record")
+    if not isinstance(command, dict):
+        return None
+    action = _video_record_action(command)
+    if action is None:
+        return None
+    expected_value = command[action]
+    return lambda response: (
+        _video_record_action(response) == action
+        and response.get(action) == expected_value
+    )
+
+
 def _response_error(response: Any) -> str:
     if isinstance(response, dict):
-        return str(response.get("error") or response.get("message") or response.get("status") or response)
+        return str(
+            response.get("error")
+            or response.get("message")
+            or response.get("status")
+            or response
+        )
     return str(response)
 
 
 def _response_ok(response: Any) -> bool:
     """Accept harmless firmware casing/whitespace while still requiring explicit success."""
-    return isinstance(response, dict) and str(response.get("status") or "").strip().casefold() == "ok"
+    return (
+        isinstance(response, dict)
+        and str(response.get("status") or "").strip().casefold() == "ok"
+    )
+
+
+def _confirmed_cruise_map(
+    state: RobotState,
+    target: str,
+    *,
+    after: datetime | None,
+) -> tuple[bool, str | None, str]:
+    """Interpret only a post-ACK heartbeat as physical map readiness."""
+    if not state.connected:
+        return False, None, "机器人连接已断开"
+    heartbeat = state.diagnostics.last_heartbeat
+    if heartbeat is None or (after is not None and heartbeat.received_at <= after):
+        return False, None, "尚未收到新的地图心跳"
+
+    payload = heartbeat.payload
+    current_map = payload.get("map") if isinstance(payload.get("map"), dict) else None
+    system = payload.get("system") if isinstance(payload.get("system"), dict) else None
+    navigation = (
+        payload.get("naviagtion")
+        if isinstance(payload.get("naviagtion"), dict)
+        else payload.get("navigation")
+        if isinstance(payload.get("navigation"), dict)
+        else None
+    )
+    if current_map is None:
+        return False, None, "新心跳没有地图状态"
+
+    actual = str(current_map.get("name") or "").strip()
+    if actual != target:
+        return False, None, f"机器人仍报告地图“{actual or '未命名'}”"
+
+    system_status = str((system or {}).get("status") or "").strip().casefold()
+    map_mode = str(current_map.get("mode") or "").strip().casefold()
+    map_status = _normalize_failed(
+        str(current_map.get("status") or "").strip().casefold() or None
+    )
+    navigation_status = str((navigation or {}).get("status") or "").strip().casefold()
+
+    if system_status and system_status != "ready":
+        return (
+            False,
+            f"地图已切换到“{target}”，但机器人硬件状态为 {system_status}",
+            f"硬件状态 {system_status}",
+        )
+    if map_status == "failed":
+        return (
+            False,
+            f"地图已切换到“{target}”，但机器人定位失败",
+            "定位失败",
+        )
+
+    missing = []
+    if system_status != "ready":
+        missing.append("硬件未就绪")
+    if map_mode != "localization":
+        missing.append(f"地图模式 {map_mode or '未上报'}")
+    if map_status != "ready":
+        missing.append(f"定位状态 {map_status or '未上报'}")
+    if navigation_status != "ready":
+        missing.append(f"导航状态 {navigation_status or '未上报'}")
+    if missing:
+        return False, None, "、".join(missing)
+    return True, None, f"地图“{target}”已定位并可导航"
 
 
 def refuse_if_unfit_to_drive(state: RobotState | None) -> None:
@@ -1637,7 +2330,7 @@ def _truthy(value: Any) -> bool:
     if isinstance(value, bool):
         return value
     if isinstance(value, str):
-        return value.lower() == "true"
+        return value.strip().casefold() == "true"
     return bool(value)
 
 

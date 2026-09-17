@@ -63,6 +63,35 @@ def test_touch_promotes_and_survives_a_reload(tmp_path):
     assert reloaded.get(first.id).request.map_name == "map1"
 
 
+def test_store_discards_legacy_point_dwell_and_retired_scan(tmp_path):
+    path = tmp_path / "cruise-routes.json"
+    path.write_text(json.dumps([{
+        "name": "legacy",
+        "request": {
+            "map_name": "map1",
+            "points": [{"path_name": "path1", "goal_id": 1}],
+            "dwell_min_seconds": 5,
+            "dwell_max_seconds": 10,
+            "dwell_seconds": 7.5,
+            "gimbal_scan": {"enabled": True, "yaw_offset_deg": 30},
+        },
+    }]), encoding="utf-8")
+
+    store = CruiseRouteStore(path=path)
+    route = store.list_routes()[0]
+
+    assert not hasattr(route.request, "dwell_seconds")
+    assert not hasattr(route.request, "gimbal_scan")
+    store.touch(route.id)
+    saved_request = json.loads(path.read_text(encoding="utf-8"))[0]["request"]
+    assert set(saved_request).isdisjoint({
+        "dwell_seconds",
+        "dwell_min_seconds",
+        "dwell_max_seconds",
+        "gimbal_scan",
+    })
+
+
 def test_corrupt_and_unreadable_entries_are_dropped_not_fatal(tmp_path):
     path = tmp_path / "cruise-routes.json"
     path.write_text(json.dumps([{"name": "broken"}, "nonsense"]), encoding="utf-8")
@@ -123,6 +152,18 @@ async def test_validation_passes_when_map_and_paths_exist():
     assert result.ok is True
     assert result.checked is True
     assert result.issues == []
+
+
+@pytest.mark.asyncio
+async def test_legacy_route_without_map_is_loaded_but_cannot_be_started_implicitly():
+    cruise = cruise_with(FakeRobotAdapter(maps=["map1"], paths=["path1"]))
+    route = route_for()
+    route.request.map_name = None
+
+    result = await cruise.validate_route(route)
+
+    assert result.ok is False
+    assert result.issues[0].field == "map_name"
 
 
 @pytest.mark.asyncio

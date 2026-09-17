@@ -143,9 +143,9 @@ some levels are wanted. Those fields are what the operator buttons will drive �
 control needs an explicit 自动 position, because a dropdown sitting on `balanced` would
 misrepresent the default as a middle setting rather than a roll.
 
-B2–B7 shared one prerequisite, and it is now met. `CruiseSegment` always held
-`transit_start_seconds`, `arrived_at_seconds`, `departed_at_seconds`, `status` and
-`scanned`, but `attach_to_recording` wrote only `notes` and `markers`, so the sidecar
+B2–B7 shared one prerequisite, and it is now met. `CruiseSegment` already held
+`transit_start_seconds`, `arrived_at_seconds`, `departed_at_seconds` and `status`, but
+`attach_to_recording` wrote only `notes` and `markers`, so the sidecar
 recorded arrival instants and never departures — a dwell had a start and no end, and nothing
 downstream could tell a parked shot from a moving one.
 

@@ -128,12 +128,12 @@ export function heartbeatObjectAlignment(snapshot, now = Date.now()) {
 export function commandContextLabel(context) {
   return {
     manual: '手动镜头控制',
-    camera_sweep: '停留扫视',
+    camera_sweep: '镜头移动',
     framing_test: '取景测试',
     cruise_moving: '巡游行进运镜',
-    cruise_stationary_scan: '点位停留扫视',
-    cruise_stationary_anchor: '点位回到锚点',
-    cruise_stationary_zoom: '点位停稳变焦',
+    cruise_stationary_camerawork: '自动运镜',
+    cruise_stationary_anchor: '回到锚点',
+    cruise_stationary_zoom: '锚点变焦',
     goal_object_alignment: '巡游目标物对准',
     cruise_navigation_goal: '巡游前往点位',
   }[context] || '镜头控制'
@@ -366,7 +366,7 @@ export function shootingApplicationPhase({
     const parked = [...segments].reverse().find((segment) =>
       segment.status === 'arrived' && segment.departed_at_seconds == null
     )
-    if (parked) return { key: 'cruise_stationary', label: '点位停留（应用计划）', tone: 'stationary' }
+    if (parked) return { key: 'cruise_stationary', label: '点位已到达（应用计划）', tone: 'stationary' }
     return { key: 'cruise_preparing', label: '巡游准备 / 切换点位', tone: 'warning' }
   }
   if (manualCaptureActive) {
@@ -448,10 +448,10 @@ export function cameraDiagnosticVerdict({
     return { tone: 'warning', label: '应用正在巡游，但机器人心跳未持续回报行进' }
   }
   if (applicationPhaseKey === 'cruise_stationary' && motionStatus === 'going') {
-    return { tone: 'warning', label: '应用已进入停留，但机器人仍回报行进' }
+    return { tone: 'warning', label: '应用已到达点位，但机器人仍回报行进' }
   }
   if (applicationPhaseKey === 'cruise_stationary' && motionStatus !== 'done') {
-    return { tone: 'warning', label: '应用已进入停留，但机器人心跳未持续回报到点' }
+    return { tone: 'warning', label: '应用已到达点位，但机器人心跳未持续回报到点' }
   }
   if (applicationPhaseKey === 'fixed_capture' && motionStatus === 'going') {
     return { tone: 'warning', label: '应用正在原地拍摄，但机器人仍回报行进' }

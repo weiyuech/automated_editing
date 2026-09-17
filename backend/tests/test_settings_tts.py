@@ -222,6 +222,8 @@ def test_camerawork_profile_is_unconfigured_until_saved_and_persists_absolute_li
         zoom_max=1.8,
         speed_min=2,
         speed_max=4,
+        anchor_time_percent=35,
+        anchor_dwell_seconds=8.5,
     )
     service.update(SettingsUpdateRequest(
         automation=AutomationSettingsUpdate(camerawork=profile)
@@ -231,11 +233,44 @@ def test_camerawork_profile_is_unconfigured_until_saved_and_persists_absolute_li
     assert saved == profile
 
 
+def test_legacy_camerawork_settings_gain_the_new_anchor_schedule_defaults(tmp_path):
+    path = tmp_path / "settings.json"
+    path.write_text(json.dumps({
+        "automation": {
+            "camerawork": {
+                "configured": True,
+                "anchor_yaw": 4,
+                "anchor_pitch": -2,
+                "anchor_zoom": 1.1,
+                "yaw_min": -30,
+                "yaw_max": 40,
+                "pitch_min": -10,
+                "pitch_max": 8,
+                "zoom_min": 1,
+                "zoom_max": 1.6,
+                "speed_min": 2,
+                "speed_max": 4,
+            },
+        },
+    }), encoding="utf-8")
+
+    loaded = SettingsService(path=path).camerawork_config()
+
+    assert loaded.configured is True
+    assert loaded.anchor_yaw == 4
+    assert loaded.anchor_time_percent == 20
+    assert loaded.anchor_dwell_seconds == pytest.approx(5.0)
+
+
 @pytest.mark.parametrize("patch", [
     {"yaw_min": 10, "yaw_max": 10},
     {"pitch_min": -5, "pitch_max": 5, "anchor_pitch": 10},
     {"zoom_min": 1.5, "zoom_max": 1.2},
     {"speed_min": 5, "speed_max": 2},
+    {"anchor_time_percent": -1},
+    {"anchor_time_percent": 101},
+    {"anchor_dwell_seconds": 0.49},
+    {"anchor_dwell_seconds": 120.01},
 ])
 def test_camerawork_rejects_invalid_ranges_and_anchors(patch):
     with pytest.raises(ValidationError):

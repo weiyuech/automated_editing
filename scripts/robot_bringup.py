@@ -30,7 +30,7 @@ from automated_video_editing_backend.core.events import EventHub  # noqa: E402
 from automated_video_editing_backend.core.models import (  # noqa: E402
     CruisePoint,
     CruiseRequest,
-    GimbalScanConfig,
+    CruiseRun,
     RobotGoalCommand,
 )
 from automated_video_editing_backend.services.capture import CaptureService  # noqa: E402
@@ -38,6 +38,22 @@ from automated_video_editing_backend.services.cruise import CruiseService  # noq
 from automated_video_editing_backend.services.robot import RobotService  # noqa: E402
 
 HEARTBEAT_KEYS = ("system", "map", "naviagtion", "navigation", "task", "gimbal")
+
+
+def _print_cruise_summary(run: CruiseRun) -> None:
+    """Print only fields persisted by the current ``CruiseRun`` contract."""
+    print(f"\n--- run {run.status} ---")
+    for segment in run.segments:
+        print(f"  #{segment.goal_id:<3} {segment.status:<10} "
+              f"arrived={segment.arrived_at_seconds} dwell={segment.dwell_seconds} "
+              f"error={segment.error}")
+    print(f"\n  markers      : {[(m.label, round(m.timestamp, 1)) for m in run.markers]}")
+    print(f"  media_url    : {run.media_url}")
+    print(f"  local_path   : {run.media_local_path}")
+    for warning in run.warnings:
+        print(f"  warning      : {warning}")
+    if run.error:
+        print(f"  error        : {run.error}")
 
 
 def confirm(message: str, assume_yes: bool) -> bool:
@@ -102,10 +118,9 @@ async def stage_probe(args: argparse.Namespace) -> int:
 
     gimbal = sample.get("gimbal") or {}
     yaw = gimbal.get("yaw")
+    pitch = gimbal.get("pitch")
     print(f"  gimbal.yaw        : {yaw if yaw is not None else 'MISSING'}")
-    if yaw is None:
-        print("    -> the optional gimbal scan cannot confirm the camera returned to centre.")
-        print("       It will fall back to a time budget, or skip if the angle is unknown.")
+    print(f"  gimbal.pitch      : {pitch if pitch is not None else 'MISSING'}")
 
     print("\n  latest heartbeat:")
     print("   ", json.dumps(sample, ensure_ascii=False)[:600])
@@ -192,7 +207,13 @@ async def stage_cruise(args: argparse.Namespace) -> int:
         return 1
 
     robot, events = await connect(args.url)
-    if not (await robot.status()).connected:
+    robot_state = await robot.status()
+    if not robot_state.connected:
+        return 1
+    target_map = args.map or robot_state.map_name
+    if not target_map:
+        print("No target map is available. Pass --map or wait for a heartbeat with map_name.")
+        await robot.disconnect()
         return 1
 
     capture = CaptureService(events)
@@ -213,15 +234,11 @@ async def stage_cruise(args: argparse.Namespace) -> int:
 
     request = CruiseRequest(
         title="bring-up cruise",
-        map_name=args.map,
+        map_name=target_map,
         points=[CruisePoint(path_name=args.path, goal_id=goal) for goal in goals],
         record=not args.no_record,
-        dwell_min_seconds=args.dwell_min,
-        dwell_max_seconds=args.dwell_max,
-        gimbal_scan=GimbalScanConfig(enabled=args.scan),
     )
-    print(f"\nstarting cruise: {len(goals)} points, record={request.record}, "
-          f"dwell={args.dwell_min}-{args.dwell_max}s, scan={args.scan}")
+    print(f"\nstarting cruise: {len(goals)} points, record={request.record}")
     print("  (Ctrl-C cancels cleanly and stops the recording)\n")
 
     run = await cruise.start(request)
@@ -235,17 +252,7 @@ async def stage_cruise(args: argparse.Namespace) -> int:
     with suppress(asyncio.CancelledError):
         await watcher
 
-    print(f"\n--- run {run.status} ---")
-    for segment in run.segments:
-        print(f"  #{segment.goal_id:<3} {segment.status:<10} "
-              f"arrived={segment.arrived_at_seconds} dwell={segment.dwell_seconds} "
-              f"scanned={segment.scanned} error={segment.error}")
-    print(f"\n  markers      : {[(m.label, round(m.timestamp, 1)) for m in run.markers]}")
-    print(f"  usable spans : {[(s.goal_id, round(s.start, 1), round(s.end, 1)) for s in run.usable_spans]}")
-    print(f"  discard spans: {[(s.goal_id, round(s.start, 1), round(s.end, 1)) for s in run.discard_spans]}")
-    print(f"  media_url    : {run.media_url}")
-    if run.error:
-        print(f"  error        : {run.error}")
+    _print_cruise_summary(run)
 
     await robot.disconnect()
     return 0 if run.status == "succeeded" else 1
@@ -262,9 +269,6 @@ def main() -> int:
     parser.add_argument("--goal-object", default=None, help="omit for navigation-only (no gimbal align)")
     parser.add_argument("--seconds", type=int, default=6, help="probe: heartbeat listen window")
     parser.add_argument("--timeout", type=float, default=180.0)
-    parser.add_argument("--dwell-min", type=float, default=5.0)
-    parser.add_argument("--dwell-max", type=float, default=10.0)
-    parser.add_argument("--scan", action="store_true", help="enable the optional gimbal scan")
     parser.add_argument("--no-record", action="store_true")
     parser.add_argument("--yes", action="store_true", help="skip the movement confirmation")
     args = parser.parse_args()

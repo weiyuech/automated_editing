@@ -1,14 +1,14 @@
 import asyncio
-import collections
+import math
 import random
 from types import SimpleNamespace
 
 import pytest
 
+import automated_video_editing_backend.services.cruise as cruise_module
 from automated_video_editing_backend.core.events import EventHub
 from automated_video_editing_backend.core.models import (
     CameraworkConfig,
-    GimbalScanConfig,
     RobotState,
 )
 from automated_video_editing_backend.services.cruise import CruiseService, _clamp
@@ -16,8 +16,26 @@ from automated_video_editing_backend.services.robot import HardwareRobotAdapter
 
 
 def _service():
-    # Only pure target selection is exercised by most tests, so no robot is needed.
-    return CruiseService.__new__(CruiseService)
+    # Only pure scheduling/target selection is exercised by most tests, so no robot is needed.
+    service = CruiseService.__new__(CruiseService)
+    service._cancel = asyncio.Event()
+    service._cw_last_quadrant = None
+    service._cw_yaw = 0.0
+    service._cw_pitch = 0.0
+    service._cw_zoom = 1.0
+    service._cw_phase = None
+    service._cw_phase_deadline = 0.0
+    service._cw_pending_anchor_seconds = 0.0
+    service._cw_anchor_commanded = False
+    service._cw_anchor_zoomed = False
+    service._cw_base_stationary = True
+    service._cw_stationary_until = 0.0
+    service._cw_base_state_changed = asyncio.Event()
+    service._cw_stationary_zoom_lock = asyncio.Lock()
+    service._cw_runner_stop = asyncio.Event()
+    service._cw_runner_task = None
+    service._point_dwell_baseline_seconds = 7.5
+    return service
 
 
 def _config(**overrides):
@@ -34,166 +52,11 @@ def _config(**overrides):
         "zoom_max": 1.5,
         "speed_min": 2,
         "speed_max": 5,
+        "anchor_time_percent": 20,
+        "anchor_dwell_seconds": 5,
     }
     values.update(overrides)
     return CameraworkConfig(**values)
-
-
-def test_camerawork_modes_replace_the_old_hold_with_the_anchor_at_fifty_thirty_twenty():
-    random.seed(1)
-    counts = collections.Counter(_service()._pick_camerawork_mode() for _ in range(20000))
-
-    assert set(counts) == {"wander", "pingpong", "anchor"}
-    assert 47 <= counts["wander"] / 200 <= 53
-    assert 27 <= counts["pingpong"] / 200 <= 33
-    assert 17 <= counts["anchor"] / 200 <= 23
-
-
-@pytest.mark.asyncio
-async def test_anchor_mode_is_one_return_move_then_the_planner_can_choose_again(monkeypatch):
-    service = _service()
-    service._cancel = asyncio.Event()
-    config = _config(anchor_yaw=2, anchor_pitch=-1)
-    stop = asyncio.Event()
-    targets = []
-
-    monkeypatch.setattr(service, "_pick_camerawork_mode", lambda: "anchor")
-    monkeypatch.setattr(service, "_current_yaw", lambda _config: 12.0)
-    monkeypatch.setattr(service, "_current_pitch", lambda _config: 4.0)
-
-    async def record_one(target, _speed, _deadline, _config):
-        targets.append(target)
-        stop.set()
-
-    monkeypatch.setattr(service, "_camerawork_leg", record_one)
-    await service._run_camerawork(
-        deadline=10**12,
-        config=config,
-        stop_requested=stop,
-    )
-
-    assert targets == [(config.anchor_yaw, config.anchor_pitch)]
-
-
-def test_left_pose_means_large_right_or_small_left():
-    random.seed(12)
-    config = _config(yaw_min=-60, yaw_max=60)
-    current = 30.0  # positive yaw is physical left; both sides have more than 10° room
-    targets = [_service()._adaptive_yaw_target(current, config) for _ in range(2000)]
-    large_right = [target for target in targets if target < current]
-    small_left = [target for target in targets if target > current]
-
-    assert large_right and small_left
-    assert 78 <= len(large_right) / 20 <= 82
-    assert all(-51 <= target <= -24 for target in large_right)  # 60–90% of 90° room
-    assert all(33 <= target <= 39 for target in small_left)  # 10–30% of 30° room
-    assert all(config.yaw_min <= target <= config.yaw_max for target in targets)
-
-
-def test_right_pose_mirrors_to_large_left_or_small_right():
-    random.seed(21)
-    config = _config(yaw_min=-60, yaw_max=60)
-    current = -30.0
-    targets = [_service()._adaptive_yaw_target(current, config) for _ in range(2000)]
-    large_left = [target for target in targets if target > current]
-    small_right = [target for target in targets if target < current]
-
-    assert large_left and small_right
-    assert 78 <= len(large_left) / 20 <= 82
-    assert all(24 <= target <= 51 for target in large_left)
-    assert all(-39 <= target <= -33 for target in small_right)
-    assert all(config.yaw_min <= target <= config.yaw_max for target in targets)
-
-
-@pytest.mark.parametrize("side", [-1, 1])
-@pytest.mark.parametrize("outward_room", [9, 10, 11])
-def test_adaptive_turns_inward_at_ten_degrees_without_changing_probability_elsewhere(
-    monkeypatch, side, outward_room,
-):
-    # This draw normally selects the small outward move. At <=10° remaining it must
-    # instead turn inward, including on the exact 10° boundary, on either physical side.
-    monkeypatch.setattr(random, "random", lambda: 0.99)
-    config = _config(yaw_min=-60, yaw_max=60)
-    current = side * (60 - outward_room)
-    target = _service()._adaptive_yaw_target(current, config)
-
-    assert (side * (target - current) < 0) == (outward_room <= 10)
-    assert config.yaw_min <= target <= config.yaw_max
-
-
-@pytest.mark.parametrize("side", [-1, 1])
-@pytest.mark.parametrize("inward_room", [10, 11])
-def test_adaptive_requires_more_than_ten_degrees_for_opposite_branch(
-    monkeypatch, side, inward_room,
-):
-    monkeypatch.setattr(random, "random", lambda: 0.0)
-    low, high = (20, 60) if side > 0 else (-60, -20)
-    config = _config(yaw_min=low, yaw_max=high, anchor_yaw=side * 40)
-    current = side * (20 + inward_room)
-    target = _service()._adaptive_yaw_target(current, config)
-
-    assert (side * (target - current) < 0) == (inward_room > 10)
-    assert low <= target <= high
-
-
-@pytest.mark.parametrize(
-    ("low", "high", "draw", "expect_right"),
-    [(-10, 60, 0.0, False), (-11, 60, 0.0, True),
-     (-60, 10, 0.99, True), (-60, 11, 0.99, False)],
-)
-def test_center_direction_uses_the_same_ten_degree_room_check(
-    monkeypatch, low, high, draw, expect_right,
-):
-    monkeypatch.setattr(random, "random", lambda: draw)
-    target = _service()._adaptive_yaw_target(0, _config(yaw_min=low, yaw_max=high))
-
-    assert (target < 0) == expect_right
-    assert low <= target <= high
-
-
-@pytest.mark.parametrize(
-    ("current", "yaw_min", "yaw_max", "opposite"),
-    [
-        (5.0, -10, 50, lambda target: target < 0),
-        (-5.0, -50, 10, lambda target: target > 0),
-    ],
-)
-def test_asymmetric_range_uses_protocol_zero_for_left_right_bias(
-    current, yaw_min, yaw_max, opposite,
-):
-    random.seed(31)
-    service = _service()
-    config = _config(yaw_min=yaw_min, yaw_max=yaw_max, anchor_yaw=0)
-    targets = [service._adaptive_yaw_target(current, config) for _ in range(2000)]
-    opposite_targets = [target for target in targets if opposite(target)]
-
-    # +yaw is physically left and -yaw is physically right regardless of an asymmetric range.
-    # The broad move crosses the real zero about 80% of the time; the other move remains a
-    # smaller continuation on the current physical side. Every result remains operator-bounded.
-    assert 78 <= len(opposite_targets) / 20 <= 82
-    assert all(yaw_min <= target <= yaw_max for target in targets)
-
-
-def test_wander_poses_respect_every_operator_range():
-    random.seed(3)
-    service = _service()
-    config = _config(yaw_min=-7, yaw_max=18, anchor_yaw=2, pitch_min=-4, pitch_max=6)
-    current = 2.0
-    for _ in range(500):
-        yaw, pitch = service._camerawork_pose(current, config)
-        assert config.yaw_min <= yaw <= config.yaw_max
-        assert config.pitch_min <= pitch <= config.pitch_max
-        current = yaw
-
-
-def _assert_separated_pose(start, target, config):
-    yaw_mid = (config.yaw_min + config.yaw_max) / 2
-    pitch_mid = (config.pitch_min + config.pitch_max) / 2
-    assert (start[0] >= yaw_mid, start[1] >= pitch_mid) != (
-        target[0] >= yaw_mid, target[1] >= pitch_mid,
-    )
-    assert config.yaw_min <= target[0] <= config.yaw_max
-    assert config.pitch_min <= target[1] <= config.pitch_max
 
 
 @pytest.mark.parametrize(
@@ -201,112 +64,281 @@ def _assert_separated_pose(start, target, config):
     [(-60, 60, -15, 15), (-10, 50, -40, 10), (20, 60, -60, -20),
      (-5, 5, 3, 4), (0, 1, 0, 1)],
 )
-def test_random_targets_change_user_range_quadrant_and_stay_inside_bounds(
+def test_every_quadrant_is_nonempty_and_stays_inside_asymmetric_or_narrow_limits(
     yaw_min, yaw_max, pitch_min, pitch_max,
 ):
-    random.seed(93)
     service = _service()
     config = _config(
         yaw_min=yaw_min, yaw_max=yaw_max, anchor_yaw=yaw_min,
         pitch_min=pitch_min, pitch_max=pitch_max, anchor_pitch=pitch_min,
     )
-    for start in [
-        (yaw_min, pitch_min), (yaw_max, pitch_max),
-        ((yaw_min + yaw_max) / 2, (pitch_min + pitch_max) / 2),
-    ]:
-        for _ in range(100):
-            proposed = service._camerawork_pose(start[0], config)
-            target = service._separate_camerawork_target(proposed, *start, config)
-            assert target[0] == proposed[0], "separation must preserve the original yaw choice"
-            _assert_separated_pose(start, target, config)
-            start = target
+    seen = set()
+    for quadrant in range(1, 5):
+        (yaw_low, yaw_high), (pitch_low, pitch_high) = service._quadrant_bounds(
+            quadrant, config,
+        )
+        assert yaw_min <= yaw_low <= yaw_high <= yaw_max
+        assert pitch_min <= pitch_low <= pitch_high <= pitch_max
+        seen.update((yaw, pitch) for yaw in range(yaw_low, yaw_high + 1)
+                    for pitch in range(pitch_low, pitch_high + 1))
+
+    assert seen == {
+        (yaw, pitch)
+        for yaw in range(yaw_min, yaw_max + 1)
+        for pitch in range(pitch_min, pitch_max + 1)
+    }
 
 
-@pytest.mark.parametrize("proposed", [(1, 1), (1, -1), (-1, 0)])
-def test_crossing_either_center_line_is_enough_even_for_a_small_move(proposed):
-    config = _config(yaw_min=-60, yaw_max=60, pitch_min=-15, pitch_max=15)
-    target = _service()._separate_camerawork_target(proposed, -1, -1, config)
+def test_next_target_excludes_only_the_previous_quadrant(monkeypatch):
+    service = _service()
+    service._cw_last_quadrant = 1
 
-    assert target == proposed
-    _assert_separated_pose((-1, -1), target, config)
+    def choose(choices):
+        assert choices == [2, 3, 4]
+        return 4
+
+    monkeypatch.setattr(random, "choice", choose)
+    quadrant, target = service._next_quadrant_target(_config())
+
+    assert quadrant == 4
+    (yaw_low, yaw_high), (pitch_low, pitch_high) = service._quadrant_bounds(
+        quadrant, _config(),
+    )
+    assert yaw_low <= target[0] <= yaw_high
+    assert pitch_low <= target[1] <= pitch_high
 
 
-def test_small_outward_yaw_keeps_its_direction_and_changes_pitch_half():
-    config = _config(yaw_min=-60, yaw_max=60, pitch_min=-15, pitch_max=15)
-    target = _service()._separate_camerawork_target((36, 12), 30, 10, config)
+def test_one_four_one_four_sequence_is_valid_but_same_quadrant_twice_is_not(monkeypatch):
+    service = _service()
+    planned = iter((1, 4, 1, 4))
 
-    assert target[0] == 36
-    assert target[1] < 0
-    _assert_separated_pose((30, 10), target, config)
+    def choose(choices):
+        quadrant = next(planned)
+        assert quadrant in choices
+        if service._cw_last_quadrant is not None:
+            assert service._cw_last_quadrant not in choices
+        return quadrant
+
+    monkeypatch.setattr(random, "choice", choose)
+    actual = []
+    for _ in range(4):
+        quadrant, _target = service._next_quadrant_target(_config())
+        actual.append(quadrant)
+        service._cw_last_quadrant = quadrant
+
+    assert actual == [1, 4, 1, 4]
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("mode", ["wander", "pingpong", "anchor"])
-async def test_random_and_anchor_fallback_legs_apply_separation_before_sending(monkeypatch, mode):
+async def test_failed_gimbal_command_does_not_advance_quadrant_history():
+    class FailingRobot:
+        def heartbeat_yaw(self):
+            return 0.0
+
+        def heartbeat_pitch(self):
+            return 0.0
+
+        async def set_gimbal(self, *_args, **_kwargs):
+            raise ValueError("firmware refused command")
+
+    service = CruiseService(EventHub(), FailingRobot(), object())
+    service._cw_last_quadrant = 1
+
+    moved = await service._camerawork_leg(
+        (12, 5), 2, _config(), quadrant=4,
+    )
+
+    assert moved is False
+    assert service._cw_last_quadrant == 1
+    assert (service._cw_yaw, service._cw_pitch) == (0.0, 0.0)
+
+
+def test_twenty_percent_anchor_with_five_seconds_means_twenty_plus_five(monkeypatch):
+    monkeypatch.setattr(random, "uniform", lambda low, high: 1.0)
+
+    quadrant_seconds, anchor_seconds = _service()._camerawork_cycle_durations(
+        _config(anchor_time_percent=20, anchor_dwell_seconds=5),
+    )
+
+    assert quadrant_seconds == pytest.approx(20.0)
+    assert anchor_seconds == pytest.approx(5.0)
+    assert anchor_seconds / (quadrant_seconds + anchor_seconds) == pytest.approx(0.20)
+
+
+@pytest.mark.parametrize(("jitter", "expected"), [(0.70, 3.5), (1.30, 6.5)])
+def test_anchor_duration_has_hidden_thirty_percent_jitter(monkeypatch, jitter, expected):
+    monkeypatch.setattr(random, "uniform", lambda low, high: jitter)
+
+    quadrant_seconds, anchor_seconds = _service()._camerawork_cycle_durations(
+        _config(anchor_time_percent=20, anchor_dwell_seconds=5),
+    )
+
+    assert anchor_seconds == pytest.approx(expected)
+    assert quadrant_seconds == pytest.approx(expected * 4)
+
+
+@pytest.mark.parametrize(
+    ("percent", "expected_quadrants", "expected_anchor"),
+    [(0, math.inf, 0.0), (100, 0.0, 5.0)],
+)
+def test_zero_and_hundred_percent_have_unambiguous_schedule_edges(
+    monkeypatch, percent, expected_quadrants, expected_anchor,
+):
+    monkeypatch.setattr(random, "uniform", lambda low, high: 1.0)
+
+    quadrant_seconds, anchor_seconds = _service()._camerawork_cycle_durations(
+        _config(anchor_time_percent=percent, anchor_dwell_seconds=5),
+    )
+
+    assert quadrant_seconds == expected_quadrants
+    assert anchor_seconds == expected_anchor
+
+
+def test_schedule_always_starts_with_a_complete_roam_budget(monkeypatch):
     service = _service()
-    service._cancel = asyncio.Event()
-    config = _config(yaw_min=-60, yaw_max=60, pitch_min=-15, pitch_max=15)
-    stop = asyncio.Event()
-    # The second ping-pong leg must compare against fresh feedback, not its first target.
-    starts = [(0, 0), (1, 1)]
-    sent = []
-    monkeypatch.setattr(service, "_pick_camerawork_mode", lambda: mode)
-    monkeypatch.setattr(service, "_current_yaw", lambda _config: starts[len(sent)][0])
-    monkeypatch.setattr(service, "_current_pitch", lambda _config: starts[len(sent)][1])
-    monkeypatch.setattr(service, "_camerawork_pose", lambda *_args: (1, 1))
-    monkeypatch.setattr(service, "_pingpong_poses", lambda *_args: ((1, 1), (1, 1)))
+    clock = iter((100.0,))
+    monkeypatch.setattr(cruise_module.time, "monotonic", lambda: next(clock))
+    monkeypatch.setattr(random, "uniform", lambda low, high: 1.0)
 
-    async def record(target, _speed, _deadline, _config):
-        _assert_separated_pose(starts[len(sent)], target, config)
-        sent.append(target)
-        if len(sent) == (2 if mode == "pingpong" else 1):
-            stop.set()
+    service._initialize_camerawork_schedule(
+        _config(anchor_time_percent=20, anchor_dwell_seconds=5),
+    )
 
-    monkeypatch.setattr(service, "_camerawork_leg", record)
-    await service._run_camerawork(10**12, config, stop)
-    assert len(sent) == (2 if mode == "pingpong" else 1)
+    assert service._cw_phase == "quadrants"
+    assert service._cw_phase_deadline == pytest.approx(120.0)
+    assert service._cw_pending_anchor_seconds == pytest.approx(5.0)
+    assert service._cw_anchor_commanded is False
 
 
 @pytest.mark.asyncio
-async def test_explicit_anchor_bypasses_random_target_separation(monkeypatch):
+async def test_quadrant_runner_starts_next_leg_immediately_after_full_leg_wait(monkeypatch):
     service = _service()
-    service._cancel = asyncio.Event()
-    config = _config(yaw_min=-60, yaw_max=60, pitch_min=-15, pitch_max=15)
-    stop = asyncio.Event()
-    sent = []
-    monkeypatch.setattr(service, "_pick_camerawork_mode", lambda: "anchor")
-    monkeypatch.setattr(service, "_current_yaw", lambda _config: 5)
-    monkeypatch.setattr(service, "_current_pitch", lambda _config: 4)
+    config = _config(anchor_time_percent=0)
+    targets = iter(((1, (-10.0, -4.0)), (4, (10.0, 4.0))))
+    calls = []
 
-    async def record(target, _speed, _deadline, _config):
-        sent.append(target)
-        stop.set()
+    monkeypatch.setattr(service, "_next_quadrant_target", lambda _config: next(targets))
 
-    monkeypatch.setattr(service, "_camerawork_leg", record)
-    await service._run_camerawork(10**12, config, stop)
-    assert sent == [(0, 0)]
+    async def complete_leg(target, speed, _config, **kwargs):
+        calls.append((target, speed, kwargs["quadrant"]))
+        if len(calls) == 2:
+            service._cw_runner_stop.set()
+        return True
+
+    monkeypatch.setattr(service, "_camerawork_leg", complete_leg)
+
+    await service._run_camerawork(config, service._cw_runner_stop)
+
+    assert [call[0] for call in calls] == [(-10.0, -4.0), (10.0, 4.0)]
+    assert [call[2] for call in calls] == [1, 4]
 
 
-def test_pingpong_starts_on_the_side_opposite_the_current_pose():
-    random.seed(4)
+@pytest.mark.asyncio
+async def test_anchor_hold_timer_starts_only_after_anchor_arrival_wait(monkeypatch):
     service = _service()
-    config = _config()
+    config = _config(anchor_time_percent=100, anchor_dwell_seconds=5)
+    service._cw_phase = "anchor"
+    service._cw_phase_deadline = math.inf
+    service._cw_pending_anchor_seconds = 5.0
+    service._cw_base_stationary = False
+    now = [100.0]
+    waits = []
+    moves = []
 
-    first_from_left, second_from_left = service._pingpong_poses(12, config)
-    assert first_from_left[0] < 0 < second_from_left[0]
-    first_from_right, second_from_right = service._pingpong_poses(-12, config)
-    assert first_from_right[0] > 0 > second_from_right[0]
+    monkeypatch.setattr(cruise_module.time, "monotonic", lambda: now[0])
+
+    async def arrive_after_feedback_or_budget(*_args, **_kwargs):
+        moves.append("anchor")
+        now[0] = 103.0
+        return True
+
+    async def record_hold(seconds, _stop_requested):
+        waits.append(seconds)
+        service._cw_runner_stop.set()
+
+    monkeypatch.setattr(service, "_camerawork_leg", arrive_after_feedback_or_budget)
+    monkeypatch.setattr(service, "_wait_for_camerawork_boundary", record_hold)
+
+    await service._run_camerawork(config, service._cw_runner_stop)
+
+    assert service._cw_anchor_commanded is True
+    assert service._cw_phase_deadline == pytest.approx(108.0)
+    assert moves == ["anchor"]
+    assert waits == [pytest.approx(5.0)]
 
 
-def test_pingpong_uses_physical_sides_inside_asymmetric_ranges():
-    random.seed(8)
+@pytest.mark.asyncio
+async def test_hundred_percent_renews_holds_without_resending_anchor(monkeypatch):
     service = _service()
+    config = _config(anchor_time_percent=100, anchor_dwell_seconds=5)
+    service._cw_base_stationary = False
+    now = [100.0]
+    moves = []
+    waits = []
 
-    first, second = service._pingpong_poses(5, _config(yaw_min=-10, yaw_max=50))
-    assert -10 <= first[0] <= 0 < second[0] <= 50
+    monkeypatch.setattr(cruise_module.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(random, "uniform", lambda low, high: 1.0)
 
-    first, second = service._pingpong_poses(-5, _config(yaw_min=-50, yaw_max=10))
-    assert -50 <= second[0] < 0 <= first[0] <= 10
+    async def initial_anchor_only(target, _speed, _config, **_kwargs):
+        moves.append(target)
+        return True
+
+    async def finish_hold(seconds, _stop_requested):
+        waits.append(seconds)
+        now[0] += seconds
+        if len(waits) == 3:
+            service._cw_runner_stop.set()
+
+    monkeypatch.setattr(service, "_camerawork_leg", initial_anchor_only)
+    monkeypatch.setattr(service, "_wait_for_camerawork_boundary", finish_hold)
+
+    await service._run_camerawork(config, service._cw_runner_stop)
+
+    assert moves == [(0, 0)]
+    assert waits == [pytest.approx(5.0)] * 3
+    assert service._cw_anchor_commanded is True
+    assert service._cw_phase_deadline == pytest.approx(115.0)
+
+
+@pytest.mark.asyncio
+async def test_slow_roam_leg_finishes_then_anchor_gets_a_full_post_arrival_hold(monkeypatch):
+    service = _service()
+    config = _config(anchor_time_percent=20, anchor_dwell_seconds=5)
+    service._cw_base_stationary = False
+    now = [100.0]
+    moves = []
+    waits = []
+
+    monkeypatch.setattr(cruise_module.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(random, "uniform", lambda low, high: 1.0)
+    monkeypatch.setattr(
+        service,
+        "_next_quadrant_target",
+        lambda _config: (1, (-15.0, -8.0)),
+    )
+
+    async def finish_each_leg(target, _speed, _config, **_kwargs):
+        moves.append((service._cw_phase, target, _kwargs.get("quadrant")))
+        # The roam leg is allowed to finish past its 120s soft boundary. Returning home then
+        # consumes another three seconds before the five-second hold clock may begin.
+        now[0] = 125.0 if len(moves) == 1 else 128.0
+        return True
+
+    async def record_hold(seconds, _stop_requested):
+        waits.append(seconds)
+        service._cw_runner_stop.set()
+
+    monkeypatch.setattr(service, "_camerawork_leg", finish_each_leg)
+    monkeypatch.setattr(service, "_wait_for_camerawork_boundary", record_hold)
+
+    await service._run_camerawork(config, service._cw_runner_stop)
+
+    assert moves == [
+        ("quadrants", (-15.0, -8.0), 1),
+        ("anchor", (0, 0), None),
+    ]
+    assert service._cw_phase_deadline == pytest.approx(133.0)
+    assert waits == [pytest.approx(5.0)]
 
 
 class _ParkedRobot:
@@ -333,6 +365,45 @@ class _ParkedRobot:
 
 
 @pytest.mark.asyncio
+async def test_moving_quadrant_leg_keeps_zoom_fixed(monkeypatch):
+    robot = _ParkedRobot()
+    service = CruiseService(EventHub(), robot, object())
+    service._cw_zoom = 1.37
+    budgets = []
+
+    async def reached(_yaw, _pitch, budget, **_kwargs):
+        budgets.append(budget)
+        return True, True
+
+    monkeypatch.setattr(service, "_await_camerawork_pose", reached)
+    moved = await service._camerawork_leg(
+        (-12, -4), 2, _config(), quadrant=1, context="cruise_moving",
+    )
+
+    assert moved is True
+    assert robot.contexts == ["cruise_moving"]
+    assert robot.commands[0].zoom_start == pytest.approx(1.37)
+    assert robot.commands[0].zoom_end == pytest.approx(1.37)
+    assert service._cw_zoom == pytest.approx(1.37)
+    assert service._cw_last_quadrant == 1
+    assert budgets == [pytest.approx(10.6)]
+
+
+@pytest.mark.asyncio
+async def test_cancel_during_leg_does_not_begin_a_followup_phase(monkeypatch):
+    robot = _ParkedRobot()
+    service = CruiseService(EventHub(), robot, object())
+
+    async def canceled_while_waiting(*_args, **_kwargs):
+        service._cancel.set()
+        return False, False
+
+    monkeypatch.setattr(service, "_await_camerawork_pose", canceled_while_waiting)
+
+    assert await service._camerawork_leg((0, 0), 2, _config()) is False
+
+
+@pytest.mark.asyncio
 async def test_parked_phase_holds_yaw_pitch_while_zooming_then_returns_full_anchor(monkeypatch):
     robot = _ParkedRobot()
     service = CruiseService(EventHub(), robot, object())
@@ -340,12 +411,13 @@ async def test_parked_phase_holds_yaw_pitch_while_zooming_then_returns_full_anch
     service._cw_pitch = 4.0
     service._cw_zoom = 1.0
 
-    async def no_wait(_seconds):
-        return False
+    async def no_wait(*_args, **_kwargs):
+        return None
 
     async def reached(*_args, **_kwargs):
         return True, True
 
+    monkeypatch.setattr(service, "_wait_for_camerawork_boundary", no_wait)
     monkeypatch.setattr(service, "_sleep_or_cancel", no_wait)
     monkeypatch.setattr(service, "_await_camerawork_pose", reached)
     config = _config(anchor_yaw=0, anchor_pitch=0, anchor_zoom=1)
@@ -477,8 +549,9 @@ async def test_parked_zoom_is_skipped_when_physical_anchor_cannot_be_confirmed(m
     robot = _ParkedRobot()
     service = CruiseService(EventHub(), robot, object())
 
-    async def missed(_config, *, wait=True):
+    async def missed(_config, *, wait=True, deadline=math.inf):
         assert wait is True
+        assert deadline == math.inf
         return False
 
     monkeypatch.setattr(service, "_return_to_anchor", missed)
@@ -488,31 +561,220 @@ async def test_parked_zoom_is_skipped_when_physical_anchor_cannot_be_confirmed(m
 
 
 @pytest.mark.asyncio
-async def test_auto_dwell_always_leaves_a_visible_anchor_shot(monkeypatch):
-    service = _service()
-    service._cancel = asyncio.Event()
-    waits = []
+async def test_short_parked_window_holds_anchor_without_starting_an_incomplete_zoom(
+    monkeypatch,
+):
+    robot = _ParkedRobot()
+    service = CruiseService(EventHub(), robot, object())
+    anchor_calls = []
 
-    async def parked(_config):
+    async def anchored(_config, *, wait=True, deadline=math.inf):
+        anchor_calls.append((wait, deadline))
         return True
+
+    monkeypatch.setattr(service, "_return_to_anchor", anchored)
+    deadline = asyncio.get_running_loop().time() + 0.05
+
+    assert await service._parked_zoom_and_anchor(_config(), deadline=deadline) is True
+    assert anchor_calls == [(True, deadline)]
+    assert robot.commands == []
+
+
+@pytest.mark.asyncio
+async def test_transit_waits_until_the_stationary_zoom_cycle_releases_ownership(monkeypatch):
+    service = _service()
+    service._cw_base_stationary = True
+    zoom_started = asyncio.Event()
+    release_zoom = asyncio.Event()
+
+    async def controlled_zoom(_config, *, deadline):
+        assert deadline > asyncio.get_running_loop().time()
+        assert service._cw_base_stationary is True
+        zoom_started.set()
+        await release_zoom.wait()
+        assert service._cw_base_stationary is True
+        return True
+
+    monkeypatch.setattr(service, "_parked_zoom_and_anchor_locked", controlled_zoom)
+    zoom = asyncio.create_task(service._parked_zoom_and_anchor(
+        _config(),
+        deadline=asyncio.get_running_loop().time() + 1,
+    ))
+    await zoom_started.wait()
+    transit = asyncio.create_task(service._begin_camerawork_transit())
+    await asyncio.sleep(0)
+
+    assert transit.done() is False
+    assert service._cw_base_stationary is True
+
+    release_zoom.set()
+    assert await zoom is True
+    assert await transit is True
+    assert service._cw_base_stationary is False
+
+
+@pytest.mark.asyncio
+async def test_cancel_while_waiting_for_zoom_gate_skips_goal_and_dispatch_event(monkeypatch):
+    service = _service()
+    service._origin_monotonic = asyncio.get_running_loop().time()
+    goal_calls = []
+    published = []
+
+    async def set_goal(command):
+        goal_calls.append(command)
+        return {"goal_check": True}
+
+    async def publish(event, _run, _segment):
+        published.append(event)
+
+    service.robot = SimpleNamespace(set_goal=set_goal)
+    monkeypatch.setattr(service, "_publish_segment", publish)
+    await service._cw_stationary_zoom_lock.acquire()
+    segment = SimpleNamespace(status="pending", departed_at_seconds=None)
+    task = asyncio.create_task(service._run_segment(
+        SimpleNamespace(),
+        SimpleNamespace(),
+        segment,
+        _config(),
+    ))
+    await asyncio.sleep(0)
+
+    service._cancel.set()
+    service._cw_stationary_zoom_lock.release()
+    await task
+
+    assert segment.status == "skipped"
+    assert service._cw_base_stationary is True
+    assert goal_calls == []
+    assert published == []
+
+
+@pytest.mark.asyncio
+async def test_zoom_cycle_rechecks_stationary_state_inside_the_transit_gate(monkeypatch):
+    service = _service()
+    service._cw_base_stationary = False
+    entered = False
+
+    async def should_not_run(*_args, **_kwargs):
+        nonlocal entered
+        entered = True
+        return True
+
+    monkeypatch.setattr(service, "_parked_zoom_and_anchor_locked", should_not_run)
+
+    assert await service._parked_zoom_and_anchor(_config()) is False
+    assert entered is False
+
+
+@pytest.mark.asyncio
+async def test_anchor_feedback_wait_cannot_overrun_its_phase_deadline():
+    robot = _ParkedRobot()
+    robot.state.yaw = 15
+    robot.state.pitch = 10
+    service = CruiseService(EventHub(), robot, object())
+    started = asyncio.get_running_loop().time()
+    deadline = started + 0.05
+
+    assert await service._return_to_anchor(_config(), deadline=deadline) is False
+
+    elapsed = asyncio.get_running_loop().time() - started
+    assert elapsed < 0.15
+    assert len(robot.commands) == 1
+
+
+@pytest.mark.asyncio
+async def test_arrival_state_change_does_not_cancel_or_retarget_the_active_sweep(monkeypatch):
+    service = _service()
+    config = _config(anchor_time_percent=0)
+    service._initialize_camerawork_schedule(config)
+    service._set_camerawork_stationary(False)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    commands = []
+
+    async def slow_leg(target, speed, _config, **kwargs):
+        commands.append((target, speed, kwargs["context"]))
+        entered.set()
+        await release.wait()
+        return True
+
+    monkeypatch.setattr(service, "_camerawork_leg", slow_leg)
+    runner = asyncio.create_task(service._run_camerawork(config, service._cw_runner_stop))
+    await entered.wait()
+
+    service._set_camerawork_stationary(True, until=asyncio.get_running_loop().time() + 1)
+    await asyncio.sleep(0)
+    assert len(commands) == 1
+
+    service._cw_runner_stop.set()
+    release.set()
+    await runner
+    assert len(commands) == 1
+
+
+@pytest.mark.asyncio
+async def test_failed_anchor_command_retries_before_marking_the_window_handled(monkeypatch):
+    service = _service()
+    config = _config(anchor_time_percent=100)
+    service._cw_phase = "anchor"
+    service._cw_phase_deadline = asyncio.get_running_loop().time() + 1
+    service._cw_base_stationary = False
+    attempts = 0
+
+    async def flaky_anchor(*_args, **_kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 2:
+            service._cw_runner_stop.set()
+            return True
+        return False
+
+    async def no_retry_delay(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(service, "_camerawork_leg", flaky_anchor)
+    monkeypatch.setattr(service, "_wait_for_camerawork_boundary", no_retry_delay)
+
+    await service._run_camerawork(config, service._cw_runner_stop)
+
+    assert attempts == 2
+    assert service._cw_anchor_commanded is True
+
+
+@pytest.mark.asyncio
+async def test_recording_point_dwell_is_internal_and_updates_the_route_wide_runner(
+    monkeypatch,
+):
+    service = _service()
+    service._point_dwell_baseline_seconds = 0.01
+    waits = []
 
     async def record_wait(seconds):
         waits.append(seconds)
-        return False
 
-    monkeypatch.setattr(service, "_parked_zoom_and_anchor", parked)
     monkeypatch.setattr(service, "_sleep_or_cancel", record_wait)
-    request = SimpleNamespace(
-        dwell_min_seconds=0.0,
-        dwell_max_seconds=0.0,
-        gimbal_scan=GimbalScanConfig(),
-    )
-    segment = SimpleNamespace(scanned=False)
+    monkeypatch.setattr(random, "uniform", lambda low, high: high)
 
-    await service._dwell(request, segment, _config())
+    await service._dwell(record=True, camerawork=_config())
 
-    assert segment.scanned is True
-    assert waits == [pytest.approx(1.0)]
+    assert service._cw_base_stationary is True
+    assert service._cw_stationary_until > 0
+    assert waits == [pytest.approx(0.013, abs=0.001)]
+
+
+@pytest.mark.asyncio
+async def test_non_recording_trial_has_no_internal_point_dwell(monkeypatch):
+    service = _service()
+    waits = []
+
+    async def record_wait(seconds):
+        waits.append(seconds)
+
+    monkeypatch.setattr(service, "_sleep_or_cancel", record_wait)
+
+    await service._dwell(record=False, camerawork=None)
+
+    assert waits == []
 
 
 def test_clamp_keeps_a_start_pose_within_the_configured_range():

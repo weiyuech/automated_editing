@@ -4,6 +4,13 @@ import { randomBytes } from 'node:crypto'
 import { createServer } from 'node:net'
 import { existsSync, mkdirSync, appendFileSync, copyFileSync, readFileSync, writeFileSync } from 'node:fs'
 import { delimiter, dirname, extname, isAbsolute, join, relative, resolve, sep } from 'node:path'
+import {
+  beginBackendShutdown,
+  createAppQuitCoordinator,
+  finishBackendShutdown,
+  runBestEffort,
+  settleBackendChild
+} from './backend-shutdown-policy.js'
 import { ensureDeletableManagedPath, ensureInspectableMediaPath } from './path-policy.js'
 import {
   MEDIA_IMPORT_DIALOG_BUTTONS,
@@ -17,7 +24,10 @@ const BACKEND_HOST = '127.0.0.1'
 const BRIDGE_TOKEN = randomBytes(32).toString('hex')
 let backendPort = DEFAULT_BACKEND_PORT
 let backendProcess = null
+let backendShutdown = null
+let backendStartupError = null
 let mainWindow = null
+let appQuitCoordinator = null
 
 function appRoot() {
   // Installed applications cannot write beside app.asar under Program Files. Keep every local
@@ -250,6 +260,7 @@ async function waitForBackend(timeoutMs = 60000) {
   const deadline = Date.now() + timeoutMs
   let lastError = null
   while (Date.now() < deadline) {
+    if (backendStartupError) throw backendStartupError
     if (!backendProcess) throw new Error('The bundled backend exited during startup')
     try {
       const response = await fetch(`http://${BACKEND_HOST}:${backendPort}/api/health`, {
@@ -270,6 +281,7 @@ async function startBackend() {
   migrateLegacySettings()
   ensureRuntimeDirs()
   if (backendProcess) return
+  backendStartupError = null
   const externalMediaTools = await resolveExternalMediaTools()
   backendPort = await findBackendPort()
   const root = appRoot()
@@ -281,6 +293,7 @@ async function startBackend() {
     APP_BACKEND_HOST: BACKEND_HOST,
     APP_BACKEND_PORT: String(backendPort),
     APP_BRIDGE_TOKEN: BRIDGE_TOKEN,
+    APP_MANAGED_BY_ELECTRON: '1',
     NUMBA_CACHE_DIR: join(root, '.cache', 'numba'),
     ...externalMediaTools,
     ...(app.isPackaged
@@ -288,18 +301,32 @@ async function startBackend() {
       : { PYTHONPATH: join(SOURCE_ROOT, 'backend', 'src') + (process.env.PYTHONPATH ? `:${process.env.PYTHONPATH}` : '') })
   }
   const backendArgs = app.isPackaged ? [] : ['-m', 'automated_video_editing_backend.main']
-  backendProcess = spawn(python, backendArgs, {
+  const child = spawn(python, backendArgs, {
     cwd: root,
     env,
-    stdio: ['ignore', 'pipe', 'pipe'],
+    stdio: ['pipe', 'pipe', 'pipe'],
     windowsHide: true
   })
+  backendProcess = child
   const log = (line) => appendFileSync(logPath, line)
-  backendProcess.stdout.on('data', (chunk) => log(`[out] ${chunk}`))
-  backendProcess.stderr.on('data', (chunk) => log(`[err] ${chunk}`))
-  backendProcess.on('exit', (code) => {
-    log(`[exit] backend exited with code ${code}\n`)
-    backendProcess = null
+  child.stdout.on('data', (chunk) => runBestEffort(() => log(`[out] ${chunk}`)))
+  child.stderr.on('data', (chunk) => runBestEffort(() => log(`[err] ${chunk}`)))
+  const settleChild = () => {
+    const settled = settleBackendChild(child, backendProcess, backendShutdown)
+    backendProcess = settled.activeChild
+    backendShutdown = settled.pending
+    if (settled.owned) appQuitCoordinator?.backendFinished()
+  }
+  child.on('error', (error) => {
+    // A missing/quarantined executable emits ChildProcess 'error' rather than throwing from
+    // spawn(). Release ownership first so the existing readiness failure can quit cleanly.
+    settleChild()
+    backendStartupError = error instanceof Error ? error : new Error(String(error))
+    runBestEffort(() => log(`[error] ${backendStartupError.message}\n`))
+  })
+  child.on('exit', (code) => {
+    settleChild()
+    runBestEffort(() => log(`[exit] backend exited with code ${code}\n`))
   })
   // A frozen Python process imports the media-analysis stack before Uvicorn can listen. Do not
   // show a renderer that immediately fires API requests into a port that is not ready yet.
@@ -416,29 +443,30 @@ ipcMain.handle('trash-managed-path', async (_event, targetPath) => {
   return { trashed: true, companionFailures }
 })
 
-/** Stop the backend for good, not just politely.
+/** Ask the backend to stop safely, then enforce the bounded deadline.
  *
- * A plain kill() is SIGTERM, which uvicorn can sit on; the process then outlived the app and
- * kept holding the port, so the next launch quietly started a second backend one port along
- * and the old one stayed forever. */
+ * Windows treats child.kill('SIGTERM') as immediate termination, so the graceful path is a
+ * private one-line stdin command. SIGKILL is reserved for the force timer after the complete
+ * camera-safe backend budget. */
 function stopBackend() {
-  const child = backendProcess
+  const child = backendProcess || backendShutdown?.child
   if (!child) return
-  backendProcess = null
-  try {
-    child.kill('SIGTERM')
-  } catch {
-    return
-  }
-  const forceTimer = setTimeout(() => {
-    try {
-      child.kill('SIGKILL')
-    } catch {
-      // Already gone.
+  backendShutdown = beginBackendShutdown(child, backendShutdown, {
+    onStdinError: (error) => {
+      runBestEffort(() => appendFileSync(
+        join(appRoot(), 'logs', 'backend.log'),
+        `[shutdown-stdin-error] ${error?.message || String(error)}\n`
+      ))
+    },
+    onForceComplete: (forcedChild) => {
+      if (backendProcess === forcedChild) backendProcess = null
+      backendShutdown = finishBackendShutdown(backendShutdown, forcedChild)
+      appQuitCoordinator?.backendFinished()
     }
-  }, 2000)
-  // Do not hold the event loop open waiting to escalate.
-  forceTimer.unref?.()
+  })
+  // Normal quit hooks and process signals converge here. Removing the active handle only after
+  // the single shutdown request exists keeps repeated calls idempotent.
+  if (backendShutdown?.child === child) backendProcess = null
 }
 
 // Exactly one copy of the app at a time. Without this, launching again while one was already
@@ -447,6 +475,12 @@ const hasSingleInstanceLock = app.requestSingleInstanceLock()
 if (!hasSingleInstanceLock) {
   app.quit()
 } else {
+  appQuitCoordinator = createAppQuitCoordinator({
+    hasBackend: () => Boolean(backendProcess || backendShutdown),
+    stopBackend,
+    quit: () => app.quit()
+  })
+
   app.on('second-instance', () => {
     if (!mainWindow) return
     if (mainWindow.isMinimized()) mainWindow.restore()
@@ -469,13 +503,11 @@ if (!hasSingleInstanceLock) {
     app.quit()
   })
 
-  app.on('will-quit', stopBackend)
-  app.on('before-quit', stopBackend)
-  // before-quit never fires when the process is signalled, which is exactly how a dev run ends.
+  app.on('before-quit', (event) => appQuitCoordinator.beforeQuit(event))
+  // Translate process signals into the same coordinated app.quit path used by the window UI.
   for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
     process.on(signal, () => {
-      stopBackend()
-      app.quit()
+      appQuitCoordinator.requestQuit()
     })
   }
   process.on('exit', stopBackend)

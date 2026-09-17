@@ -36,7 +36,7 @@ from automated_video_editing_backend.core.security import require_http_token, to
 from automated_video_editing_backend.services import subtitles as subtitle_layer
 from automated_video_editing_backend.services.admin_access import AdminAccessService
 from automated_video_editing_backend.services.capture import CaptureService
-from automated_video_editing_backend.services.cruise import CruiseService
+from automated_video_editing_backend.services.cruise import CruisePreflightError, CruiseService
 from automated_video_editing_backend.services.cruise_routes import CruiseRouteStore
 from automated_video_editing_backend.services.framing_test import FramingTestService
 from automated_video_editing_backend.services.jobs import JobService
@@ -513,6 +513,11 @@ def build_router(
         require_camera_not_reserved()
         try:
             return await cruise.start(request)
+        except CruisePreflightError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail=exc.validation.model_dump(mode="json"),
+            ) from exc
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         except (ConnectionError, TimeoutError) as exc:
@@ -550,17 +555,18 @@ def build_router(
         if route is None:
             raise HTTPException(status_code=404, detail="Route not found")
 
-        # Verify what can be verified before anything moves; goal ids are checked at
-        # dispatch, where a rejected one costs no movement.
-        validation = await cruise.validate_route(route)
-        if not validation.ok:
-            raise HTTPException(status_code=409, detail=validation.model_dump(mode="json"))
-
         try:
-            run = await cruise.start(route.request)
+            # start_route performs the one authoritative fail-closed preflight.  Do not issue a
+            # separate validation pass here: the robot may change between two network snapshots.
+            run, validation = await cruise.start_route(route)
+        except CruisePreflightError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail=exc.validation.model_dump(mode="json"),
+            ) from exc
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
-        except ConnectionError as exc:
+        except (ConnectionError, TimeoutError) as exc:
             raise HTTPException(status_code=503, detail=str(exc)) from exc
 
         cruise_routes.touch(route_id)

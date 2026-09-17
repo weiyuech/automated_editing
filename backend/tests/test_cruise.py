@@ -12,17 +12,19 @@ from automated_video_editing_backend.core.models import (
     CameraworkConfig,
     CruisePoint,
     CruiseRequest,
-    GimbalScanConfig,
     MediaItem,
     RobotGoalCommand,
+    RobotHeartbeatDiagnostic,
     RobotState,
 )
+from automated_video_editing_backend.services import cruise as cruise_module
+from automated_video_editing_backend.services import robot as robot_module
 from automated_video_editing_backend.services.capture import (
     CaptureService,
     gimbal_sidecar_path,
     sidecar_path,
 )
-from automated_video_editing_backend.services.cruise import CruiseService
+from automated_video_editing_backend.services.cruise import CruisePreflightError, CruiseService
 from automated_video_editing_backend.services.robot import HardwareRobotAdapter, RobotService
 
 
@@ -156,10 +158,19 @@ class FakeAdapter:
     """Duck-typed robot that reports arrival for every goal except those in fail_ids."""
 
     def __init__(self, fail_ids=()):
-        self.state = RobotState(connected=True, yaw=0.0, pitch=0.0)
+        self.state = RobotState(
+            connected=True,
+            yaw=0.0,
+            pitch=0.0,
+            map_name="old-map",
+            map_mode="localization",
+            map_status="ready",
+            system_status="ready",
+            navigation_status="ready",
+        )
         self.fail_ids = set(fail_ids)
+        self.map_switches = []
         self.goals = []
-        self.sweeps = []
         self.gimbal_commands = []
         self.recording_calls = []
         self.arrival_timeouts = []
@@ -168,8 +179,35 @@ class FakeAdapter:
     async def status(self):
         return self.state
 
+    async def map_list(self):
+        return ["map1"]
+
+    async def path_list(self, map_name):
+        return ["path1"] if map_name == "map1" else []
+
     async def switch_map(self, map_name):
-        self.state.map_name = map_name
+        self.map_switches.append(map_name)
+
+        async def report_switched_map():
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+            payload = json.loads(heartbeat("done"))
+            payload["map"]["name"] = map_name
+            self.state.map_name = map_name
+            self.state.map_mode = "localization"
+            self.state.map_status = "ready"
+            self.state.system_status = "ready"
+            self.state.navigation_status = "ready"
+            previous = self.state.diagnostics.last_heartbeat
+            self.state.diagnostics.last_heartbeat = RobotHeartbeatDiagnostic(
+                sequence=(previous.sequence if previous else 0) + 1,
+                payload={
+                    key: payload[key]
+                    for key in ("system", "map", "naviagtion", "task")
+                },
+            )
+
+        asyncio.create_task(report_switched_map())
         return {"map_name": map_name, "ok": True}
 
     async def set_goal(self, command):
@@ -181,11 +219,6 @@ class FakeAdapter:
         self.arrival_timeouts.append(timeout_s)
         await asyncio.sleep(0)
         return "failed" if self._pending.goal_id in self.fail_ids else "done"
-
-    async def sweep_camera(self, target_yaw, yaw_speed, *, context="camera_sweep"):
-        self.sweeps.append((target_yaw, yaw_speed))
-        self.state.yaw = target_yaw
-        return self.state
 
     async def set_camera_angle(self, angle):
         self.state.yaw = angle.angle
@@ -237,14 +270,19 @@ def build_cruise(fail_ids=(), camerawork_provider=None):
     robot = RobotService(events, adapter=adapter, media=FakeMedia())
     robot.resolve_media_url = lambda url: url
     capture = CaptureService(events, path=Path(tempfile.mkdtemp()) / "sessions.json")
-    return CruiseService(events, robot, capture, camerawork_provider), adapter, capture
+    service = CruiseService(events, robot, capture, camerawork_provider)
+    # Integration tests exercise route behavior, not the private production capture window.
+    service._point_dwell_baseline_seconds = 0.0
+    return service, adapter, capture
 
 
 def cruise_request(**overrides):
     request = {
-        "points": [CruisePoint(path_name="path1", goal_id=1), CruisePoint(path_name="path1", goal_id=2)],
-        "dwell_min_seconds": 0.0,
-        "dwell_max_seconds": 0.0,
+        "map_name": "map1",
+        "points": [
+            CruisePoint(path_name="path1", goal_id=1),
+            CruisePoint(path_name="path1", goal_id=2),
+        ],
     }
     request.update(overrides)
     return CruiseRequest(**request)
@@ -252,6 +290,177 @@ def cruise_request(**overrides):
 
 def test_cruise_arrival_timeout_defaults_to_sixty_seconds():
     assert cruise_request().arrival_timeout_seconds == 60.0
+
+
+def test_cruise_request_does_not_expose_point_dwell_controls():
+    request = CruiseRequest(
+        map_name="map1",
+        points=[CruisePoint(path_name="path1", goal_id=1)],
+    )
+
+    assert set(request.model_dump()).isdisjoint({
+        "dwell_seconds",
+        "dwell_min_seconds",
+        "dwell_max_seconds",
+        "gimbal_scan",
+    })
+
+
+def test_all_legacy_dwell_shapes_and_scan_are_ignored():
+    request = CruiseRequest.model_validate({
+        "map_name": "map1",
+        "points": [{"path_name": "path1", "goal_id": 1}],
+        "dwell_seconds": "not-a-number",
+        "dwell_min_seconds": -100,
+        "dwell_max_seconds": {"invalid": True},
+        # Deliberately malformed internals: retired data is accepted but never interpreted.
+        "gimbal_scan": {"enabled": True, "yaw_offset_deg": "not-a-number"},
+    })
+
+    assert not hasattr(request, "dwell_seconds")
+    assert not hasattr(request, "gimbal_scan")
+    assert set(request.model_dump()).isdisjoint({
+        "dwell_seconds", "dwell_min_seconds", "dwell_max_seconds", "gimbal_scan",
+    })
+
+
+def test_each_dwell_sample_uses_uniform_seventy_to_one_thirty_percent_bounds(monkeypatch):
+    calls = []
+
+    def choose_bound(low, high):
+        calls.append((low, high))
+        return low if len(calls) == 1 else high
+
+    monkeypatch.setattr(cruise_module.random, "uniform", choose_bound)
+
+    assert cruise_module._randomized_point_dwell_seconds(10.0) == pytest.approx(7.0)
+    assert cruise_module._randomized_point_dwell_seconds(10.0) == pytest.approx(13.0)
+    assert calls == [(7.0, 13.0), (7.0, 13.0)]
+
+
+@pytest.mark.asyncio
+async def test_start_requires_its_own_map_even_when_robot_has_a_current_map():
+    cruise, adapter, capture = build_cruise()
+
+    with pytest.raises(CruisePreflightError) as caught:
+        await cruise.start(cruise_request(map_name=None))
+
+    assert caught.value.validation.ok is False
+    assert caught.value.validation.issues[0].field == "map_name"
+    assert adapter.map_switches == []
+    assert adapter.goals == []
+    assert adapter.recording_calls == []
+    assert capture.active_session() is None
+
+
+@pytest.mark.asyncio
+async def test_unverified_map_or_paths_block_start_instead_of_degrading_to_warning():
+    cruise, adapter, capture = build_cruise()
+
+    async def unreachable():
+        raise ConnectionError("robot offline")
+
+    adapter.map_list = unreachable
+    with pytest.raises(CruisePreflightError) as caught:
+        await cruise.start(cruise_request())
+
+    assert caught.value.validation.checked is False
+    assert caught.value.validation.ok is False
+    assert caught.value.validation.issues[0].level == "error"
+    assert adapter.map_switches == []
+    assert adapter.recording_calls == []
+    assert capture.active_session() is None
+
+
+@pytest.mark.asyncio
+async def test_target_map_can_recover_from_an_unfit_old_map_before_drive_check():
+    cruise, adapter, _capture = build_cruise()
+    adapter.state.map_name = "broken-old-map"
+    adapter.state.map_mode = "mapping"
+    adapter.state.map_status = "failed"
+
+    run = await cruise.start(cruise_request())
+    await cruise._task
+
+    assert adapter.map_switches == ["map1"]
+    assert run.status == "succeeded", run.error
+
+
+@pytest.mark.asyncio
+async def test_rejected_map_switch_aborts_before_capture_recording_or_navigation():
+    cruise, adapter, capture = build_cruise()
+
+    async def reject(map_name):
+        adapter.map_switches.append(map_name)
+        return {"map_name": map_name, "ok": False, "raw": "false"}
+
+    adapter.switch_map = reject
+    with pytest.raises(ValueError, match="拒绝切换"):
+        await cruise.start(cruise_request())
+
+    assert adapter.state.map_name == "old-map"
+    assert adapter.goals == []
+    assert adapter.recording_calls == []
+    assert capture.active_session() is None
+
+
+@pytest.mark.asyncio
+async def test_cancel_during_map_preflight_prevents_a_late_cruise_launch(monkeypatch):
+    cruise, adapter, capture = build_cruise()
+    switch_started = asyncio.Event()
+    release_switch = asyncio.Event()
+
+    async def delayed_confirmation(_map_name):
+        switch_started.set()
+        await release_switch.wait()
+        return adapter.state
+
+    monkeypatch.setattr(cruise.robot, "switch_map_and_confirm", delayed_confirmation)
+    starting = asyncio.create_task(cruise.start(cruise_request()))
+    await switch_started.wait()
+    canceling = asyncio.create_task(cruise.cancel())
+    await asyncio.sleep(0)
+    release_switch.set()
+
+    with pytest.raises(ValueError, match="canceled"):
+        await starting
+    await canceling
+
+    assert cruise.is_running is False
+    assert adapter.goals == []
+    assert adapter.recording_calls == []
+    assert capture.active_session() is None
+
+
+@pytest.mark.asyncio
+async def test_concurrent_starts_cannot_interleave_preflight_or_map_ownership(monkeypatch):
+    cruise, adapter, _capture = build_cruise()
+    switch_started = asyncio.Event()
+    release_switch = asyncio.Event()
+    release_execution = asyncio.Event()
+
+    async def delayed_confirmation(_map_name):
+        switch_started.set()
+        await release_switch.wait()
+        return adapter.state
+
+    async def held_execution(_request, _run, _camerawork):
+        await release_execution.wait()
+
+    monkeypatch.setattr(cruise.robot, "switch_map_and_confirm", delayed_confirmation)
+    monkeypatch.setattr(cruise, "_execute", held_execution)
+
+    first = asyncio.create_task(cruise.start(cruise_request()))
+    await switch_started.wait()
+    second = asyncio.create_task(cruise.start(cruise_request()))
+    release_switch.set()
+
+    await first
+    with pytest.raises(ValueError, match="already running"):
+        await second
+
+    release_execution.set()
+    await cruise._task
 
 
 @pytest.mark.asyncio
@@ -278,13 +487,129 @@ async def test_auto_camerawork_requires_an_explicitly_saved_camera_profile():
 
 
 @pytest.mark.asyncio
+async def test_route_wide_camerawork_runs_while_goal_acknowledgement_is_pending(monkeypatch):
+    config = CameraworkConfig(configured=True)
+    cruise, adapter, _ = build_cruise(camerawork_provider=lambda: config)
+    goal_entered = asyncio.Event()
+    release_goal = asyncio.Event()
+    runner_started = asyncio.Event()
+
+    async def delayed_goal(command):
+        goal_entered.set()
+        await release_goal.wait()
+        adapter.goals.append(command)
+        adapter._pending = command
+        return {"goal_check": "true", "goal_id": command.goal_id}
+
+    async def route_wide_runner(_config, stop_requested):
+        runner_started.set()
+        await stop_requested.wait()
+
+    monkeypatch.setattr(adapter, "set_goal", delayed_goal)
+    monkeypatch.setattr(cruise, "_run_camerawork", route_wide_runner)
+
+    run = await cruise.start(cruise_request(
+        auto_camerawork=True,
+        points=[CruisePoint(path_name="path1", goal_id=1)],
+    ))
+    await goal_entered.wait()
+
+    assert runner_started.is_set() is True
+    assert cruise._cw_runner_task is not None
+
+    release_goal.set()
+    await cruise._task
+    assert run.status == "succeeded", run.error
+
+
+@pytest.mark.asyncio
+async def test_zero_percent_final_resting_anchor_is_sent_only_after_recording_stops(
+    monkeypatch,
+):
+    config = CameraworkConfig(configured=True, anchor_time_percent=0)
+    cruise, adapter, _ = build_cruise(camerawork_provider=lambda: config)
+    order = []
+    original_stop = adapter.stop_recording
+
+    async def record_anchor(_config, *, wait=True, deadline=float("inf")):
+        order.append(("anchor", adapter.state.recording, wait, deadline))
+        return True
+
+    async def record_stop():
+        order.append(("stop.begin", adapter.state.recording))
+        state = await original_stop()
+        order.append(("stop.done", adapter.state.recording))
+        return state
+
+    async def idle_runner(_config, stop_requested):
+        await stop_requested.wait()
+
+    monkeypatch.setattr(cruise, "_return_to_anchor", record_anchor)
+    monkeypatch.setattr(cruise, "_run_camerawork", idle_runner)
+    monkeypatch.setattr(adapter, "stop_recording", record_stop)
+
+    run = await cruise.start(cruise_request(
+        auto_camerawork=True,
+        points=[CruisePoint(path_name="path1", goal_id=1)],
+    ))
+    await cruise._task
+
+    assert run.status == "succeeded", run.error
+    assert [entry[0] for entry in order] == [
+        "anchor",
+        "stop.begin",
+        "stop.done",
+        "anchor",
+    ]
+    assert order[0][1] is False  # preparation, before recording starts
+    assert order[-1][1] is False  # resting pose, after Stop is confirmed
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_recording_state_never_triggers_an_unrecorded_final_anchor(
+    monkeypatch,
+):
+    config = CameraworkConfig(configured=True, anchor_time_percent=0)
+    cruise, adapter, _ = build_cruise(camerawork_provider=lambda: config)
+    anchor_calls = []
+
+    async def record_anchor(_config, *, wait=True, deadline=float("inf")):
+        anchor_calls.append((adapter.state.recording, wait, deadline))
+        return True
+
+    async def ambiguous_finalize(on_media_url=None):
+        del on_media_url
+        # This is only a snapshot taken while an already-written Stop/Start can still apply.
+        adapter.state.recording = False
+        raise TimeoutError("recording acknowledgement is still ambiguous")
+
+    async def idle_runner(_config, stop_requested):
+        await stop_requested.wait()
+
+    monkeypatch.setattr(cruise, "_return_to_anchor", record_anchor)
+    monkeypatch.setattr(cruise, "_run_camerawork", idle_runner)
+    monkeypatch.setattr(cruise.robot, "finalize_capture_recording", ambiguous_finalize)
+    monkeypatch.setattr(cruise.robot, "recording_status_known", lambda: False)
+
+    run = await cruise.start(cruise_request(
+        auto_camerawork=True,
+        points=[CruisePoint(path_name="path1", goal_id=1)],
+    ))
+    await cruise._task
+
+    assert run.status == "failed"
+    assert len(anchor_calls) == 1  # preparation only; no command after ambiguous Stop
+    assert anchor_calls[0][0] is False
+
+
+@pytest.mark.asyncio
 async def test_cruise_records_once_and_marks_each_arrival():
     cruise, adapter, capture = build_cruise()
 
     run = await cruise.start(cruise_request())
     await cruise._task
 
-    assert run.status == "succeeded"
+    assert run.status == "succeeded", run.error
     assert adapter.recording_calls == ["start", "stop"]
     assert [goal.goal_id for goal in adapter.goals] == [1, 2]
     # Navigation-only points must not ask the robot to align its gimbal.
@@ -292,6 +617,118 @@ async def test_cruise_records_once_and_marks_each_arrival():
     assert [marker.label for marker in run.markers] == ["path1#1", "path1#2"]
     assert len(capture.list_sessions()[0].markers) == 2
     assert run.media_url == "robot://cruise.mp4"
+
+
+@pytest.mark.asyncio
+async def test_cruise_waits_for_late_recording_ack_before_dispatching_first_goal(
+    monkeypatch,
+    tmp_path,
+):
+    """A soft Start deadline must not fail the run or send a duplicate Start."""
+    monkeypatch.setattr(robot_module, "_RECORDING_REPLY_TIMEOUT_SECONDS", 0.01)
+    monkeypatch.setattr(robot_module, "_RECORDING_LATE_REPLY_GRACE_SECONDS", 0.2)
+    events = EventHub()
+    adapter = armed_adapter()
+    start_sent = asyncio.Event()
+    allow_late_reply = asyncio.Event()
+    start_reconciled = asyncio.Event()
+    goal_sent = asyncio.Event()
+    outgoing: list[dict] = []
+    reply_tasks: list[asyncio.Task] = []
+
+    class Socket:
+        async def send(self, message):
+            payload = json.loads(message)
+            outgoing.append(payload)
+            if "get_map_list" in payload:
+                await adapter._handle_message(json.dumps({"robot_map_list": ["map1"]}))
+            elif "get_path_list" in payload:
+                await adapter._handle_message(json.dumps({"robot_path_list": ["path1"]}))
+            elif "set_switch_map" in payload:
+                await adapter._handle_message(json.dumps({"robot_switch_map": "true"}))
+
+                async def switched_heartbeat():
+                    await asyncio.sleep(0)
+                    await asyncio.sleep(0)
+                    await adapter._handle_message(heartbeat("done"))
+
+                reply_tasks.append(asyncio.create_task(switched_heartbeat()))
+            elif payload.get("video_record", {}).get("start") == 0:
+                start_sent.set()
+
+                async def late_start_reply():
+                    await allow_late_reply.wait()
+                    await adapter._handle_message(json.dumps({
+                        "robot_video_record": {
+                            "start": 0,
+                            "status": "ok",
+                            "url": "robot://late-start.mp4",
+                        }
+                    }))
+                    start_reconciled.set()
+
+                reply_tasks.append(asyncio.create_task(late_start_reply()))
+            elif "set_goal" in payload:
+                assert start_reconciled.is_set()
+                goal_sent.set()
+                requested = payload["set_goal"]
+                await adapter._handle_message(json.dumps({
+                    "robot_goal": {
+                        "path_file": requested["path_name"],
+                        "goal_id": requested["goal_id"],
+                        "goal_object": requested["goal_object"],
+                        "goal_check": "true",
+                    }
+                }))
+                await adapter._handle_message(heartbeat("going", goal_id=requested["goal_id"]))
+                await adapter._handle_message(heartbeat("done", goal_id=requested["goal_id"]))
+            elif payload.get("video_record", {}).get("stop") == 0:
+                await adapter._handle_message(json.dumps({
+                    "robot_video_record": {
+                        "stop": 0,
+                        "status": "ok",
+                        "url": "robot://late-start.mp4",
+                    }
+                }))
+
+    class Media:
+        async def download_url(self, _url, metadata=None, **_kwargs):
+            target = tmp_path / "late-start.mp4"
+            target.write_bytes(b"video")
+            return MediaItem(path=str(target), kind="video", metadata=metadata or {})
+
+    adapter._socket = Socket()
+    adapter._start_connection_loop = lambda: None
+
+    async def already_connected():
+        return adapter.state
+
+    adapter.connect = already_connected
+    robot = RobotService(events, adapter=adapter, media=Media())
+    robot.resolve_media_url = lambda url: url
+    capture = CaptureService(events, path=tmp_path / "sessions.json")
+    cruise = CruiseService(events, robot, capture)
+
+    run = await cruise.start(cruise_request(
+        points=[CruisePoint(path_name="path1", goal_id=1)],
+    ))
+    await start_sent.wait()
+    # The reply is event-gated, so loaded Windows CI cannot deliver it before this assertion.
+    await asyncio.sleep(0.02)
+    assert goal_sent.is_set() is False
+    allow_late_reply.set()
+
+    await cruise._task
+    await asyncio.gather(*reply_tasks)
+
+    assert run.status == "succeeded", run.error
+    assert goal_sent.is_set() is True
+    assert sum(
+        payload.get("video_record", {}).get("start") == 0 for payload in outgoing
+    ) == 1
+    assert sum(
+        payload.get("video_record", {}).get("stop") == 0 for payload in outgoing
+    ) == 1
 
 
 @pytest.mark.asyncio
@@ -327,49 +764,35 @@ async def test_failed_point_is_marked_but_nothing_is_discarded():
 
 
 @pytest.mark.asyncio
-async def test_gimbal_scan_is_off_by_default_and_returns_to_centre_when_enabled():
-    cruise, adapter, _ = build_cruise()
-    await cruise.start(cruise_request())
-    await cruise._task
-    assert adapter.sweeps == []
+async def test_run_fails_when_no_requested_point_was_reached():
+    cruise, adapter, _ = build_cruise(fail_ids={1, 2})
 
-    cruise, adapter, _ = build_cruise()
-    adapter.state.yaw = 20.0
-    scan = GimbalScanConfig(enabled=True, yaw_offset_deg=15.0, yaw_speed_deg_s=30.0)
-    run = await cruise.start(cruise_request(gimbal_scan=scan))
+    run = await cruise.start(cruise_request())
     await cruise._task
 
-    assert all(segment.scanned for segment in run.segments)
-    # Recording does not move the gimbal. Each point scans from its current angle and returns.
-    assert adapter.sweeps == [(35.0, 30.0), (20.0, 30.0), (35.0, 30.0), (20.0, 30.0)]
-    assert adapter.state.yaw == 20.0
-    samples = json.loads(
-        gimbal_sidecar_path(run.media_local_path).read_text(encoding="utf-8")
-    )["samples"]
-    assert samples
+    assert run.status == "failed"
+    assert run.error == "巡游未到达任何点位"
+    assert [segment.status for segment in run.segments] == ["failed", "failed"]
+    assert adapter.recording_calls == ["start", "stop"]
 
 
 @pytest.mark.asyncio
-async def test_plain_cruise_never_inherits_gimbal_samples_from_previous_run():
+async def test_legacy_scan_payload_cannot_issue_camera_commands():
     cruise, adapter, _ = build_cruise()
-    adapter.state.yaw = 20.0
-    scan = GimbalScanConfig(enabled=True, yaw_offset_deg=15.0, yaw_speed_deg_s=30.0)
-    scanned = await cruise.start(cruise_request(gimbal_scan=scan))
+    request = CruiseRequest.model_validate({
+        **cruise_request().model_dump(),
+        "gimbal_scan": {
+            "enabled": True,
+            "direction": "right",
+            "yaw_offset_deg": 60,
+            "yaw_speed_deg_s": 30,
+        },
+    })
+
+    await cruise.start(request)
     await cruise._task
-    assert gimbal_sidecar_path(scanned.media_local_path).exists()
 
-    plain = await cruise.start(cruise_request())
-    await cruise._task
-    assert not gimbal_sidecar_path(plain.media_local_path).exists()
-
-
-@pytest.mark.asyncio
-async def test_dwell_is_floored_so_a_scan_is_never_cut_mid_return():
-    scan = GimbalScanConfig(enabled=True, yaw_offset_deg=15.0, yaw_speed_deg_s=5.0)
-    assert scan.budget_seconds == pytest.approx(7.6)
-
-    request = cruise_request(dwell_min_seconds=1.0, dwell_max_seconds=1.0, gimbal_scan=scan)
-    assert request.gimbal_scan.budget_seconds > request.dwell_max_seconds
+    assert adapter.gimbal_commands == []
 
 
 @pytest.mark.asyncio
@@ -413,7 +836,7 @@ async def test_cruise_refuses_to_hijack_a_running_manual_capture():
 @pytest.mark.asyncio
 async def test_second_cruise_is_rejected_while_one_is_running():
     cruise, _, _ = build_cruise()
-    await cruise.start(cruise_request(dwell_min_seconds=5.0, dwell_max_seconds=5.0))
+    await cruise.start(cruise_request())
     try:
         with pytest.raises(ValueError):
             await cruise.start(cruise_request())
@@ -714,10 +1137,10 @@ async def test_failure_before_start_attempt_never_stops_an_unowned_recording():
 
     adapter.switch_map = fail_map_switch
 
-    run = await cruise.start(cruise_request(map_name="map1"))
-    await cruise._task
+    with pytest.raises(ConnectionError, match="map switch failed"):
+        await cruise.start(cruise_request(map_name="map1"))
 
-    assert run.status == "failed"
+    assert cruise.current() is None
     assert adapter.state.recording is True
     assert adapter.recording_calls == []
     assert capture.active_session() is None

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any, Literal
@@ -182,6 +183,10 @@ class CameraworkProfile(BaseModel):
     # The robot firmware expects whole-number yaw/pitch speeds on the wire.
     speed_min: int = Field(default=2, ge=2, le=5)
     speed_max: int = Field(default=5, ge=2, le=5)
+    # This is the only probability-like camerawork control exposed to operators.  It is
+    # implemented as a time share, not as a per-command random choice.
+    anchor_time_percent: int = Field(default=20, ge=0, le=100)
+    anchor_dwell_seconds: float = Field(default=5.0, ge=0.5, le=120.0)
 
     @model_validator(mode="after")
     def validate_ranges_and_anchor(self) -> CameraworkProfile:
@@ -246,36 +251,6 @@ class CaptureSession(BaseModel):
     pending_media_sync_error: str | None = None
 
 
-class GimbalScanConfig(BaseModel):
-    """Optional slow pan-and-return, performed only while the robot is parked at a point.
-
-    Off by default. Navigation and gimbal control are independent commands, so enabling
-    this does not change how the cruise drives, and manual camera control stays usable
-    throughout a run.
-    """
-
-    enabled: bool = False
-    direction: Literal["left", "right"] = "right"
-    yaw_offset_deg: float = Field(default=15.0, ge=1.0, le=60.0)
-    yaw_speed_deg_s: float = Field(default=5.0, ge=1.0, le=30.0)
-    settle_tolerance_deg: float = Field(default=2.0, ge=0.1, le=15.0)
-
-    @property
-    def signed_offset_deg(self) -> float:
-        return self.yaw_offset_deg if self.direction == "right" else -self.yaw_offset_deg
-
-    @property
-    def leg_budget_seconds(self) -> float:
-        """Worst-case time for one leg: the pure travel time plus settle margin."""
-        return self.yaw_offset_deg / self.yaw_speed_deg_s + 0.8
-
-    @property
-    def budget_seconds(self) -> float:
-        """Worst-case time for out-and-back, used as a floor on dwell so a scan is
-        never cut off mid-return."""
-        return 2 * self.leg_budget_seconds
-
-
 class CruisePoint(BaseModel):
     path_name: str = Field(min_length=1, max_length=200)
     goal_id: int = Field(ge=0)
@@ -289,20 +264,31 @@ class CruiseRequest(BaseModel):
     map_name: str | None = Field(default=None, max_length=200)
     points: list[CruisePoint] = Field(min_length=1, max_length=200)
     record: bool = True
-    dwell_min_seconds: float = Field(default=5.0, ge=0.0, le=120.0)
-    dwell_max_seconds: float = Field(default=10.0, ge=0.0, le=120.0)
     arrival_timeout_seconds: float = Field(default=60.0, ge=5.0, le=1800.0)
-    gimbal_scan: GimbalScanConfig = Field(default_factory=GimbalScanConfig)
-    # Off by default. When enabled, the currently saved 镜头设置 profile is resolved when the
-    # run starts: yaw/pitch move during transit, zoom is only commanded after arrival, and the
-    # camera settles back on the profile's anchor before departing again.
+    # Off by default. When enabled, one timed four-quadrant/anchor schedule spans both travel
+    # and point dwell. Zoom is still commanded only while the robot base is parked.
     auto_camerawork: bool = False
 
-    @model_validator(mode="after")
-    def validate_dwell_range(self) -> CruiseRequest:
-        if self.dwell_max_seconds < self.dwell_min_seconds:
-            raise ValueError("dwell_max_seconds must be >= dwell_min_seconds")
-        return self
+    @model_validator(mode="before")
+    @classmethod
+    def discard_retired_cruise_fields(cls, value: Any) -> Any:
+        """Discard retired point-dwell controls and the retired stationary scan.
+
+        Saved routes and older clients may still send these keys. They are consumed before
+        normal validation so they remain loadable, but none survives in the active model or its
+        serialized output. Point dwell is now an execution detail; the only operator-controlled
+        camerawork pause is ``CameraworkProfile.anchor_dwell_seconds``.
+        """
+        if not isinstance(value, Mapping):
+            return value
+
+        data = dict(value)
+        data.pop("dwell_seconds", None)
+        data.pop("dwell_min_seconds", None)
+        data.pop("dwell_max_seconds", None)
+        # Accept any legacy shape and ignore it completely. It must never reactivate movement.
+        data.pop("gimbal_scan", None)
+        return data
 
 
 class CruiseSegment(BaseModel):
@@ -315,7 +301,6 @@ class CruiseSegment(BaseModel):
     arrived_at_seconds: float | None = None
     departed_at_seconds: float | None = None
     dwell_seconds: float | None = None
-    scanned: bool = False
     error: str | None = None
 
 
