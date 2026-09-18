@@ -186,8 +186,7 @@ class RenderService:
             filter_parts.append(f"[origraw]volume={bed}[orig]")
             sources.append("[orig]")
         if timeline.music_path:
-            # Analysis and render use the same excerpt. Previously the entire song's energy
-            # was compressed over a short edit while playback always began at 0:00.
+            # Controlled composition uses music from its start, bounded by the picture.
             bed = MUSIC_BED_VOLUME if timeline.voiceover_path else 1.0
             duration = timeline.music_duration_seconds or sum(
                 max(0.0, clip.duration) for clip in timeline.clips
@@ -544,7 +543,13 @@ class RenderService:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        _stdout, stderr = await process.communicate()
+        try:
+            _stdout, stderr = await process.communicate()
+        except asyncio.CancelledError:
+            if process.returncode is None:
+                process.kill()
+            await process.wait()
+            raise
         if process.returncode != 0:
             raise RuntimeError(stderr.decode("utf-8", errors="replace")[-2000:])
 

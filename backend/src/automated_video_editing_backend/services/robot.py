@@ -1327,6 +1327,7 @@ class HardwareRobotAdapter(RobotAdapter):
                 if normalized_context == "cruise_moving":
                     base_motion_intent = "moving"
                 elif normalized_context in {
+                    "cruise_fixed_piece",
                     "cruise_stationary_camerawork",
                     "cruise_stationary_anchor",
                     "cruise_stationary_zoom",

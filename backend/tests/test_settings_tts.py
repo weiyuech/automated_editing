@@ -233,7 +233,7 @@ def test_camerawork_profile_is_unconfigured_until_saved_and_persists_absolute_li
     assert saved == profile
 
 
-def test_legacy_camerawork_settings_gain_the_new_anchor_schedule_defaults(tmp_path):
+def test_legacy_camerawork_settings_migrate_to_fixed_origin_and_program(tmp_path):
     path = tmp_path / "settings.json"
     path.write_text(json.dumps({
         "automation": {
@@ -257,20 +257,21 @@ def test_legacy_camerawork_settings_gain_the_new_anchor_schedule_defaults(tmp_pa
     loaded = SettingsService(path=path).camerawork_config()
 
     assert loaded.configured is True
-    assert loaded.anchor_yaw == 4
-    assert loaded.anchor_time_percent == 20
-    assert loaded.anchor_dwell_seconds == pytest.approx(5.0)
+    assert loaded.anchor_yaw == 0
+    assert loaded.anchor_pitch == 0
+    assert loaded.point_mode == 4
+    assert "anchor_time_percent" not in loaded.model_dump()
+    assert "anchor_dwell_seconds" not in loaded.model_dump()
+    assert CameraworkConfig(anchor_zoom=3.5).anchor_zoom == 3.5
 
 
 @pytest.mark.parametrize("patch", [
     {"yaw_min": 10, "yaw_max": 10},
-    {"pitch_min": -5, "pitch_max": 5, "anchor_pitch": 10},
-    {"zoom_min": 1.5, "zoom_max": 1.2},
-    {"speed_min": 5, "speed_max": 2},
-    {"anchor_time_percent": -1},
-    {"anchor_time_percent": 101},
-    {"anchor_dwell_seconds": 0.49},
-    {"anchor_dwell_seconds": 120.01},
+    {"pitch_min": 0, "pitch_max": 5},
+    {"anchor_zoom": 3.6},
+    {"speed_max": 1},
+    {"point_mode": 5},
+    {"piece_ids": ["upper-left"]},
 ])
 def test_camerawork_rejects_invalid_ranges_and_anchors(patch):
     with pytest.raises(ValidationError):

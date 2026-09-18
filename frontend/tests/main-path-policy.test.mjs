@@ -290,7 +290,7 @@ test('no-record cruise capture lifecycle never becomes a manual recording or res
   })
 })
 
-test('pool inventory retains offline ids, explains the empty state, and keeps all clear buttons enabled', () => {
+test('legacy pool inventory retains offline identities and explains the empty state', () => {
   const inventory = mediaPoolInventory(
     ['offline-a', 'available-a', 'offline-a'],
     [{ id: 'available-a' }]
@@ -307,30 +307,14 @@ test('pool inventory retains offline ids, explains the empty state, and keeps al
     '媒体池为空。'
   )
 
-  for (const field of [
-    'source_media_ids',
-    'music_media_ids',
-    'voiceover_media_ids',
-    'effect_media_ids'
-  ]) {
-    assert.match(
-      appSource,
-      new RegExp(`:disabled="mediaPoolSaving \\|\\| !mediaPool\\.${field}\\.length"`)
-    )
-  }
 
-  assert.match(appSource, /已入池 \{\{ mediaPool\.music_media_ids\.length }}/)
-  assert.match(appSource, /已入池 \{\{ mediaPool\.voiceover_media_ids\.length }}/)
-  assert.match(appSource, /已入池 \{\{ mediaPool\.effect_media_ids\.length }}/)
 })
 
-test('generating a voiceover leaves pool membership and selection to explicit user actions', () => {
-  const start = appSource.indexOf('async function generateVoiceover()')
-  const end = appSource.indexOf('\nfunction moveCalendar(', start)
-  assert.ok(start >= 0 && end > start, 'generateVoiceover source must be present')
-  const generateSource = appSource.slice(start, end)
-
-  assert.doesNotMatch(generateSource, /addItemToMediaPool|saveMediaPool|selectedAutomationVoiceoverIds/)
-  assert.match(generateSource, /需要使用时，请在旁白池点击“从媒体库添加”/)
+test('ordinary narration generation leaves pool membership to explicit user selection', () => {
+  const panel = readFileSync(new URL('../src/renderer/src/components/NarrationPanel.vue', import.meta.url), 'utf8')
+  const start = panel.indexOf('async function generate()')
+  const end = panel.indexOf('async function poll()', start)
+  assert.ok(start >= 0 && end > start)
+  assert.doesNotMatch(panel.slice(start, end), /saveMediaPool|source_media_ids|voiceover_media_ids/)
   assert.match(appSource, /async function addPendingItemsToPool\(\)/)
 })

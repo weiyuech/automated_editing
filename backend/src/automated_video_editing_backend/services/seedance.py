@@ -586,7 +586,7 @@ class SeedanceService:
         payload: dict[str, Any] = {
             "model": cfg["image_model"],
             "prompt": asset.prompt,
-            "size": self._image_size(cfg, asset),
+            "size": await asyncio.to_thread(self._image_size, cfg, asset),
             "response_format": "url",
         }
         if asset.source_image_url:
@@ -623,11 +623,9 @@ class SeedanceService:
         source = asset.source_image_path
         if source and Path(source).exists():
             try:
-                import cv2
-
-                image = cv2.imread(source)
-                if image is not None:
-                    height, width = image.shape[:2]
+                size = self.renderer.probe_frame_size(source)
+                if size is not None:
+                    width, height = size
                     if width > 0 and height > 0:
                         scale = max(1.0, (SEEDREAM_MIN_PIXELS / (width * height)) ** 0.5)
                         out_w, out_h = int(width * scale + 0.5), int(height * scale + 0.5)

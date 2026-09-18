@@ -1,5 +1,6 @@
 <script setup>
 import { computed, ref } from 'vue'
+import CaptureTreeNode from './CaptureTreeNode.vue'
 import { captureSelectionState, changeCaptureChild, fullCaptureSelection, formatCaptureTime, captureStatus, normalizeCaptureSelection } from '../capture-group-policy.js'
 
 const props = defineProps({ group: { type: Object, required: true }, modelValue: { type: Object, default: null }, disabled: Boolean })
@@ -39,11 +40,8 @@ function preview(segment = null) {
           <span><strong>完整录制</strong><small>{{ group.master_available ? '包含本次拍摄全部内容' : '原片已移走或删除' }}</small></span></label>
         <button :disabled="!group.master_available" @click="preview()">预览</button>
       </div>
-      <div v-for="segment in group.segments" :key="segment.id" class="capture-picker-child">
-        <label><input type="checkbox" :checked="normalizedSelection?.segment_ids.includes(segment.id) || false" :disabled="disabled || (!group.master_available && (!segment.available || !segment.path))" @change="child(segment.id, $event.target.checked)" />
-          <span><strong>{{ segment.label }}</strong><small>{{ formatCaptureTime(segment.start) }}–{{ formatCaptureTime(segment.end) }} · {{ captureStatus(segment.status) }}</small></span></label>
-        <button :disabled="!group.master_available && (!segment.available || !segment.path)" @click="preview(segment)">预览</button>
-      </div>
+      <CaptureTreeNode v-for="segment in group.segments" :key="segment.id" :node="segment" :group="group"
+        :selection="normalizedSelection" :disabled="disabled" @change="child($event.id, $event.checked)" @preview="preview" />
       <p class="capture-picker-note">{{ group.error || group.timing_note }}<button v-if="group.status === 'failed'" @click="emit('retry', group)">重试生成</button></p>
     </div>
   </div>

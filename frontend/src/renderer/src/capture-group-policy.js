@@ -1,109 +1,74 @@
 // A source stays a recording root throughout library, pool and edit requests.
 export function captureGroup(item) { return item?.metadata?.capture_group || item?.capture_group || null }
 
-export function selectableCaptureSegments(group) {
-  const segments = group?.segments || []
-  return group?.master_available
-    ? segments
-    : segments.filter((segment) => segment.available && segment.path)
+export function captureNodes(nodes) {
+  return (nodes || []).flatMap(node => [node, ...captureNodes(node.children)])
 }
-
+export function captureLeaves(nodes) {
+  return (nodes || []).flatMap(node => node.children?.length ? captureLeaves(node.children) : [node])
+}
+export function selectableCaptureSegments(group) {
+  return captureNodes(group?.segments).filter(node => group.master_available || (node.available && node.path))
+}
+function coveredLeaves(group, selection) {
+  const selected = new Set(selection?.segment_ids || [])
+  function visit(nodes, inherited = false) {
+    return (nodes || []).flatMap(node => {
+      const on = inherited || selected.has(node.id) || selection?.include_full
+      return node.children?.length ? visit(node.children, on) : (on ? [node] : [])
+    })
+  }
+  return visit(group.segments)
+}
 export function normalizeCaptureSelection(group, selection) {
   if (!group || !selection) return null
   const selectable = selectableCaptureSegments(group)
-  const requestedFull = Boolean(selection.include_full)
-  const includeFull = Boolean(group.master_available && requestedFull)
-  const selected = new Set(selection.segment_ids || [])
-  // A persisted full-selection remains the user's request for all usable footage even if its
-  // master disappears later. It must degrade to the available children, never to an empty pick.
-  const segmentIds = (requestedFull ? selectable : selectable.filter((segment) => selected.has(segment.id)))
-    .map((segment) => segment.id)
-  if (!includeFull && !segmentIds.length) return null
-  return { capture_id: group.id, include_full: includeFull, segment_ids: segmentIds }
+  const includeFull = Boolean(group.master_available && selection.include_full)
+  const ids = new Set(selection.segment_ids || [])
+  const selected = (selection.include_full ? selectable : selectable.filter(node => ids.has(node.id))).map(node => node.id)
+  if (!includeFull && !selected.length) return null
+  return { capture_id: group.id, include_full: includeFull, segment_ids: selected }
 }
-
 export function fullCaptureSelection(group) {
-  const selectable = selectableCaptureSegments(group)
-  if (!group.master_available && !selectable.length) return null
-  return {
-    capture_id: group.id,
-    include_full: Boolean(group.master_available),
-    segment_ids: selectable.map((segment) => segment.id)
-  }
+  return normalizeCaptureSelection(group, { include_full: true, segment_ids: [] })
 }
-
 export function captureSelectionState(group, selection) {
-  const selectable = selectableCaptureSegments(group)
   const normalized = normalizeCaptureSelection(group, selection)
-  const ids = new Set(normalized?.segment_ids || [])
-  const count = selectable.filter((segment) => ids.has(segment.id)).length
+  const leaves = captureLeaves(group.segments)
+  const selected = coveredLeaves(group, normalized)
+  const selectable = leaves.filter(node => group.master_available || (node.available && node.path))
   const full = Boolean(normalized?.include_full)
+  const count = selected.length
   const checked = full || (selectable.length > 0 && count === selectable.length)
-  return {
-    checked,
-    partial: (full || count > 0) && !checked,
-    whole: Boolean(group.master_available) && (full || (group.segments.length > 0 && count === group.segments.length)),
-    count,
-    selectableCount: selectable.length,
-    duration: full ? group.duration : selectable.filter((segment) => ids.has(segment.id))
-      .reduce((sum, segment) => sum + segment.end - segment.start, 0)
-  }
+  return { checked, partial: count > 0 && !checked,
+    whole: Boolean(group.master_available) && (full || (leaves.length > 0 && count === leaves.length)),
+    count, selectableCount: selectable.length,
+    duration: full ? group.duration : selected.reduce((sum, node) => sum + node.end - node.start, 0) }
 }
-
+export function captureNodeState(group, selection, node) {
+  const selected = new Set(coveredLeaves(group, selection).map(n => n.id))
+  const leaves = captureLeaves([node])
+  const count = leaves.filter(n => selected.has(n.id)).length
+  return { checked: count === leaves.length, partial: count > 0 && count < leaves.length }
+}
 export function changeCaptureChild(group, selection, id, checked) {
+  if (id === 'full' && checked) return fullCaptureSelection(group)
   const normalized = normalizeCaptureSelection(group, selection)
-  const next = normalized ? { ...normalized, segment_ids: [...normalized.segment_ids] }
-    : { capture_id: group.id, include_full: false, segment_ids: [] }
-  if (id === 'full') {
-    if (checked) return fullCaptureSelection(group)
-    next.include_full = false
-  }
-  else {
-    // A root-level full selection owns every child even though the backend also receives the
-    // explicit ids. The first subtraction changes that meaning to "all except this child";
-    // leaving include_full set would make the backend correctly ignore the subtraction.
-    const selectable = selectableCaptureSegments(group)
-    const selected = new Set(next.include_full ? selectable.map((segment) => segment.id) : next.segment_ids)
-    if (!checked) next.include_full = false
-    if (checked) selected.add(id)
-    else selected.delete(id)
-    next.segment_ids = selectable.filter((segment) => selected.has(segment.id)).map((segment) => segment.id)
-  }
-  return next.include_full || next.segment_ids.length ? next : null
+  if (id === 'full') return normalizeCaptureSelection(group, { ...normalized, include_full: false })
+  const selected = new Set(coveredLeaves(group, normalized).map(n => n.id))
+  const node = captureNodes(group.segments).find(n => n.id === id)
+  if (!node) return normalized
+  for (const leaf of captureLeaves([node])) checked ? selected.add(leaf.id) : selected.delete(leaf.id)
+  return normalizeCaptureSelection(group, { include_full: false, segment_ids: [...selected] })
 }
 
-/** Sources shown under one recorded session in the manual fine-tune picker.
- *
- * The child has its own UI identity so choosing it cannot collide with the recording root. The
- * timeline still claims the durable root media id and carries the child's real path separately;
- * the backend can then verify that exact pair against the capture manifest.
- */
+/** Partial recordings must first be composed into one reviewed input. */
 export function captureTuneSourceGroups(items) {
-  return (items || []).flatMap((item) => {
+  return (items || []).flatMap(item => {
     const group = captureGroup(item)
-    if (!group) return []
-    const sources = []
-    if (group.master_available) {
-      sources.push({
-        ...item,
-        tune_label: `完整录制 · ${item.name || String(item.path || '').split(/[\\/]/).pop() || group.title}`
-      })
-    }
-    for (const segment of group.segments || []) {
-      if (!segment.available || !segment.path) continue
-      sources.push({
-        ...item,
-        id: `capture-segment:${encodeURIComponent(item.id)}:${encodeURIComponent(segment.id)}`,
-        media_id: item.id,
-        path: segment.path,
-        name: segment.label,
-        tune_label: `${segment.label} · ${formatCaptureTime(segment.start)}–${formatCaptureTime(segment.end)}`,
-        capture_segment: segment
-      })
-    }
-    return sources.length
-      ? [{ id: `capture-tune:${encodeURIComponent(group.id)}`, title: group.title, sources }]
-      : []
+    if (!group?.master_available) return []
+    return [{ id: `capture-tune:${encodeURIComponent(group.id)}`, title: group.title,
+      sources: [{ ...item, tune_label: `完整录制 · ${group.title}` }] }]
   })
 }
 
@@ -116,7 +81,7 @@ export function captureTuneClipIdentity(source) {
 
 export function captureSearchText(item) {
   const group = captureGroup(item)
-  return [item.path, item.name, group?.title, ...(group?.segments || []).map((s) => s.label)].join(' ').toLowerCase()
+  return [item.path, item.name, group?.title, ...captureNodes(group?.segments).map((s) => s.label)].join(' ').toLowerCase()
 }
 
 export function captureVaultRow(asset) {

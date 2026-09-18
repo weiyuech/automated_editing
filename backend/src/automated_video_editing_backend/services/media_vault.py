@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from automated_video_editing_backend.services.recording_segments import iter_nodes
+
 import hashlib
 from collections.abc import Iterable
 from datetime import UTC, datetime
@@ -101,7 +103,7 @@ class MediaVaultService:
             day.asset_count += 1
             day.total_bytes += asset.size_bytes
             if asset.capture_group:
-                day.total_bytes += sum(s.get("size_bytes", 0) for s in asset.capture_group["segments"])
+                day.total_bytes += sum(s.get("size_bytes", 0) for s in iter_nodes(asset.capture_group["segments"]))
         return list(grouped.values())
 
     def storage_report(self) -> StorageReport:
@@ -166,7 +168,7 @@ class MediaVaultService:
                 # Capture timing/point notes belong to the downloaded recording. They are moved
                 # to the trash as its companion and must not appear as a second, unusable asset.
                 if area == "downloads" and path.name.endswith(
-                    (".capture.json", ".gimbal.json")
+                    (".capture.json", ".gimbal.json", ".composition.json")
                 ):
                     continue
                 # The subtitle layer belongs to its export, not beside it in the library. It is

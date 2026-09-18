@@ -125,22 +125,110 @@ def build_timeline(payload: dict, duration: float, offset: float = 0.0) -> list[
                 "boundary_source": source,
             }
         )
+    visits_by_id = {
+        f"visit-{v.get('index', i)}-dwell": v for i, v in enumerate(visits) if isinstance(v, dict)
+    }
+    for node in result:
+        visit = visits_by_id.get(node["id"])
+        if not visit or not visit.get("shots"):
+            continue
+        children = []
+        cursor = node["start"]
+
+        def append_child(key, label, kind, start, end, source, complete=True):
+            if end <= start:
+                return
+            children.append(
+                {
+                    "id": f"{node['id']}:{key}",
+                    "order": len(children),
+                    "label": label,
+                    "kind": kind,
+                    "start": start,
+                    "end": end,
+                    "boundary_source": source,
+                    "complete": complete,
+                }
+            )
+
+        for shot in visit["shots"]:
+            start, end = timestamp(shot.get("start")), timestamp(shot.get("end"))
+            if start is None or end is None:
+                continue
+            start, end = max(cursor, start + offset), min(node["end"], end + offset)
+            if start > node["end"]:
+                break
+            append_child(
+                f"gap-{len(children)}",
+                "镜头准备",
+                "preparation",
+                cursor,
+                start,
+                "application_estimate",
+            )
+            append_child(
+                shot["id"],
+                shot["label"],
+                shot["kind"],
+                start,
+                end,
+                shot.get("boundary_source", "application_estimate"),
+                shot.get("status") == "complete",
+            )
+            cursor = max(cursor, end)
+        append_child("tail", "结束准备", "preparation", cursor, node["end"], "application_estimate")
+        node["children"] = children
     return result
+
+
+def iter_nodes(nodes):
+    """Traverse for validation/file operations only; persisted representation stays nested."""
+    for node in nodes:
+        yield node
+        yield from iter_nodes(node.get("children", []))
+
+
+def selected_nodes(nodes: list[dict], ids: set[str]) -> list[dict]:
+    result = []
+    for node in nodes:
+        if node["id"] in ids:
+            result.append(node)
+        else:
+            result.extend(selected_nodes(node.get("children", []), ids))
+    return result
+
+
+def validate_tree(nodes, start, end, seen=None):
+    seen = set() if seen is None else seen
+    cursor = start
+    for order, node in enumerate(nodes):
+        lo, hi = timestamp(node.get("start")), timestamp(node.get("end"))
+        if (
+            lo is None
+            or hi is None
+            or lo < cursor - 1e-6
+            or hi <= lo
+            or hi > end + 1e-6
+            or not isinstance(node.get("id"), str)
+            or node["id"] in seen
+        ):
+            raise ValueError("拍摄树节点时间或标识无效")
+        seen.add(node["id"])
+        cursor = hi
+        validate_tree(node.get("children", []), lo, hi, seen)
 
 
 def selected_ranges(group: dict, selection: dict) -> list[tuple[float, float]]:
     """Resolve a group's child choice to a chronological union, never a source list."""
     children = group["segments"]
     ids = set(selection.get("segment_ids") or [])
-    known = {s["id"] for s in children}
+    known = {s["id"] for s in iter_nodes(children)}
+    if selection.get("include_full"):
+        return [(0.0, group["duration"])]
     if ids - known:
         raise ValueError("所选分段已变化，请重新选择这次拍摄")
-    if selection.get("include_full") or (known and ids == known):
-        return [(0.0, group["duration"])]
     ranges: list[tuple[float, float]] = []
-    for segment in children:
-        if segment["id"] not in ids:
-            continue
+    for segment in selected_nodes(children, ids):
         start, end = segment["start"], segment["end"]
         if ranges and start <= ranges[-1][1] + 1e-9:
             ranges[-1] = (ranges[-1][0], max(end, ranges[-1][1]))
@@ -166,7 +254,23 @@ def rebase_timeline(segments: list[dict], ranges: list[tuple[float, float]]) -> 
                         "end": cursor + hi - start,
                         "source_start": lo,
                         "source_end": hi,
+                        "children": shift_nodes(
+                            rebase_timeline(segment.get("children", []), [(lo, hi)]),
+                            cursor + lo - start,
+                        ),
                     }
                 )
         cursor += end - start
     return result
+
+
+def shift_nodes(nodes: list[dict], offset: float) -> list[dict]:
+    return [
+        {
+            **node,
+            "start": node["start"] + offset,
+            "end": node["end"] + offset,
+            "children": shift_nodes(node.get("children", []), offset),
+        }
+        for node in nodes
+    ]

@@ -55,9 +55,9 @@ jobs:
         run: node --test tools/tests/robot-control-console.test.mjs
 
       - name: Install backend build dependencies
-        run: python -m pip install --upgrade pip pyinstaller && python -m pip install -e "backend[beat,assets,dev,pyav]"
+        run: python -m pip install --upgrade pip pyinstaller && python -m pip install -e "backend[assets,dev]"
 
-      - name: Fetch pinned fonts, semantic model, and Windows FFmpeg
+      - name: Fetch pinned fonts, BAAI model and Windows FFmpeg
         run: python scripts/prepare_assets.py --platform win64
 
       - name: Verify bundled media assets
@@ -73,11 +73,12 @@ jobs:
               Path("backend/src/automated_video_editing_backend/assets/fonts/SmileySans.ttf"),
               Path("backend/src/automated_video_editing_backend/assets/semantic/bge-small-zh-v1.5/model_int8.onnx"),
               Path("backend/src/automated_video_editing_backend/assets/semantic/bge-small-zh-v1.5/tokenizer.json"),
+              Path("backend/src/automated_video_editing_backend/assets/semantic/bge-small-zh-v1.5/LICENSE-BAAI-BGE.txt"),
           ]
           missing = [str(path) for path in required if not path.is_file()]
           if missing:
               raise SystemExit("Missing release assets: " + ", ".join(missing))
-          print("Fonts, semantic model, and FFmpeg are ready.")
+          print("Fonts and FFmpeg are ready.")
           PY
 
       - name: Add bundled FFmpeg tools to PATH
@@ -104,12 +105,13 @@ jobs:
               "SmileySans.ttf",
               "model_int8.onnx",
               "tokenizer.json",
+              "LICENSE-BAAI-BGE.txt",
           }
           found = {path.name for path in bundle.rglob("*") if path.is_file()}
           missing = sorted(required_names - found)
           if missing:
               raise SystemExit("Frozen backend is incomplete: " + ", ".join(missing))
-          print("Frozen backend contains the executable, FFmpeg, fonts, and semantic model.")
+          print("Frozen backend contains the executable, FFmpeg, fonts.")
           PY
 
       - name: Smoke-test frozen backend startup and API authentication
@@ -196,10 +198,10 @@ jobs:
       - name: Test standalone robot console
         run: node --test tools/tests/robot-control-console.test.mjs
 
-      - name: Install backend without PyAV
-        run: python -m pip install --upgrade pip pyinstaller && python -m pip install -e "backend[beat,assets,dev]"
+      - name: Install backend with external media tools
+        run: python -m pip install --upgrade pip pyinstaller && python -m pip install -e "backend[assets,dev]"
 
-      - name: Fetch commercially redistributable fonts and semantic model
+      - name: Fetch fonts and the BAAI model
         run: |
           python scripts/prepare_assets.py --fonts-only
           python scripts/prepare_assets.py --semantic-only
@@ -209,54 +211,6 @@ jobs:
 
       - name: Add test-only FFmpeg to PATH
         run: echo "$GITHUB_WORKSPACE/backend/vendor/ffmpeg/win64" >> "$GITHUB_PATH"
-
-      - name: Verify OpenCV can decode video
-        run: |
-          python - <<'PY'
-          import cv2
-          import shutil
-          import subprocess
-          import tempfile
-          from pathlib import Path
-
-          ffmpeg_line = next(
-              (line.strip() for line in cv2.getBuildInformation().splitlines()
-               if line.strip().startswith("FFMPEG:")),
-              "FFMPEG: UNKNOWN",
-          )
-          ffmpeg = shutil.which("ffmpeg")
-          if not ffmpeg:
-              raise SystemExit("Test-only FFmpeg is missing from PATH.")
-          with tempfile.TemporaryDirectory() as directory:
-              fixture = Path(directory) / "opencv-h264-smoke.mp4"
-              subprocess.run(
-                  [
-                      ffmpeg,
-                      "-hide_banner",
-                      "-loglevel", "error",
-                      "-f", "lavfi",
-                      "-i", "color=c=black:s=64x64:d=0.4:r=5",
-                      "-c:v", "libx264",
-                      "-pix_fmt", "yuv420p",
-                      "-y", str(fixture),
-                  ],
-                  check=True,
-              )
-              capture = cv2.VideoCapture(str(fixture))
-              try:
-                  opened = capture.isOpened()
-                  decoded, frame = capture.read()
-              finally:
-                  capture.release()
-              if not opened or not decoded or frame is None or frame.size == 0:
-                  frame_size = 0 if frame is None else frame.size
-                  raise SystemExit(
-                      "OpenCV failed to decode an actual H.264 frame "
-                      f"(opened={opened}, decoded={decoded}, frame_size={frame_size}; "
-                      f"build info: {ffmpeg_line})."
-                  )
-          print(f"OpenCV decoded an actual H.264 frame (build info: {ffmpeg_line}).")
-          PY
 
       - name: Verify retained runtime assets
         run: |
@@ -269,19 +223,20 @@ jobs:
               Path("backend/src/automated_video_editing_backend/assets/fonts/SmileySans.ttf"),
               Path("backend/src/automated_video_editing_backend/assets/semantic/bge-small-zh-v1.5/model_int8.onnx"),
               Path("backend/src/automated_video_editing_backend/assets/semantic/bge-small-zh-v1.5/tokenizer.json"),
+              Path("backend/src/automated_video_editing_backend/assets/semantic/bge-small-zh-v1.5/LICENSE-BAAI-BGE.txt"),
           ]
           missing = [str(path) for path in required if not path.is_file()]
           if missing:
               raise SystemExit("Missing release assets: " + ", ".join(missing))
-          print("Fonts and semantic model are ready for the frozen runtime.")
+          print("Fonts are ready for the frozen runtime.")
           PY
 
-      - name: Run backend tests without PyAV
+      - name: Run backend tests with external media tools
         env:
           AVE_EXTERNAL_MEDIA_TOOLS: "1"
         run: python -m pytest backend/tests -q
 
-      - name: Freeze backend without PyAV or standalone FFmpeg
+      - name: Freeze backend with external media tools or standalone FFmpeg
         env:
           AVE_EXTERNAL_MEDIA_TOOLS: "1"
         run: python -m PyInstaller --noconfirm --clean --distpath frontend/build-external --workpath .cache/pyinstaller-external backend/windows_backend.spec
@@ -299,6 +254,7 @@ jobs:
               "SmileySans.ttf",
               "model_int8.onnx",
               "tokenizer.json",
+              "LICENSE-BAAI-BGE.txt",
           }
           files = [path for path in bundle.rglob("*") if path.is_file()]
           found = {path.name for path in files}

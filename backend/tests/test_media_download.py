@@ -1,9 +1,9 @@
 import asyncio
 from pathlib import Path
 
-import cv2
+import subprocess
 import httpx
-import numpy as np
+from automated_video_editing_backend.services.render import RenderService
 import pytest
 
 from automated_video_editing_backend.services import media as media_module
@@ -19,17 +19,10 @@ from automated_video_editing_backend.services.media_download import (
 
 def _tiny_avi_bytes(tmp_path: Path) -> bytes:
     path = tmp_path / "complete.avi"
-    writer = cv2.VideoWriter(
-        str(path),
-        cv2.VideoWriter_fourcc(*"MJPG"),
-        10,
-        (64, 48),
-    )
-    assert writer.isOpened()
-    for index in range(12):
-        writer.write(np.full((48, 64, 3), index * 15, dtype=np.uint8))
-    writer.release()
+    subprocess.run([RenderService().ffmpeg_binary(), '-v', 'error', '-y', '-f', 'lavfi',
+                    '-i', 'testsrc2=s=64x48:r=10:d=1', '-c:v', 'mjpeg', str(path)], check=True)
     return path.read_bytes()
+
 
 
 def test_startup_cleanup_removes_only_app_owned_partial_downloads(tmp_path):

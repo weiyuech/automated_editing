@@ -7,17 +7,12 @@ from pathlib import Path
 
 import pytest
 
-from automated_video_editing_backend.core import paths as paths_module
 from automated_video_editing_backend.core.events import EventHub
 from automated_video_editing_backend.core.models import (
-    CaptureSelection,
     MediaItem,
     TimelineClip,
-    TimelineDraftRequest,
 )
-from automated_video_editing_backend.core.paths import GENERATED_DIRS
 from automated_video_editing_backend.services import capture_library as capture_library_module
-from automated_video_editing_backend.services.analysis import AnalysisService
 from automated_video_editing_backend.services.capture import gimbal_sidecar_path, sidecar_path
 from automated_video_editing_backend.services.capture_library import CaptureLibrary
 from automated_video_editing_backend.services.jobs import JobService
@@ -28,7 +23,6 @@ from automated_video_editing_backend.services.recording_segments import (
     selected_ranges,
 )
 from automated_video_editing_backend.services.render import RenderService
-from automated_video_editing_backend.services.timeline import EditPlanner
 
 
 def _evidence() -> dict:
@@ -218,7 +212,7 @@ def test_capture_manifest_survives_restart_and_resumes_interrupted_generation(tm
     assert reopened.groups["capture-1"]["segments"][0]["path"] == str(child_path)
 
 
-def test_media_pool_capture_choice_survives_restart_as_one_recording(tmp_path):
+def test_capture_tree_stays_in_library_and_cannot_enter_flat_pool(tmp_path):
     master = tmp_path / "master.mp4"
     master.write_bytes(b"master")
     sidecar_path(master).write_text(json.dumps(_evidence()), encoding="utf-8")
@@ -229,32 +223,14 @@ def test_media_pool_capture_choice_survives_restart_as_one_recording(tmp_path):
     first.captures = CaptureLibrary(manifest, directory)
     root = first.import_path(str(master))
     first.list_items()
-
-    saved = first.update_media_pool(
-        {
-            "source_media_ids": [root.id],
-            "music_media_ids": [],
-            "voiceover_media_ids": [],
-            "effect_media_ids": [],
-            "capture_selections": [
-                {
-                    "capture_id": "capture-1",
-                    "include_full": True,
-                    "segment_ids": [],
-                }
-            ],
-        }
-    )
-
+    assert root.metadata.get("capture_group")
+    with pytest.raises(ValueError, match="Invalid media type"):
+        first.update_media_pool({"source_media_ids": [root.id]})
+    assert root.id not in first.media_pool()["source_media_ids"]
     reopened = MediaService(path=library)
     reopened.captures = CaptureLibrary(manifest, directory)
-    restored = reopened.media_pool()
-
-    assert saved["source_media_ids"] == [root.id]
-    assert restored["source_media_ids"] == [root.id]
-    assert restored["capture_selections"] == [
-        {"capture_id": "capture-1", "include_full": True, "segment_ids": []}
-    ]
+    assert root.id not in reopened.media_pool()["source_media_ids"]
+    assert any(i.id == root.id for i in reopened.list_items())
 
 
 def test_corrupt_derived_manifest_does_not_hide_the_source_recording(tmp_path):
@@ -545,71 +521,6 @@ def test_manual_timeline_authorizes_only_ready_manifest_children(tmp_path):
     blocked["segments"][0]["status"] = "failed"
     media.captures._commit(blocked)
     assert media.capture_child_item(root.id, str(child)) is None
-
-
-@pytest.mark.asyncio
-async def test_partial_capture_draft_survives_cleanup_and_is_accepted_for_render(
-    tmp_path, monkeypatch
-):
-    """Exercise the real selection/materialization/draft contract before queuing rendering."""
-    data = tmp_path / "data"
-    exports = tmp_path / "exports"
-    data.mkdir()
-    exports.mkdir()
-    monkeypatch.setattr(paths_module, "APP_ROOT", tmp_path)
-    monkeypatch.setitem(GENERATED_DIRS, "data", data)
-    monkeypatch.setitem(GENERATED_DIRS, "exports", exports)
-
-    master = _video_with_audio(tmp_path / "capture-master.mp4", seconds=2.0)
-    sidecar_path(master).write_text(json.dumps(_evidence(), ensure_ascii=False), encoding="utf-8")
-    media = MediaService(path=data / "media-library.json")
-    root = media.import_path(str(master))
-    media.list_items()
-    prepared = await media.captures.prepare("capture-1")
-    media.list_items()
-    selected_ids = [part["id"] for part in prepared["segments"][1:4]]
-
-    jobs = JobService(EventHub(), media, AnalysisService(), EditPlanner(), RenderService())
-    media.captures.external_path_in_use = jobs.is_path_in_use
-    timeline = await jobs.draft_timeline(
-        TimelineDraftRequest(
-            title="片段草稿",
-            media_ids=[root.id],
-            capture_selections=[
-                CaptureSelection(
-                    capture_id="capture-1",
-                    include_full=False,
-                    segment_ids=selected_ids,
-                )
-            ],
-            target_duration_seconds=1.0,
-            mute_original_audio=True,
-        )
-    )
-
-    assert timeline.clips
-    clip = timeline.clips[0]
-    materialized = media.capture_input_item(clip.media_id, clip.source_path)
-    assert materialized is not None
-    assert Path(materialized.path).is_file()
-    assert media.captures.directory in Path(materialized.path).resolve().parents
-
-    # A draft is not a queued job yet, but its internal source must remain available while the
-    # user previews and confirms it. Safe cleanup therefore treats the draft record as a lease.
-    deleted, _freed, skipped = media.captures.cleanup_inputs()
-    assert deleted == 0
-    assert skipped == 1
-    assert Path(materialized.path).is_file()
-
-    async def no_render(_job_id):
-        return None
-
-    monkeypatch.setattr(jobs, "_run", no_render)
-    job = await jobs.create_from_timeline(timeline)
-    await asyncio.sleep(0)
-
-    assert job.timeline is timeline
-    assert job.request.media_ids == [clip.media_id]
 
 
 def test_capture_input_authorization_requires_exact_internal_id_path_and_file(tmp_path):

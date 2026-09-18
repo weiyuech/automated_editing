@@ -1,7 +1,7 @@
 import os
 from pathlib import Path
 
-from PyInstaller.utils.hooks import collect_all, copy_metadata
+from PyInstaller.utils.hooks import copy_metadata
 
 
 BACKEND_ROOT = Path(SPECPATH).resolve()
@@ -13,7 +13,6 @@ EXTERNAL_MEDIA_TOOLS = os.environ.get("AVE_EXTERNAL_MEDIA_TOOLS") == "1"
 datas = []
 binaries = []
 hiddenimports = [
-    "automated_video_editing_backend.services.scene_detect_worker",
     "uvicorn.logging",
     "uvicorn.loops.auto",
     "uvicorn.protocols.http.auto",
@@ -21,36 +20,11 @@ hiddenimports = [
     "uvicorn.lifespan.on",
 ]
 
-# These libraries discover codecs, compiled extensions or analysis backends dynamically. The
-# explicit collection makes the Windows artifact independent of whichever modules PyInstaller
-# happened to observe while importing main.py on the CI runner.
-packages = [
-    "cv2",
-    "scenedetect",
-    "librosa",
-    "numba",
-    "llvmlite",
-    "soundfile",
-    "sklearn",
-    "onnxruntime",
-    "tokenizers",
-]
-if not EXTERNAL_MEDIA_TOOLS:
-    packages.insert(0, "av")
-
-for package in packages:
-    package_datas, package_binaries, package_hidden = collect_all(package)
-    datas += package_datas
-    binaries += package_binaries
-    hiddenimports += package_hidden
-
 for distribution in (
     "fastapi",
     "pydantic",
     "uvicorn",
     "python-multipart",
-    "onnxruntime",
-    "tokenizers",
 ):
     datas += copy_metadata(distribution)
 
@@ -81,7 +55,7 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=["pytest", "matplotlib", "tkinter"] + (["av"] if EXTERNAL_MEDIA_TOOLS else []),
+    excludes=["pytest", "matplotlib", "tkinter", "av", "cv2", "librosa", "numba", "llvmlite", "scenedetect"],
     noarchive=False,
     optimize=0,
 )

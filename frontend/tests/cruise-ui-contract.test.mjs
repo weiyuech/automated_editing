@@ -4,10 +4,12 @@ import test from 'node:test'
 
 const appSource = readFileSync(new URL('../src/renderer/src/App.vue', import.meta.url), 'utf8')
 
-test('cruise UI exposes only anchor dwell, not per-point dwell or internal selection details', () => {
-  assert.match(appSource, /自动运镜（使用「镜头设置」中的配置）/)
-  assert.match(appSource, /每次回到锚点后停留（秒）/)
-  assert.doesNotMatch(appSource, /每点停留|四区域|四个画面区域|cruiseDwell/)
+test('cruise UI exposes fixed 4/8 modes and per-point piece choices', () => {
+  assert.match(appSource, /固定运镜（使用「镜头设置」中的配置）/)
+  assert.match(appSource, /4 点 · 6 段/)
+  assert.match(appSource, /8 点 · 10 段/)
+  assert.match(appSource, /piece_ids: point.piece_ids/)
+  assert.doesNotMatch(appSource, /每次回到锚点后停留（秒）/)
 })
 
 test('cruise launch requests do not submit a retired per-point dwell field', () => {

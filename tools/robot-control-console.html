@@ -130,7 +130,7 @@ summary{ cursor:pointer; color:var(--text-muted); font-size:12px; font-weight:70
     <main class="panel">
       <div class="tabs" role="tablist" aria-label="运镜测试方式">
         <button class="tab active" id="tabManual" role="tab" aria-selected="true" aria-controls="manualPanel">镜头控制</button>
-        <button class="tab" id="tabAuto" role="tab" aria-selected="false" aria-controls="autoPanel">自动运镜（巡游）</button>
+        <button class="tab" id="tabAuto" role="tab" aria-selected="false" aria-controls="autoPanel">固定镜头（停稳测试）</button>
       </div>
 
       <section class="tab-panel" id="manualPanel" role="tabpanel" aria-labelledby="tabManual">
@@ -160,73 +160,19 @@ summary{ cursor:pointer; color:var(--text-muted); font-size:12px; font-weight:70
       </section>
 
       <section class="tab-panel" id="autoPanel" role="tabpanel" aria-labelledby="tabAuto" hidden>
-        <p class="hint direction-note">复现正式应用的巡游自动运镜：镜头在允许范围内持续移动，并按设置返回锚点。</p>
-        <div class="group">
-          <span class="group-title">锚点</span>
-          <div class="form-grid">
-            <label class="field">锚点水平角（−90°～90°）
-              <input class="auto-input" id="anchorYaw" type="number" min="-90" max="90" step="1" value="0">
-            </label>
-            <label class="field">锚点俯仰角（−60°～15°）
-              <input class="auto-input" id="anchorPitch" type="number" min="-60" max="15" step="1" value="0">
-            </label>
-          </div>
-          <div class="row" style="margin-top:8px"><button id="useActualAnchor">使用当前实测角度</button></div>
-        </div>
-
-        <div class="group">
-          <span class="group-title">允许范围（绝对角度）</span>
-          <div class="form-grid">
-            <label class="field">水平右边界（−90°～90°）
-              <input class="auto-input" id="yawMin" type="number" min="-90" max="90" step="1" value="-60">
-            </label>
-            <label class="field">水平左边界（−90°～90°）
-              <input class="auto-input" id="yawMax" type="number" min="-90" max="90" step="1" value="60">
-            </label>
-            <label class="field">俯仰上边界（−60°～15°）
-              <input class="auto-input" id="pitchMin" type="number" min="-60" max="15" step="1" value="-15">
-            </label>
-            <label class="field">俯仰下边界（−60°～15°）
-              <input class="auto-input" id="pitchMax" type="number" min="-60" max="15" step="1" value="15">
-            </label>
-          </div>
-        </div>
-
-        <div class="group">
-          <span class="group-title">速度范围</span>
-          <div class="form-grid">
-            <label class="field">最慢（2～5°/秒）
-              <input class="auto-input" id="speedMin" type="number" min="2" max="5" step="1" value="2">
-            </label>
-            <label class="field">最快（2～5°/秒）
-              <input class="auto-input" id="speedMax" type="number" min="2" max="5" step="1" value="5">
-            </label>
-          </div>
-        </div>
-
-        <div class="group">
-          <span class="group-title">锚点节奏</span>
-          <div class="form-grid">
-            <label class="field">锚点停留时间占比（0～100%）
-              <input class="auto-input" id="anchorTimePercent" type="number" min="0" max="100" step="1" value="20">
-            </label>
-            <label class="field">每次回到锚点后停留（秒）
-              <input class="auto-input" id="anchorDwellSeconds" type="number" min="0.5" max="120" step="0.5" value="5">
-            </label>
-          </div>
-          <p class="hint">回到锚点后才开始计时；返回过程不占用停留时间。</p>
-        </div>
-
-        <div class="row" style="margin-bottom:8px">
-          <button id="saveAutoConfig">保存自动运镜设置</button>
-          <span class="mode-pill" id="configState">尚未保存</span>
-        </div>
-        <div class="row">
-          <button class="primary" id="autoStart">开始模拟行进</button>
-          <button id="autoArrive" disabled>模拟到达点位</button>
-          <button class="danger" id="autoStop" disabled>停止并回锚点</button>
-        </div>
-        <p class="status-line" id="autoStatus">模拟到达只切换底盘状态，自动运镜会继续；停止时才回锚点。</p>
+        <p class="hint direction-note">只测试停稳后的固定镜头序列，不控制底盘、不录制。正式拍摄请在应用内选择点位。原点始终为 (0, 0)，变焦固定 1 倍。</p>
+        <div class="group"><span class="group-title">矩形范围与执行顺序</span><div class="form-grid">
+          <label class="field">右边界 yaw<input class="auto-input" id="yawMin" type="number" min="-90" max="-1" value="-60"></label>
+          <label class="field">左边界 yaw<input class="auto-input" id="yawMax" type="number" min="1" max="90" value="60"></label>
+          <label class="field">上边界 pitch<input class="auto-input" id="pitchMin" type="number" min="-60" max="-1" value="-15"></label>
+          <label class="field">下边界 pitch<input class="auto-input" id="pitchMax" type="number" min="1" max="15" value="15"></label>
+          <label class="field">速度（2～5°/秒）<input class="auto-input" id="speedMax" type="number" min="2" max="5" value="5"></label>
+          <label class="field">镜头模式<select class="auto-input" id="pointMode"><option value="4">4 点 · 6 段</option><option value="8">8 点 · 10 段</option></select></label>
+        </div></div>
+        <div id="pieceChoices" class="form-grid"></div>
+        <p class="hint">按固定顺序完成勾选镜头；跳选时先移动到该镜头起点。每段等待两次新的心跳确认 ±0.5°；超时停止，不将预计时间当作到位。</p>
+        <div class="row"><button class="primary" id="autoStart">开始固定镜头测试</button><button class="danger" id="autoStop" disabled>停止后续指令</button></div>
+        <p class="status-line" id="autoStatus">请确认底盘已停稳，再开始测试。停止不等于硬件急停，已发送的动作可能继续完成。</p>
       </section>
     </main>
 
@@ -265,14 +211,11 @@ summary{ cursor:pointer; color:var(--text-muted); font-size:12px; font-weight:70
   "use strict";
 
   var MODE = 1;
-  var POSE_TOLERANCE = 2;
+  var POSE_TOLERANCE = 0.5;
   var POSE_STABLE_SAMPLES = 2;
-  var LEG_MARGIN_SECONDS = 0.6;
+  var LEG_MARGIN_SECONDS = 8;
   var HEARTBEAT_MAX_AGE_MS = 5000;
   var CONNECTION_NOTICE_MS = 5000;
-  var ANCHOR_DWELL_JITTER = 0.30;
-  var CONFIG_STORAGE_KEY = "robot_camerawork_yaw_pitch_v2";
-  var LEGACY_CONFIG_STORAGE_KEY = "robot_camerawork_yaw_pitch_v1";
 
   var ws = null;
   var connectionNoticeTimer = null;
@@ -287,14 +230,8 @@ summary{ cursor:pointer; color:var(--text-muted); font-size:12px; font-weight:70
   var heartbeatDiagnostic = "";
   var currentTarget = null;
   var autoRunning = false;
-  var autoBusy = false;
   var autoToken = 0;
   var manualToken = 0;
-  var activeAutoConfig = null;
-  var autoSchedule = null;
-  var lastAutoQuadrant = null;
-  var autoStationary = false;
-  var autoConfigured = false;
   var $ = function(id){ return document.getElementById(id); };
 
   function setConnectionState(kind, text){
@@ -413,7 +350,7 @@ summary{ cursor:pointer; color:var(--text-muted); font-size:12px; font-weight:70
     $("btnDisc").disabled = true;
     $("btnDisc").textContent = "断开";
     $("connErr").textContent = "";
-    cancelAutomatic("连接已断开，自动运镜已经停止；无法确认是否回到锚点。", false);
+    cancelAutomatic("连接已断开；后续镜头已取消。未确认已发送动作停止。");
     manualToken += 1;
     resetPose();
     refreshButtons();
@@ -428,25 +365,7 @@ summary{ cursor:pointer; color:var(--text-muted); font-size:12px; font-weight:70
       logLine("断开", "sys", "已取消连接，可重新连接。");
       return;
     }
-    if((autoRunning || autoBusy) && activeAutoConfig){
-      var config = activeAutoConfig;
-      autoRunning = false;
-      autoBusy = false;
-      autoToken += 1;
-      var pose = commandStartPose();
-      var start = {
-        yaw: clamp(pose.yaw, config.yawMin, config.yawMax),
-        pitch: clamp(pose.pitch, config.pitchMin, config.pitchMax)
-      };
-      sendGimbal(config.anchorYaw, config.anchorPitch, config.speedMax, config.speedMax, "断开前发送锚点", start);
-      activeAutoConfig = null;
-      setAutoInputsDisabled(false);
-      setAutoStatus("已尽力发送锚点；连接断开后无法继续确认实际位置。", "warn");
-      window.setTimeout(function(){
-        if(socket.readyState === 0 || socket.readyState === 1) socket.close();
-      }, 200);
-      return;
-    }
+    cancelAutomatic("已取消后续镜头并断开；未确认硬件停止。");
     socket.close();
   }
 
@@ -490,7 +409,7 @@ summary{ cursor:pointer; color:var(--text-muted); font-size:12px; font-weight:70
     estimatedPitch = targetPitch;
     currentTarget = { yaw: targetYaw, pitch: targetPitch, kind: kind };
     $("targetKind").textContent = kind;
-    setTargetStatus(hasFreshPose() ? "已发送，等待实际位置。" : "已发送；等待实测心跳，暂按预计行程。", "warn");
+    setTargetStatus(hasFreshPose() ? "已发送，等待实际位置。" : "已发送；尚无完整实测心跳，无法确认到位。", "warn");
     renderComparison();
     return true;
   }
@@ -609,7 +528,7 @@ summary{ cursor:pointer; color:var(--text-muted); font-size:12px; font-weight:70
           ){
             stable += 1;
             if(stable >= POSE_STABLE_SAMPLES){
-              setTargetStatus("连续两次心跳进入 ±2°，已到达。", "success");
+              setTargetStatus("连续两次心跳进入 ±0.5°，已到达。", "success");
               resolve("reached");
               return;
             }
@@ -619,11 +538,11 @@ summary{ cursor:pointer; color:var(--text-muted); font-size:12px; font-weight:70
         }
         if(Date.now() >= deadline){
           if(!receivedCompletePose){
-            setTargetStatus("没有收到新的完整 yaw/pitch 心跳；已按预计行程继续。", "warn");
-            resolve("estimated");
+            setTargetStatus("没有收到新的完整 yaw/pitch 心跳；无法确认到位。", "warn");
+            resolve("timeout");
             return;
           }
-          setTargetStatus("等待结束，实际位置仍未稳定进入 ±2°。", "warn");
+          setTargetStatus("等待结束，实际位置仍未稳定进入 ±0.5°。", "warn");
           resolve("timeout");
           return;
         }
@@ -646,7 +565,7 @@ summary{ cursor:pointer; color:var(--text-muted); font-size:12px; font-weight:70
       setManualStatus("指令发送失败。", "error");
       return;
     }
-    setManualStatus(hasFreshPose() ? "指令已发送，正在用心跳核对实际位置。" : "指令已发送；没有完整心跳，按预计行程等待。", "warn");
+    setManualStatus(hasFreshPose() ? "指令已发送，正在用心跳核对实际位置。" : "指令已发送；没有完整心跳，无法确认到位。", "warn");
     var travel = Math.max(Math.abs(targetYaw - startYaw), Math.abs(targetPitch - startPitch));
     var speed = Math.min(yawSpeed, pitchSpeed);
     waitForPose(targetYaw, targetPitch, travel / speed + LEG_MARGIN_SECONDS, function(){ return token !== manualToken; }, startRevisions)
@@ -654,7 +573,6 @@ summary{ cursor:pointer; color:var(--text-muted); font-size:12px; font-weight:70
         if(token !== manualToken) return;
         if(result === "reached") setManualStatus("实测位置已到达目标范围。", "success");
         else if(result === "timeout") setManualStatus("实测位置与发送目标仍有偏差，请查看右侧。", "warn");
-        else if(result === "estimated") setManualStatus("未收到完整实测心跳；指令已发送，并已按预计行程等待。", "warn");
         else if(result === "canceled" && !isSocketOpen()) setManualStatus("连接已断开。", "error");
       });
   }
@@ -672,345 +590,84 @@ summary{ cursor:pointer; color:var(--text-muted); font-size:12px; font-weight:70
     $("manualStatus").className = "status-line" + (kind ? " " + kind : "");
   }
 
-  function readAutoConfig(){
-    return {
-      anchorYaw: numberFrom("anchorYaw"), anchorPitch: numberFrom("anchorPitch"),
-      yawMin: numberFrom("yawMin"), yawMax: numberFrom("yawMax"),
-      pitchMin: numberFrom("pitchMin"), pitchMax: numberFrom("pitchMax"),
-      speedMin: numberFrom("speedMin"), speedMax: numberFrom("speedMax"),
-      anchorTimePercent: numberFrom("anchorTimePercent"),
-      anchorDwellSeconds: numberFrom("anchorDwellSeconds")
-    };
-  }
-
-  function validateAutoGeometry(config){
-    var angles = [config.anchorYaw, config.anchorPitch, config.yawMin, config.yawMax, config.pitchMin, config.pitchMax];
-    if(angles.some(function(value){ return !Number.isInteger(value); })) return "所有水平和俯仰角度都必须是整数。";
-    if(config.yawMin < -90 || config.yawMax > 90 || config.yawMax <= config.yawMin) return "水平范围必须在 −90°～90°，且左边界大于右边界。";
-    if(config.pitchMin < -60 || config.pitchMax > 15 || config.pitchMax <= config.pitchMin) return "俯仰范围必须在 −60°～15°，且下边界大于上边界。";
-    if(config.anchorYaw < config.yawMin || config.anchorYaw > config.yawMax) return "锚点水平角必须位于水平范围内。";
-    if(config.anchorPitch < config.pitchMin || config.anchorPitch > config.pitchMax) return "锚点俯仰角必须位于俯仰范围内。";
-    if(!isWholeSpeed(config.speedMin) || !isWholeSpeed(config.speedMax) || config.speedMax < config.speedMin) return "速度范围必须是 2～5 的整数，且最快不能小于最慢。";
-    if(!Number.isInteger(config.anchorTimePercent) || config.anchorTimePercent < 0 || config.anchorTimePercent > 100) return "锚点停留时间占比必须是 0～100% 内的整数。";
-    if(!Number.isFinite(config.anchorDwellSeconds) || config.anchorDwellSeconds < .5 || config.anchorDwellSeconds > 120) return "每次回到锚点后停留时间必须在 0.5～120 秒内。";
-    return "";
-  }
-
-  function validateAutoRuntime(config){
-    var geometryError = validateAutoGeometry(config);
-    if(geometryError) return geometryError;
-    if(!autoConfigured) return "请先保存自动运镜设置。";
-    if(!isSocketOpen()) return "请先连接机器人。";
-    return "";
-  }
-
-  function saveAutoConfig(){
-    var config = readAutoConfig();
-    var validation = validateAutoGeometry(config);
-    if(validation){ setAutoStatus(validation, "error"); return; }
-    var persisted = storageSet(CONFIG_STORAGE_KEY, JSON.stringify(config));
-    autoConfigured = true;
-    $("configState").textContent = persisted ? "已保存" : "本次已确认";
-    setAutoStatus(persisted ? "自动运镜设置已保存。" : "浏览器未允许本地保存；本次测试仍可使用。", persisted ? "success" : "warn");
-    refreshButtons();
-  }
-
-  function markAutoDirty(){
-    if(autoRunning) return;
-    autoConfigured = false;
-    $("configState").textContent = "有未保存修改";
-    setAutoStatus("设置已修改，请保存后开始模拟行进。", "warn");
-    refreshButtons();
-  }
-
-  function normalizeSavedAutoConfig(value){
-    if(!value || typeof value !== "object" || Array.isArray(value)) return null;
-    var config = {
-      anchorYaw: savedNumber(value.anchorYaw), anchorPitch: savedNumber(value.anchorPitch),
-      yawMin: savedNumber(value.yawMin), yawMax: savedNumber(value.yawMax),
-      pitchMin: savedNumber(value.pitchMin), pitchMax: savedNumber(value.pitchMax),
-      speedMin: savedNumber(value.speedMin), speedMax: savedNumber(value.speedMax),
-      anchorTimePercent: value.anchorTimePercent === undefined ? 20 : savedNumber(value.anchorTimePercent),
-      anchorDwellSeconds: value.anchorDwellSeconds === undefined ? 5 : savedNumber(value.anchorDwellSeconds)
-    };
-    return validateAutoGeometry(config) ? null : config;
-  }
-
-  function parseSavedAutoConfig(raw){
-    if(!raw) return null;
-    try { return normalizeSavedAutoConfig(JSON.parse(raw)); }
-    catch(error){ return null; }
-  }
-
-  function applyAutoConfig(config){
-    $("anchorYaw").value = config.anchorYaw;
-    $("anchorPitch").value = config.anchorPitch;
-    $("yawMin").value = config.yawMin;
-    $("yawMax").value = config.yawMax;
-    $("pitchMin").value = config.pitchMin;
-    $("pitchMax").value = config.pitchMax;
-    $("speedMin").value = config.speedMin;
-    $("speedMax").value = config.speedMax;
-    $("anchorTimePercent").value = config.anchorTimePercent;
-    $("anchorDwellSeconds").value = config.anchorDwellSeconds;
-  }
-
-  function loadAutoConfig(){
-    var currentRaw = storageGet(CONFIG_STORAGE_KEY);
-    var config = parseSavedAutoConfig(currentRaw);
-    var migrated = false;
-    if(!config){
-      if(currentRaw) storageRemove(CONFIG_STORAGE_KEY);
-      config = parseSavedAutoConfig(storageGet(LEGACY_CONFIG_STORAGE_KEY));
-      migrated = Boolean(config);
-    }
-    if(!config) return;
-    applyAutoConfig(config);
-    if(migrated) storageSet(CONFIG_STORAGE_KEY, JSON.stringify(config));
-    autoConfigured = true;
-    $("configState").textContent = "已保存";
-    setAutoStatus(migrated ? "已沿用原设置，并补充新的锚点节奏。" : "已载入保存的自动运镜设置。", "success");
-  }
-
-  function startAutomatic(){
-    var config = readAutoConfig();
-    var validation = validateAutoRuntime(config);
-    if(validation){ setAutoStatus(validation, "error"); return; }
-    manualToken += 1;
-    autoToken += 1;
-    var token = autoToken;
-    autoRunning = true;
-    autoBusy = true;
-    activeAutoConfig = config;
-    autoStationary = false;
-    setAutoInputsDisabled(true);
-    refreshButtons();
-    runAutomatic(token, config);
-  }
-
-  async function runAutomatic(token, config){
-    setAutoStatus("正在回到锚点，然后开始模拟行进。", "warn");
-    var anchorResult = await returnToAnchor(config, token, "开始前回锚点", function(){ return isAutoTokenActive(token); });
-    if(!isAutoTokenActive(token)) return;
-    setAutoStatus(anchorResult === "estimated" ?
-      "正在模拟巡游行进；无完整心跳，按预计行程执行水平＋俯仰运镜。" :
-      "正在模拟巡游行进，持续执行水平＋俯仰运镜。", anchorResult === "estimated" ? "warn" : "success");
-
-    autoSchedule = createCameraworkSchedule(config, Date.now());
-    lastAutoQuadrant = null;
-    // Starting the run already completed a return to anchor. At 100%, begin a
-    // complete hold now instead of sending the same target again.
-    var handledAnchorSerial = autoSchedule.phase === "anchor" ? autoSchedule.serial : -1;
-    while(isAutoTokenActive(token)){
-      advanceCameraworkSchedule(autoSchedule, config, Date.now());
-      if(autoSchedule.phase === "anchor"){
-        if(handledAnchorSerial !== autoSchedule.serial){
-          handledAnchorSerial = autoSchedule.serial;
-          var anchorSerial = autoSchedule.serial;
-          await moveAutoTarget(config.anchorYaw, config.anchorPitch, config.speedMax, (autoStationary ? "停稳" : "行进") + " · 锚点", token, config);
-          if(!isAutoTokenActive(token) || !autoSchedule) return;
-          if(autoSchedule.phase === "anchor" && autoSchedule.serial === anchorSerial){
-            // Arrival confirmation (or the full estimated travel budget) ends
-            // before the hold clock begins, so travel never consumes the hold.
-            beginAnchorHold(autoSchedule, Date.now());
-          }
-        }
-        await waitForScheduleBoundary(token, autoSchedule);
-        continue;
-      }
-      var quadrant = chooseNextQuadrant(lastAutoQuadrant);
-      lastAutoQuadrant = quadrant;
-      var target = quadrantPose(quadrant, config);
-      var speed = randomInteger(config.speedMin, config.speedMax);
-      await moveAutoTarget(target[0], target[1], speed, (autoStationary ? "停稳" : "行进") + " · 自动运镜", token, config);
-    }
-  }
-
-  async function moveAutoTarget(targetYaw, targetPitch, speed, kind, token, config){
-    if(!isAutoTokenActive(token)) return "canceled";
-    var pose = commandStartPose();
-    var startYaw = clamp(pose.yaw, config.yawMin, config.yawMax);
-    var startPitch = clamp(pose.pitch, config.pitchMin, config.pitchMax);
-    var startRevisions = poseRevisions();
-    if(!sendGimbal(targetYaw, targetPitch, speed, speed, kind, { yaw:startYaw, pitch:startPitch })){
-      cancelAutomatic("指令发送失败，自动运镜已经停止。", false);
-      return "canceled";
-    }
-    var travel = Math.max(Math.abs(targetYaw - startYaw), Math.abs(targetPitch - startPitch));
-    var result = await waitForPose(targetYaw, targetPitch, travel / speed + LEG_MARGIN_SECONDS, function(){ return !isAutoTokenActive(token); }, startRevisions);
-    return result;
-  }
-
-  function simulateArrival(){
-    if(!autoRunning || !activeAutoConfig || autoStationary) return;
-    autoStationary = true;
-    setAutoStatus("已模拟到达点位；底盘停稳，自动运镜沿用当前节奏继续。", "success");
-    refreshButtons();
-  }
-
-  function cancelAutomatic(message, returnAnchor){
-    var config = activeAutoConfig || readAutoConfig();
-    autoRunning = false;
-    autoSchedule = null;
-    lastAutoQuadrant = null;
-    autoStationary = false;
-    autoToken += 1;
-    var token = autoToken;
-    activeAutoConfig = null;
-    if(returnAnchor && isSocketOpen() && !validateAutoGeometry(config)){
-      autoBusy = true;
-      setAutoInputsDisabled(true);
-      refreshButtons();
-      setAutoStatus(message + " 正在回锚点。", "warn");
-      returnToAnchor(config, token, "停止后回锚点", function(){ return token === autoToken && isSocketOpen(); }).then(function(result){
-        if(token !== autoToken) return;
-        autoBusy = false;
-        setAutoInputsDisabled(false);
-        refreshButtons();
-        if(result === "reached") setAutoStatus("自动运镜已停止并回到锚点。", "success");
-        else if(result === "estimated") setAutoStatus("自动运镜已停止；锚点指令已发送，并已按预计行程等待。", "warn");
-        else if(result === "canceled") setAutoStatus("连接已断开，无法继续回到锚点。", "error");
-        else setAutoStatus("已停止；锚点指令已发送，但实测仍有偏差。", "warn");
+  function fixedPieces(){
+    var l=numberFrom("yawMax"), r=numberFrom("yawMin"), u=numberFrom("pitchMin"), d=numberFrom("pitchMax");
+    var o=[0,0], left=[l,0], right=[r,0], up=[0,u], down=[0,d];
+    var pieces=[
+      {id:"origin-left",label:"原点 → 左",poses:[o,left]},
+      {id:"left-right",label:"左 → 右",poses:[left,right]},
+      {id:"right-origin",label:"右 → 原点",poses:[right,o]},
+      {id:"origin-up",label:"原点 → 上",poses:[o,up]},
+      {id:"up-down",label:"上 → 下",poses:[up,down]},
+      {id:"down-origin",label:"下 → 原点",poses:[down,o]}
+    ];
+    if(numberFrom("pointMode")===8){
+      [["upper-left","左上",[l,u]],["upper-right","右上",[r,u]],["lower-right","右下",[r,d]],["lower-left","左下",[l,d]]].forEach(function(c){
+        pieces.push({id:c[0],label:"原点 → "+c[1]+" → 原点",poses:[o,c[2],o]});
       });
-    } else {
-      autoBusy = false;
-      setAutoInputsDisabled(false);
-      refreshButtons();
-      setAutoStatus(message, returnAnchor ? "warn" : "error");
     }
+    return pieces;
   }
-
-  async function returnToAnchor(config, token, kind, stillValid){
-    var lastResult = "timeout";
-    for(var attempt = 0; attempt < 2; attempt += 1){
-      if(!stillValid()) return "canceled";
-      var pose = commandStartPose();
-      var startYaw = clamp(pose.yaw, config.yawMin, config.yawMax);
-      var startPitch = clamp(pose.pitch, config.pitchMin, config.pitchMax);
-      var startRevisions = poseRevisions();
-      if(!sendGimbal(config.anchorYaw, config.anchorPitch, config.speedMax, config.speedMax, kind, { yaw:startYaw, pitch:startPitch })) return "canceled";
-      var travel = Math.max(Math.abs(config.anchorYaw - startYaw), Math.abs(config.anchorPitch - startPitch));
-      var result = await waitForPose(config.anchorYaw, config.anchorPitch, travel / config.speedMax + LEG_MARGIN_SECONDS, function(){ return token !== autoToken || !stillValid(); }, startRevisions);
-      if(result === "reached" || result === "estimated" || result === "canceled") return result;
-      lastResult = result;
-      if(attempt === 0) setTargetStatus("第一次未确认到达，正在重试锚点。", "warn");
-    }
-    return lastResult;
-  }
-
-  function sampleCameraworkCycle(config){
-    var anchorMs = config.anchorDwellSeconds * 1000 * randomBetween(1 - ANCHOR_DWELL_JITTER, 1 + ANCHOR_DWELL_JITTER);
-    var share = config.anchorTimePercent;
-    var roamMs = share <= 0 ? Infinity : (share >= 100 ? 0 : anchorMs * (100 - share) / share);
-    return { anchorMs:anchorMs, roamMs:roamMs };
-  }
-
-  function createCameraworkSchedule(config, now){
-    if(config.anchorTimePercent <= 0){
-      return { phase:"quadrants", deadline:Infinity, cycle:{ anchorMs:0, roamMs:Infinity }, serial:0 };
-    }
-    var cycle = sampleCameraworkCycle(config);
-    if(config.anchorTimePercent >= 100){
-      return { phase:"anchor", deadline:now + cycle.anchorMs, cycle:cycle, serial:1 };
-    }
-    // A new run always begins with a complete roaming interval. In particular,
-    // it must never appear halfway through an anchor hold.
-    return { phase:"quadrants", deadline:now + cycle.roamMs, cycle:cycle, serial:0 };
-  }
-
-  function advanceCameraworkSchedule(schedule, config, now){
-    if(schedule.phase === "anchor" && !Number.isFinite(schedule.deadline)) return schedule;
-    if(now < schedule.deadline) return schedule;
-    if(schedule.phase === "quadrants"){
-      schedule.phase = "anchor";
-      schedule.serial += 1;
-      // No deadline runs while the camera is returning to the anchor.
-      schedule.deadline = null;
-    } else {
-      schedule.cycle = sampleCameraworkCycle(config);
-      if(config.anchorTimePercent >= 100){
-        // The camera is already at the anchor. Renew a complete hold without a
-        // redundant movement command or carrying overdue time into the hold.
-        schedule.deadline = now + schedule.cycle.anchorMs;
-      } else {
-        schedule.phase = "quadrants";
-        schedule.deadline = now + schedule.cycle.roamMs;
-      }
-    }
-    return schedule;
-  }
-
-  function beginAnchorHold(schedule, now){
-    if(schedule.phase === "anchor" && !Number.isFinite(schedule.deadline)){
-      schedule.deadline = now + schedule.cycle.anchorMs;
-    }
-    return schedule;
-  }
-
-  function waitForScheduleBoundary(token, schedule){
-    return new Promise(function(resolve){
-      function check(){
-        if(!isAutoTokenActive(token) || Date.now() >= schedule.deadline){ resolve(); return; }
-        window.setTimeout(check, Math.min(200, schedule.deadline - Date.now()));
-      }
-      check();
+  function renderPieces(){
+    $("pieceChoices").innerHTML="";
+    fixedPieces().forEach(function(piece){
+      var label=document.createElement("label"), input=document.createElement("input");
+      input.type="checkbox"; input.value=piece.id; input.checked=true;
+      label.appendChild(input); label.appendChild(document.createTextNode(piece.label));
+      $("pieceChoices").appendChild(label);
     });
   }
-
-  function chooseNextQuadrant(previous){
-    var choices = [0, 1, 2, 3].filter(function(value){ return value !== previous; });
-    return choices[randomInteger(0, choices.length - 1)];
-  }
-
-  function integerHalfBounds(low, high, upperHalf){
-    var firstUpper = Math.ceil((low + high) / 2);
-    return upperHalf ? [firstUpper, high] : [low, firstUpper - 1];
-  }
-
-  function quadrantPose(quadrant, config){
-    var yawBounds = integerHalfBounds(config.yawMin, config.yawMax, Boolean(quadrant & 1));
-    var pitchBounds = integerHalfBounds(config.pitchMin, config.pitchMax, Boolean(quadrant & 2));
-    return [randomInteger(yawBounds[0], yawBounds[1]), randomInteger(pitchBounds[0], pitchBounds[1])];
-  }
-
   function setAutoStatus(text, kind){
-    $("autoStatus").textContent = text;
-    $("autoStatus").className = "status-line" + (kind ? " " + kind : "");
+    $("autoStatus").textContent=text;
+    $("autoStatus").className="status-line"+(kind ? " "+kind : "");
   }
-  function setAutoInputsDisabled(disabled){
-    Array.prototype.forEach.call(document.querySelectorAll(".auto-input"), function(input){ input.disabled = disabled; });
-    $("saveAutoConfig").disabled = disabled;
-    $("useActualAnchor").disabled = disabled || !hasFreshPose();
+  function cancelAutomatic(message){
+    autoRunning=false; autoToken+=1; refreshButtons(); setAutoStatus(message,"warn");
   }
-  function isAutoTokenActive(token){ return autoRunning && token === autoToken && isSocketOpen(); }
-
+  async function startAutomatic(){
+    if(autoRunning || !isSocketOpen()) return;
+    var l=numberFrom("yawMax"), r=numberFrom("yawMin"), u=numberFrom("pitchMin"), d=numberFrom("pitchMax"), speed=numberFrom("speedMax");
+    if(![l,r,u,d].every(Number.isInteger) || r>=0 || l<=0 || u>=0 || d<=0 || r< -90 || l>90 || u< -60 || d>15 || !isWholeSpeed(speed)){
+      setAutoStatus("范围必须包含原点；请检查角度和速度。","error"); return;
+    }
+    var selected=Array.prototype.map.call(document.querySelectorAll("#pieceChoices input:checked"),function(input){return input.value;});
+    var pieces=fixedPieces().filter(function(piece){return selected.indexOf(piece.id)>=0;});
+    if(!pieces.length){setAutoStatus("至少选择一个镜头。","error");return;}
+    autoRunning=true; autoToken+=1; manualToken+=1; var token=autoToken; refreshButtons();
+    async function move(pose, label){
+      if(token!==autoToken || !autoRunning) throw new Error("后续镜头已取消。");
+      if(!hasFreshPose()) throw new Error("缺少新的完整位置心跳，已停止后续镜头。");
+      var start=commandStartPose();
+      if(!sendGimbal(pose[0],pose[1],speed,speed,label,start)) throw new Error("发送失败。");
+      var result=await waitForPose(pose[0],pose[1],Math.max(Math.abs(pose[0]-start.yaw),Math.abs(pose[1]-start.pitch))/speed+8,function(){return token!==autoToken;},poseRevisions());
+      if(result!=="reached") throw new Error("未确认到位，后续镜头已停止（"+result+"）。");
+    }
+    try {
+      await move([0,0],"开始前回原点");
+      for(var i=0;i<pieces.length;i++){
+        var piece=pieces[i], first=piece.poses[0];
+        if(Math.abs(lastYaw-first[0])>POSE_TOLERANCE || Math.abs(lastPitch-first[1])>POSE_TOLERANCE) await move(first,"镜头准备");
+        setAutoStatus((i+1)+" / "+pieces.length+" · "+piece.label,"warn");
+        for(var j=1;j<piece.poses.length;j++) await move(piece.poses[j],piece.label);
+      }
+      if(Math.abs(lastYaw)>POSE_TOLERANCE || Math.abs(lastPitch)>POSE_TOLERANCE) await move([0,0],"结束后回原点");
+      if(token===autoToken) setAutoStatus("选定镜头已完成，已确认回到原点。","success");
+    } catch(error){ if(token===autoToken) setAutoStatus(error.message,"error"); }
+    finally { if(token===autoToken){autoRunning=false;refreshButtons();} }
+  }
   function refreshButtons(){
-    var ready = isSocketOpen();
-    $("manualSend").disabled = !ready || autoRunning || autoBusy;
-    $("manualCenter").disabled = !ready || autoRunning || autoBusy;
-    $("autoStart").disabled = !ready || autoRunning || autoBusy || !autoConfigured;
-    $("autoArrive").disabled = !autoRunning || autoStationary;
-    $("autoArrive").textContent = autoStationary ? "已模拟到达" : "模拟到达点位";
-    $("autoStop").disabled = !autoRunning;
-    $("useActualAnchor").disabled = autoRunning || autoBusy || !hasFreshPose();
+    $("manualSend").disabled=!isSocketOpen() || autoRunning;
+    $("manualCenter").disabled=!isSocketOpen() || autoRunning;
+    $("autoStart").disabled=!isSocketOpen() || autoRunning;
+    $("autoStop").disabled=!autoRunning;
+    Array.prototype.forEach.call(document.querySelectorAll(".auto-input, #pieceChoices input"),function(input){input.disabled=autoRunning;});
   }
-
   function switchTab(name){
-    var manual = name === "manual";
-    if(manual && autoRunning){
-      cancelAutomatic("正在停止自动运镜。", true);
-      return;
-    }
-    if(manual && autoBusy){
-      setAutoStatus("正在回到锚点，请完成后再切换。", "warn");
-      return;
-    }
-    $("manualPanel").hidden = !manual;
-    $("autoPanel").hidden = manual;
-    $("tabManual").classList.toggle("active", manual);
-    $("tabAuto").classList.toggle("active", !manual);
-    $("tabManual").setAttribute("aria-selected", String(manual));
-    $("tabAuto").setAttribute("aria-selected", String(!manual));
+    if(autoRunning){setAutoStatus("请先停止后续镜头，再切换控制方式。","warn");return;}
+    var manual=name==="manual";
+    $("manualPanel").hidden=!manual; $("autoPanel").hidden=manual;
+    $("tabManual").classList.toggle("active",manual); $("tabAuto").classList.toggle("active",!manual);
+    $("tabManual").setAttribute("aria-selected",String(manual)); $("tabAuto").setAttribute("aria-selected",String(!manual));
   }
 
   function logLine(label, kind, body){
@@ -1042,14 +699,7 @@ summary{ cursor:pointer; color:var(--text-muted); font-size:12px; font-weight:70
     var result = Number(value);
     return Number.isFinite(result) ? result : null;
   }
-  function savedNumber(value){
-    var result = toNumber(value);
-    return result === null ? NaN : result;
-  }
   function isWholeSpeed(value){ return Number.isInteger(value) && value >= 2 && value <= 5; }
-  function clamp(value, low, high){ return Math.min(high, Math.max(low, value)); }
-  function randomBetween(low, high){ return low + Math.random() * (high - low); }
-  function randomInteger(low, high){ return Math.floor(randomBetween(low, high + 1)); }
   function round1(value){ return Math.round(value * 10) / 10; }
   function formatAngle(value){ return Number.isFinite(value) ? round1(value).toFixed(1) + "°" : "–"; }
   function formatSigned(value){
@@ -1064,35 +714,10 @@ summary{ cursor:pointer; color:var(--text-muted); font-size:12px; font-weight:70
     try { window.localStorage.setItem(key, value); return true; }
     catch(error){ return false; }
   }
-  function storageRemove(key){ try { window.localStorage.removeItem(key); } catch(error){} }
-
-  function bestEffortAnchorBeforeUnload(){
-    if(!(autoRunning || autoBusy) || !activeAutoConfig || !isSocketOpen()) return;
-    var config = activeAutoConfig;
-    var pose = commandStartPose();
-    var command = {
-      gimbal_control: {
-        mode: MODE,
-        yaw_start: round1(clamp(pose.yaw, config.yawMin, config.yawMax)),
-        yaw_speed: config.speedMax,
-        yaw_end: config.anchorYaw,
-        pitch_start: round1(clamp(pose.pitch, config.pitchMin, config.pitchMax)),
-        pitch_speed: config.speedMax,
-        pitch_end: config.anchorPitch,
-        zoom_start: 1,
-        zoom_speed: 0,
-        zoom_end: 1
-      }
-    };
-    try { ws.send(JSON.stringify(command)); } catch(error){}
-    autoRunning = false;
-    autoBusy = false;
-    autoToken += 1;
-  }
 
   var savedUrl = storageGet("robot_ws_url");
   if(savedUrl) $("url").value = savedUrl;
-  loadAutoConfig();
+  renderPieces();
 
   $("btnConn").onclick = connect;
   $("btnDisc").onclick = disconnect;
@@ -1106,19 +731,10 @@ summary{ cursor:pointer; color:var(--text-muted); font-size:12px; font-weight:70
     $("manualPitch").value = 0;
     sendManual(0, 0, numberFrom("manualYawSpeed"), numberFrom("manualPitchSpeed"), "回到 0° / 0°");
   };
-  $("useActualAnchor").onclick = function(){
-    if(!hasFreshPose()) return;
-    $("anchorYaw").value = Math.round(lastYaw);
-    $("anchorPitch").value = Math.round(lastPitch);
-    markAutoDirty();
-  };
-  $("saveAutoConfig").onclick = saveAutoConfig;
-  $("autoStart").onclick = startAutomatic;
-  $("autoArrive").onclick = simulateArrival;
-  $("autoStop").onclick = function(){ cancelAutomatic("自动运镜已停止。", true); };
-  $("logClear").onclick = function(){ $("log").innerHTML = ""; };
-  Array.prototype.forEach.call(document.querySelectorAll(".auto-input"), function(input){ input.addEventListener("input", markAutoDirty); });
-  window.addEventListener("pagehide", bestEffortAnchorBeforeUnload);
+  $("autoStart").onclick=startAutomatic;
+  $("autoStop").onclick=function(){cancelAutomatic("后续镜头已取消；已发送动作可能继续完成，协议没有急停指令。");};
+  $("pointMode").onchange=renderPieces;
+  $("logClear").onclick=function(){$("log").innerHTML="";};
 
   window.setInterval(function(){
     if(Number.isFinite(lastYaw) || Number.isFinite(lastPitch)) renderActualPose();

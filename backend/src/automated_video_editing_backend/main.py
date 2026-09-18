@@ -1,13 +1,11 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import os
 import sys
 import threading
 from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager, suppress
-from pathlib import Path
 from typing import Any, TextIO
 
 import uvicorn
@@ -20,7 +18,8 @@ from automated_video_editing_backend.core.diagnostics import configure_diagnosti
 from automated_video_editing_backend.core.events import EventHub
 from automated_video_editing_backend.core.paths import GENERATED_DIRS, ensure_generated_dirs
 from automated_video_editing_backend.services.admin_access import AdminAccessService
-from automated_video_editing_backend.services.analysis import AnalysisService
+from automated_video_editing_backend.services.composition import CompositionService
+from automated_video_editing_backend.services.mapped_narration import MappedNarrationService
 from automated_video_editing_backend.services.capture import CaptureService
 from automated_video_editing_backend.services.cruise import CruiseService
 from automated_video_editing_backend.services.cruise_routes import CruiseRouteStore
@@ -259,7 +258,7 @@ async def _shutdown_robot_and_capture(
 def create_app() -> FastAPI:
     ensure_generated_dirs()
     configure_diagnostics(GENERATED_DIRS["logs"] / "diagnostics.log")
-    log_event("info", "backend.started", version="0.1.7")
+    log_event("info", "backend.started", version="0.1.8")
     abandoned_parts = cleanup_abandoned_download_parts(
         GENERATED_DIRS["data"] / "downloads"
     )
@@ -290,12 +289,13 @@ def create_app() -> FastAPI:
     vault = MediaVaultService(media)
     llm = LLMService(settings)
     tts = TTSService(settings, media)
-    analysis = AnalysisService()
     planner = EditPlanner()
     renderer = RenderService()
     seedance = SeedanceService(settings, media, renderer)
     encoding_slots = asyncio.Semaphore(1)
-    jobs = JobService(events, media, analysis, planner, renderer, settings, render_slots=encoding_slots)
+    jobs = JobService(events, media, None, planner, renderer, settings, render_slots=encoding_slots)
+    jobs.compositions = CompositionService(jobs)
+    jobs.narration = MappedNarrationService(jobs.compositions, llm, tts)
     media.captures.slots = encoding_slots
     media.captures.external_path_in_use = jobs.is_path_in_use
     renamer = MediaRenameService(media, jobs, seedance)
@@ -314,9 +314,11 @@ def create_app() -> FastAPI:
                 framing_test.close,
                 lambda: _shutdown_robot_and_capture(robot, capture),
             )
+            await jobs.narration.close()
+            await jobs.compositions.close()
             await media.captures.close()
 
-    app = FastAPI(title="Automated Video Editing Backend", version="0.1.7", lifespan=lifespan)
+    app = FastAPI(title="Automated Video Editing Backend", version="0.1.8", lifespan=lifespan)
     app.add_middleware(
         CORSMiddleware,
         # electron-vite serves the installed renderer from file://, whose browser origin is
@@ -350,24 +352,19 @@ app = create_app()
 
 
 if __name__ == "__main__":
-    if len(sys.argv) == 3 and sys.argv[1] == "--scene-detect-worker":
-        from automated_video_editing_backend.services.scene_detect_worker import detect
-
-        print(json.dumps(detect(Path(sys.argv[2]))))
-    else:
-        host = os.environ.get("APP_BACKEND_HOST", "127.0.0.1")
-        if host != "127.0.0.1":
-            raise SystemExit("Backend must bind to 127.0.0.1")
-        port = int(os.environ.get("APP_BACKEND_PORT", "4817"))
-        # Source and frozen builds intentionally serve the same object: importing by string in
-        # source mode would create a second app and leave the stdin watcher attached to the wrong
-        # server lifecycle.
-        asyncio.run(
-            _serve_backend(
-                app,
-                host,
-                port,
-                sys.stdin,
-                managed_by_electron=os.environ.get(_ELECTRON_MANAGED_ENV) == "1",
-            )
+    host = os.environ.get("APP_BACKEND_HOST", "127.0.0.1")
+    if host != "127.0.0.1":
+        raise SystemExit("Backend must bind to 127.0.0.1")
+    port = int(os.environ.get("APP_BACKEND_PORT", "4817"))
+    # Source and frozen builds intentionally serve the same object: importing by string in
+    # source mode would create a second app and leave the stdin watcher attached to the wrong
+    # server lifecycle.
+    asyncio.run(
+        _serve_backend(
+            app,
+            host,
+            port,
+            sys.stdin,
+            managed_by_electron=os.environ.get(_ELECTRON_MANAGED_ENV) == "1",
         )
+    )

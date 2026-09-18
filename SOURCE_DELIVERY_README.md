@@ -1,6 +1,6 @@
 # Automated Video Editing — external media tools source delivery
 
-Version: 0.1.7
+Version: 0.1.8
 
 This directory contains the application source, tests, build manifests, authored interface
 assets, and third-party notices for the external media tools edition.  It contains no version
@@ -37,12 +37,12 @@ These commands fetch pinned, checksum-verified fonts and the pinned semantic mod
 
 ## Build the external-media-tools Windows installer
 
-Install the backend without the optional `pyav` extra, prepare the retained assets, freeze with
+Install the backend, prepare the retained assets, freeze with
 `AVE_EXTERNAL_MEDIA_TOOLS=1`, and run the external Electron Builder target:
 
 ```powershell
 python -m pip install --upgrade pip pyinstaller
-python -m pip install -e "backend[beat,assets,dev]"
+python -m pip install -e "backend[assets,dev]"
 python scripts/prepare_assets.py --fonts-only
 python scripts/prepare_assets.py --semantic-only
 $env:AVE_EXTERNAL_MEDIA_TOOLS = "1"

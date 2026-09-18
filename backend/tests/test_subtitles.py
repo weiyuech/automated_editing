@@ -16,8 +16,6 @@ import re
 import subprocess
 from pathlib import Path
 
-import cv2
-import numpy as np
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -139,8 +137,18 @@ def source(tmp_path_factory, ffmpeg) -> str:
     return str(path)
 
 
+def _gray_pixels(path):
+    return subprocess.check_output([RenderService().ffmpeg_binary(), '-v', 'error', '-i', str(path),
+                                    '-frames:v', '1', '-pix_fmt', 'gray', '-f', 'rawvideo', 'pipe:1'])
+
+
+def _pixel_difference(left, right):
+    assert len(left) == len(right)
+    return [abs(a-b) for a, b in zip(left, right)]
+
+
 def _render(tmp_path, source: str, ffmpeg: str, name: str, *, font: str | None,
-            width: int = 640, height: int = 360) -> np.ndarray:
+            width: int = 640, height: int = 360) -> bytes:
     """Render one clip and return a frame from inside the cue, as pixels."""
     track = None
     if font is not None:
@@ -163,7 +171,7 @@ def _render(tmp_path, source: str, ffmpeg: str, name: str, *, font: str | None,
          "-frames:v", "1", "-update", "1", str(frame)],
         check=True,
     )
-    image = cv2.imread(str(frame), cv2.IMREAD_GRAYSCALE)
+    image = _gray_pixels(frame)
     assert image is not None, f"could not read back {frame}"
     return image
 
@@ -177,12 +185,12 @@ def test_subtitles_reach_the_picture_and_not_merely_the_arguments(tmp_path, sour
     plain = _render(tmp_path, source, ffmpeg, "plain", font=None)
     subtitled = _render(tmp_path, source, ffmpeg, "subbed", font="noto_sans_sc")
 
-    changed = int(np.count_nonzero(cv2.absdiff(plain, subtitled) > 40))
+    changed = sum(d > 40 for d in _pixel_difference(plain, subtitled))
     assert changed > 500, f"only {changed} pixels changed; nothing was drawn"
 
     # And it was drawn where subtitles go, not smeared over the whole frame.
-    top_half = cv2.absdiff(plain, subtitled)[: plain.shape[0] // 2]
-    assert np.count_nonzero(top_half > 40) == 0, "something was drawn outside the subtitle area"
+    top_half = _pixel_difference(plain, subtitled)[:len(plain)//2]
+    assert sum(d > 40 for d in top_half) == 0, "something was drawn outside the subtitle area"
 
 
 def test_each_bundled_font_renders_differently(tmp_path, source, ffmpeg):
@@ -201,7 +209,7 @@ def test_each_bundled_font_renders_differently(tmp_path, source, ffmpeg):
     for first in range(len(keys)):
         for second in range(first + 1, len(keys)):
             a, b = keys[first], keys[second]
-            differing = int(np.count_nonzero(cv2.absdiff(rendered[a], rendered[b]) > 40))
+            differing = sum(d > 40 for d in _pixel_difference(rendered[a], rendered[b]))
             assert differing > 200, (
                 f"{a} and {b} rendered near-identically ({differing} px differ) — "
                 "libass probably substituted one system font for both"
@@ -219,15 +227,15 @@ def test_text_stays_inside_the_frame_in_both_orientations(tmp_path, source, ffmp
                         width=width, height=height)
         subbed = _render(tmp_path, source, ffmpeg, f"sub-{name}", font="noto_sans_sc",
                          width=width, height=height)
-        diff = cv2.absdiff(plain, subbed)
-        assert np.count_nonzero(diff > 40) > 300, f"{name}: no text drawn"
+        diff = _pixel_difference(plain, subbed)
+        assert sum(d > 40 for d in diff) > 300, f"{name}: no text drawn"
 
-        drawn = np.argwhere(diff > 40)
-        rows, columns = drawn[:, 0], drawn[:, 1]
-        assert rows.min() > 0 and rows.max() < height - 1, f"{name}: text touches top/bottom edge"
-        assert columns.min() > 0 and columns.max() < width - 1, f"{name}: text touches a side"
+        drawn = [i for i,d in enumerate(diff) if d > 40]
+        rows, columns = [i//width for i in drawn], [i%width for i in drawn]
+        assert min(rows) > 0 and max(rows) < height - 1, f"{name}: text touches top/bottom edge"
+        assert min(columns) > 0 and max(columns) < width - 1, f"{name}: text touches a side"
         # And it sits in the lower part of the frame, not floating in the middle.
-        assert rows.min() > height * 0.5, f"{name}: subtitles are not near the bottom"
+        assert min(rows) > height * 0.5, f"{name}: subtitles are not near the bottom"
 
 
 # ── the timing relationship, which is the whole design ───────────────────────────────────────
@@ -766,15 +774,15 @@ def test_a_subtitled_export_also_yields_a_clean_master(tmp_path, source, ffmpeg)
         out = tmp_path / f"{name}.png"
         subprocess.run([ffmpeg, "-y", "-v", "error", "-ss", "1.5", "-i", path,
                         "-frames:v", "1", "-update", "1", str(out)], check=True)
-        return cv2.imread(str(out), cv2.IMREAD_GRAYSCALE)
+        return _gray_pixels(out)
 
     delivered, clean = frame_at(delivery, "d"), frame_at(master, "m")
-    differing = int(np.count_nonzero(cv2.absdiff(delivered, clean) > 40))
+    differing = sum(d > 40 for d in _pixel_difference(delivered, clean))
     assert differing > 300, "the two files look identical; the master still has subtitles"
 
     # And the difference is only where subtitles go, i.e. the master is the same edit.
-    top = cv2.absdiff(delivered, clean)[: delivered.shape[0] // 2]
-    assert np.count_nonzero(top > 40) == 0, "the master is a different edit, not just untitled"
+    top = _pixel_difference(delivered, clean)[:len(delivered)//2]
+    assert sum(d > 40 for d in top) == 0, "the master is a different edit, not just untitled"
 
 
 def test_master_is_not_reported_when_its_canonical_subtitles_cannot_be_saved(
@@ -1035,12 +1043,12 @@ def test_a_future_export_survives_restart_and_can_be_recut_from_its_master(
                  "-frames:v", "1", "-update", "1", str(frame)],
                 check=True,
             )
-            return cv2.imread(str(frame), cv2.IMREAD_GRAYSCALE)
+            return _gray_pixels(frame)
 
         rendered = frame_at(recut_delivery, "recut-delivery")
         clean = frame_at(recut_master, "recut-master")
         assert rendered is not None and clean is not None
-        assert np.count_nonzero(cv2.absdiff(rendered, clean) > 40) > 300
+        assert sum(d > 40 for d in _pixel_difference(rendered, clean)) > 300
     finally:
         for path in companions:
             path.unlink(missing_ok=True)
@@ -1481,153 +1489,6 @@ def test_asking_for_subtitles_without_a_voiceover_says_so(tmp_path):
     off = EditJobRequest(title="t", output_name="t.mp4", subtitles=False)
     assert EditPlanner()._subtitles(off, None, 1280, 720, quiet) is None
     assert quiet == []
-
-
-def test_the_planner_builds_cues_from_a_real_tts_sidecar(tmp_path, fonts_present):
-    """The path the app actually takes: a voiceover media item, its sidecar, and a job that
-    asked for subtitles. Tested end to end because the pieces each work in isolation and the
-    join between them — where the sidecar lives, and in what shape — is the part that rots."""
-    import json
-
-    from automated_video_editing_backend.core.models import (
-        AnalysisResult,
-        EditJobRequest,
-        MediaItem,
-    )
-    from automated_video_editing_backend.services.timeline import EditPlanner
-
-    audio = tmp_path / "旁白-001.mp3"
-    audio.write_bytes(b"not really audio")
-    sidecar = audio.with_suffix(".json")
-    # The shape tts.py writes.
-    sidecar.write_text(
-        json.dumps({
-            "text": NARRATION,
-            "duration_ms": 8000,
-            "timing_quality": "exact",
-            "words": _words(),
-        },
-                   ensure_ascii=False),
-        encoding="utf-8",
-    )
-    voiceover = MediaItem(
-        id="v1", name=audio.name, path=str(audio), kind="audio",
-        metadata={"role": "tts_voice", "metadata_path": str(sidecar)},
-    )
-
-    warnings: list[str] = []
-    request = EditJobRequest(title="t", output_name="t.mp4", subtitles=True,
-                             subtitle_font="smiley_sans", subtitle_size="large")
-    track = EditPlanner()._subtitles(request, voiceover, 1280, 720, warnings)
-
-    assert warnings == []
-    assert track is not None and len(track.cues) >= 2
-    assert track.timing_quality == "exact"
-    assert track.font == "smiley_sans"
-    assert track.size == subtitles.SIZE_PRESETS["large"]
-    assert "机器人" in track.cues[0].text
-
-    # And with the sidecar pointer absent, it is found by the paired stem instead.
-    unlinked = MediaItem(id="v2", name=audio.name, path=str(audio), kind="audio",
-                         metadata={"role": "tts_voice"})
-    assert EditPlanner()._subtitles(request, unlinked, 1280, 720, []) is not None
-
-    video = MediaItem(id="video", path=str(tmp_path / "video.mp4"), kind="video")
-    analysis = AnalysisResult(media_id=video.id, scenes=[{"start": 0, "end": 10}])
-    exact_timeline = EditPlanner().plan(
-        request.model_copy(update={"media_ids": [video.id]}),
-        [video],
-        [analysis],
-        None,
-        voiceover,
-        voiceover_duration=8.0,
-    )
-    assert exact_timeline.planning_diagnostics["subtitles"] == {
-        "requested": True,
-        "mode": "exact",
-        "label": "精确字幕",
-    }
-
-
-def test_planner_marks_estimated_subtitles_and_keeps_narration_when_estimation_is_impossible(
-    tmp_path, fonts_present,
-):
-    from automated_video_editing_backend.core.models import (
-        AnalysisResult,
-        EditJobRequest,
-        MediaItem,
-    )
-    from automated_video_editing_backend.services.timeline import EditPlanner
-
-    audio = tmp_path / "旁白.mp3"
-    audio.write_bytes(b"not really audio")
-    sidecar = audio.with_suffix(".json")
-    sidecar.write_text(json.dumps({
-        "text": "欢迎来到六和桥。这里是新品体验台。",
-        "words": [],
-    }, ensure_ascii=False), encoding="utf-8")
-    voiceover = MediaItem(
-        id="estimated",
-        path=str(audio),
-        kind="audio",
-        metadata={"role": "tts_voice", "metadata_path": str(sidecar)},
-    )
-    request = EditJobRequest(title="t", output_name="t.mp4", subtitles=True)
-    warnings: list[str] = []
-
-    track = EditPlanner()._subtitles(
-        request, voiceover, 1280, 720, warnings, voiceover_duration=4.2,
-    )
-
-    assert track is not None
-    assert track.timing_quality == "estimated"
-    assert "".join(cue.text for cue in track.cues) == "欢迎来到六和桥这里是新品体验台"
-    assert track.cues[-1].end == pytest.approx(4.2)
-    assert any("估算字幕" in warning for warning in warnings)
-
-    video = MediaItem(id="video", path=str(tmp_path / "video.mp4"), kind="video")
-    analysis = AnalysisResult(media_id=video.id, scenes=[{"start": 0, "end": 6}])
-    estimated_timeline = EditPlanner().plan(
-        request,
-        [video],
-        [analysis],
-        None,
-        voiceover,
-        voiceover_duration=4.2,
-    )
-    assert estimated_timeline.planning_diagnostics["subtitles"] == {
-        "requested": True,
-        "mode": "estimated",
-        "label": "估算字幕",
-    }
-
-    sidecar.write_text(json.dumps({"words": []}), encoding="utf-8")
-    narration_only_warnings: list[str] = []
-    unavailable = EditPlanner()._subtitles(
-        request,
-        voiceover,
-        1280,
-        720,
-        narration_only_warnings,
-        voiceover_duration=4.2,
-    )
-    assert unavailable is None
-    assert any("成片仍保留旁白" in warning for warning in narration_only_warnings)
-
-    narration_only_timeline = EditPlanner().plan(
-        request,
-        [video],
-        [analysis],
-        None,
-        voiceover,
-        voiceover_duration=4.2,
-    )
-    assert narration_only_timeline.subtitles is None
-    assert narration_only_timeline.planning_diagnostics["subtitles"] == {
-        "requested": True,
-        "mode": "narration_only",
-        "label": "仅旁白",
-    }
 
 
 def test_an_ffmpeg_without_libass_refuses_instead_of_dropping_the_text(tmp_path, monkeypatch):

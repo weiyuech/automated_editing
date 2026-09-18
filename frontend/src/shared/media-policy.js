@@ -35,9 +35,9 @@ export function itemRole(item) {
 
 export function isMediaPoolEligible(poolKind, item) {
   const role = itemRole(item)
-  if (poolKind === 'source') return item?.kind === 'video' && role === 'raw_video'
+  if (poolKind === 'source') return item?.kind === 'video' && role === 'raw_video' && !item?.metadata?.capture_group
   if (poolKind === 'music') return item?.kind === 'audio' && role === 'music'
-  if (poolKind === 'voiceover') return item?.kind === 'audio' && role === 'tts_voice'
+  if (poolKind === 'voiceover') return item?.kind === 'audio' && role === 'tts_voice' && (!item?.metadata?.binding_id || Boolean(item.metadata.bound_source_id))
   if (poolKind === 'effect') return item?.kind === 'video' && role === 'seedance_effect'
   return false
 }

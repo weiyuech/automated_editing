@@ -12,27 +12,14 @@ an engineering distribution audit, not legal advice and not a patent-licence opi
 
 - Electron and its Chromium/Node.js runtime, under their included BSD/MIT/LGPL-compatible
   notices.  Electron's Chromium media decoder is not the separately supplied FFmpeg tool.
-- Vue, Vite, FastAPI, Uvicorn, PyInstaller, NumPy, OpenCV, PySceneDetect, librosa, numba,
-  llvmlite, ONNX Runtime, tokenizers, and their transitive dependencies, under their included
-  MIT, ISC, BSD, Apache, MPL, LGPL, and runtime-exception terms.
-- OpenCV's Windows video-I/O component uses an LGPL-compatible FFmpeg build without x264/x265
-  GPL symbols, as verified by the release binary audit.
+- Vue, Vite, FastAPI, Uvicorn, Pydantic, HTTPX, websockets, PyInstaller, and their
+  transitive dependencies, under their included licence terms.
 
 ## Fonts
 
 Noto Sans SC, Noto Serif SC, and Smiley Sans are included under the SIL Open Font License 1.1.
 Their complete licence texts are included beside the font assets under
 `automated_video_editing_backend/assets/font_licenses`.
-
-## BAAI BGE semantic model
-
-The application includes the pinned INT8 ONNX conversion of `BAAI/bge-small-zh-v1.5` from
-`Xenova/bge-small-zh-v1.5` revision `75c43b0`.  The base model and FlagEmbedding project are
-released under the MIT License.  The licence text is included beside the model.
-
-- https://huggingface.co/BAAI/bge-small-zh-v1.5
-- https://huggingface.co/Xenova/bge-small-zh-v1.5
-- https://github.com/FlagOpen/FlagEmbedding
 
 ## Operator-supplied prerequisites
 
@@ -43,3 +30,11 @@ reviewing its licence and patent position, and complying with those terms.
 
 - https://ffmpeg.org/legal.html
 - https://ffmpeg.org/download.html
+
+## Local narration matching
+
+BAAI/bge-small-zh-v1.5 is included under the MIT license, using Xenova's INT8 ONNX conversion
+pinned at revision `75c43b0`. Model, tokenizer, and license downloads are verified by SHA-256 in
+`scripts/prepare_assets.py`. Its license is bundled in `assets/semantic/bge-small-zh-v1.5/`.
+NumPy (BSD), ONNX Runtime (MIT), tokenizers (Apache-2.0), and their dependencies retain their
+respective license terms. The model only compares text; it does not analyze images or beats.

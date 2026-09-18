@@ -165,43 +165,44 @@ class GimbalMoveRequest(BaseModel):
 
 
 class CameraworkProfile(BaseModel):
-    """Operator-owned automatic camerawork limits, all expressed as absolute poses.
+    """Fixed camera program inside operator bounds, always relative to physical (0, 0)."""
 
-    These limits deliberately match the narrower ranges already accepted by the manual
-    镜头控制 form. The anchor is a real resting pose, not the origin of relative offsets.
-    """
-
-    anchor_yaw: int = Field(default=0, ge=-90, le=90)
-    anchor_pitch: int = Field(default=0, ge=-60, le=15)
+    anchor_yaw: Literal[0] = 0
+    anchor_pitch: Literal[0] = 0
     anchor_zoom: float = Field(default=1.0, ge=1.0, le=3.5)
     yaw_min: int = Field(default=-60, ge=-90, le=90)
     yaw_max: int = Field(default=60, ge=-90, le=90)
     pitch_min: int = Field(default=-15, ge=-60, le=15)
     pitch_max: int = Field(default=15, ge=-60, le=15)
-    zoom_min: float = Field(default=1.0, ge=1.0, le=3.5)
-    zoom_max: float = Field(default=1.5, ge=1.0, le=3.5)
     # The robot firmware expects whole-number yaw/pitch speeds on the wire.
-    speed_min: int = Field(default=2, ge=2, le=5)
     speed_max: int = Field(default=5, ge=2, le=5)
-    # This is the only probability-like camerawork control exposed to operators.  It is
-    # implemented as a time share, not as a per-command random choice.
-    anchor_time_percent: int = Field(default=20, ge=0, le=100)
-    anchor_dwell_seconds: float = Field(default=5.0, ge=0.5, le=120.0)
+
+    point_mode: Literal[4, 8] = 4
+    piece_ids: list[str] | None = Field(default=None, max_length=10)
+
+    @model_validator(mode="before")
+    @classmethod
+    def fixed_origin(cls, value: Any) -> Any:
+        # Old profiles remain loadable; their anchor can never move the new origin.
+        if isinstance(value, Mapping):
+            return {**value, "anchor_yaw": 0, "anchor_pitch": 0}
+        return value
 
     @model_validator(mode="after")
     def validate_ranges_and_anchor(self) -> CameraworkProfile:
         ranges = (
             ("yaw", self.yaw_min, self.yaw_max, self.anchor_yaw),
             ("pitch", self.pitch_min, self.pitch_max, self.anchor_pitch),
-            ("zoom", self.zoom_min, self.zoom_max, self.anchor_zoom),
         )
         for name, low, high, anchor in ranges:
             if high <= low:
                 raise ValueError(f"{name}_max must be greater than {name}_min")
             if not low <= anchor <= high:
                 raise ValueError(f"anchor_{name} must be inside the configured {name} range")
-        if self.speed_max < self.speed_min:
-            raise ValueError("speed_max must be greater than or equal to speed_min")
+        if not self.yaw_min < 0 < self.yaw_max or not self.pitch_min < 0 < self.pitch_max:
+            raise ValueError("上下左右边界必须分布在原点 (0, 0) 两侧")
+        from automated_video_editing_backend.services.camera_program import camera_program
+        camera_program(self, self.piece_ids)
         return self
 
 
@@ -254,6 +255,8 @@ class CaptureSession(BaseModel):
 
 
 class CruisePoint(BaseModel):
+    # None inherits the saved program; [] deliberately records no camera sweep here.
+    piece_ids: list[str] | None = Field(default=None, max_length=10)
     path_name: str = Field(min_length=1, max_length=200)
     goal_id: int = Field(ge=0)
     # Legacy route compatibility only. CruiseService deliberately ignores this value: product
@@ -267,8 +270,7 @@ class CruiseRequest(BaseModel):
     points: list[CruisePoint] = Field(min_length=1, max_length=200)
     record: bool = True
     arrival_timeout_seconds: float = Field(default=60.0, ge=5.0, le=1800.0)
-    # Off by default. When enabled, one timed four-quadrant/anchor schedule spans both travel
-    # and point dwell. Zoom is still commanded only while the robot base is parked.
+    # Legacy API name retained: enables the fixed program at each parked route point.
     auto_camerawork: bool = False
 
     @model_validator(mode="before")
@@ -278,8 +280,8 @@ class CruiseRequest(BaseModel):
 
         Saved routes and older clients may still send these keys. They are consumed before
         normal validation so they remain loadable, but none survives in the active model or its
-        serialized output. Point dwell is now an execution detail; the only operator-controlled
-        camerawork pause is ``CameraworkProfile.anchor_dwell_seconds``.
+        serialized output. With the fixed program enabled, the selected pieces determine
+        the parked duration; legacy pause settings never change the program.
         """
         if not isinstance(value, Mapping):
             return value
@@ -294,6 +296,7 @@ class CruiseRequest(BaseModel):
 
 
 class CruiseSegment(BaseModel):
+    shots: list[dict[str, Any]] = Field(default_factory=list)
     index: int = Field(ge=0)
     path_name: str
     goal_id: int
@@ -475,7 +478,7 @@ class EditJobRequest(BaseModel):
     music_media_id: str | None = None
     voiceover_media_id: str | None = None
     output_name: str = ""
-    target_duration_seconds: float = Field(default=30.0, ge=1.0, le=180.0)
+    target_duration_seconds: float = Field(default=30.0, gt=0, le=86400, allow_inf_nan=False)
     mute_original_audio: bool = True
     beat_sync: bool = True
     # None lets the app-wide framing preset decide. Once a job is accepted JobService resolves
@@ -530,7 +533,7 @@ class EditBatchRequest(BaseModel):
     music_media_ids: list[str] = Field(default_factory=list, max_length=100)
     voiceover_media_ids: list[str] = Field(default_factory=list, max_length=100)
     output_count: int = Field(default=1, ge=1, le=100)
-    target_duration_seconds: float = Field(default=30.0, ge=1.0, le=180.0)
+    target_duration_seconds: float = Field(default=30.0, gt=0, le=86400, allow_inf_nan=False)
     mute_original_audio: bool = True
     beat_sync: bool = True
     output_aspect_ratio: OutputAspectRatio | None = None
@@ -584,7 +587,7 @@ class TimelineDraftRequest(BaseModel):
     capture_selections: list[CaptureSelection] = Field(default_factory=list, max_length=20)
     music_media_id: str | None = None
     voiceover_media_id: str | None = None
-    target_duration_seconds: float = Field(default=30.0, ge=1.0, le=180.0)
+    target_duration_seconds: float = Field(default=30.0, gt=0, le=86400, allow_inf_nan=False)
     mute_original_audio: bool = True
     beat_sync: bool = True
     output_aspect_ratio: OutputAspectRatio | None = None
@@ -744,7 +747,7 @@ class EditTimeline(BaseModel):
     output_fit: Literal["cover", "contain"] = "cover"
     output_crop_x: float = Field(default=0.5, ge=0, le=1)
     output_crop_y: float = Field(default=0.5, ge=0, le=1)
-    target_duration_seconds: float = Field(default=30.0, ge=1.0, le=180.0)
+    target_duration_seconds: float = Field(default=30.0, gt=0, le=86400, allow_inf_nan=False)
     markers: list[TimelineMarker] = Field(default_factory=list)
     # 手动微调 lays one unbroken soundtrack under the picture. Effects are placed as ordinary
     # clips, so no separate effect-placement list is needed.
@@ -1007,7 +1010,7 @@ class TTSGenerateRequest(BaseModel):
 
 
 class VoiceoverDraftRequest(BaseModel):
-    text: str = Field(default="", max_length=1500)
+    text: str = Field(default="", max_length=8000)
     target_seconds: float | None = Field(default=None, ge=1, le=600)
 
 

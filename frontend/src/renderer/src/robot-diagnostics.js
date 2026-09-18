@@ -130,6 +130,7 @@ export function commandContextLabel(context) {
     manual: '手动镜头控制',
     camera_sweep: '镜头移动',
     framing_test: '取景测试',
+    cruise_fixed_piece: '点位固定镜头',
     cruise_moving: '巡游行进运镜',
     cruise_stationary_camerawork: '自动运镜',
     cruise_stationary_anchor: '回到锚点',

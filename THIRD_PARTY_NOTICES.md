@@ -20,20 +20,17 @@ The application bundles Noto Sans SC and Noto Serif SC under the SIL Open Font L
 and Smiley Sans under its bundled open-font license. The complete license texts are included
 inside the application beside the font assets under `automated_video_editing_backend/assets/font_licenses`.
 
-## BAAI BGE semantic model
-
-The application bundles the INT8 ONNX conversion of `BAAI/bge-small-zh-v1.5` from the pinned
-`Xenova/bge-small-zh-v1.5` revision `75c43b0`. The base model and FlagEmbedding project are
-released under the MIT License. The complete license text is bundled beside the model under
-`automated_video_editing_backend/assets/semantic/bge-small-zh-v1.5`.
-
-- https://huggingface.co/BAAI/bge-small-zh-v1.5
-- https://huggingface.co/Xenova/bge-small-zh-v1.5
-- https://github.com/FlagOpen/FlagEmbedding
-
 ## Application dependencies
 
-Electron, Vue, Vite, FastAPI, Uvicorn, PyInstaller, OpenCV, PyAV, PySceneDetect, NumPy,
-librosa, numba, llvmlite, ONNX Runtime, tokenizers, and their transitive dependencies retain
-their respective licenses.
-Their package metadata is included in the packaged runtime where required.
+Electron, Vue, Vite, FastAPI, Uvicorn, Pydantic, HTTPX, websockets, PyInstaller,
+and their transitive dependencies retain their respective licenses. Their package metadata
+is included in the packaged runtime where required. Retired automatic video-analysis
+and beat-detection libraries are no longer bundled.
+
+## Local narration matching
+
+BAAI/bge-small-zh-v1.5 is included under the MIT license, using Xenova's INT8 ONNX conversion
+pinned at revision `75c43b0`. Model, tokenizer, and license downloads are verified by SHA-256 in
+`scripts/prepare_assets.py`. Its license is bundled in `assets/semantic/bge-small-zh-v1.5/`.
+NumPy (BSD), ONNX Runtime (MIT), tokenizers (Apache-2.0), and their dependencies retain their
+respective license terms. The model only compares text; it does not analyze images or beats.

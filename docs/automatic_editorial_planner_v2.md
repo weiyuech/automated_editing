@@ -1,3 +1,5 @@
+> 版本说明：本文保留改版前的设计记录。当前已改为固定镜头、树形精确拼接和显式旁白映射；旧自动选片、节拍与语义匹配规则不再执行。当前操作与实现以 [根 README](../README.md) 和 [改版说明](controlled_capture_concat_plan.md) 为准。
+
 # Automatic editorial planner v2
 
 This document is the developer view of the four customer-facing choices in 智能剪辑. 专业剪辑

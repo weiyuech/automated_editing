@@ -521,15 +521,15 @@ def test_deleting_an_effect_removes_its_files(tmp_path, seedance_root):
 def test_image_size_defaults_to_the_source_dimensions(tmp_path, seedance_root):
     """Ark accepts 'WIDTHxHEIGHT' or 2k/3k/4k. Pinning a preset upscaled every result, so a
     766x576 screenshot came back at 2464x1856 and read as an upscale rather than an edit."""
-    import cv2
-    import numpy as np
+    import subprocess
 
     settings = SettingsService(path=tmp_path / "settings.json")
     service = SeedanceService(settings, MediaService(path=tmp_path / "media-library.json"),
                               RenderService(), root=seedance_root)
 
     source = tmp_path / "shot.png"
-    cv2.imwrite(str(source), np.zeros((576, 766, 3), dtype=np.uint8))
+    subprocess.run([RenderService().ffmpeg_binary(), '-v', 'error', '-y', '-f', 'lavfi',
+                    '-i', 'color=black:s=766x576', '-frames:v', '1', str(source)], check=True)
     asset = SeedanceAsset(id="a", name="a.png", kind="image", output_path=str(tmp_path / "o.png"),
                           metadata_path=str(tmp_path / "a.json"), prompt="p",
                           source_image_path=str(source), created_at=utc_now())

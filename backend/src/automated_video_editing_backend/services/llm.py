@@ -66,7 +66,7 @@ class LLMService:
         """Draft narration solely from text the operator deliberately supplied for speech.
 
         Capture notes have a different job: they describe which point contains which subject
-        so the local semantic matcher can align an existing narration with the picture. Keeping
+        for explicit picture-to-speech mapping in the composition service. Keeping
         them out of this service makes it impossible for a filming reminder to become dialogue.
 
         ``target_seconds`` asks for a spoken length: it is turned into a target 字数 and the

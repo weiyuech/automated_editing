@@ -1,12 +1,9 @@
 from __future__ import annotations
 
 import asyncio
-import math
-import random
 import time
 from collections.abc import Callable
 from contextlib import suppress
-from contextvars import ContextVar
 from typing import Any
 
 from automated_video_editing_backend.core.diagnostics import log_event
@@ -26,45 +23,12 @@ from automated_video_editing_backend.core.models import (
 from automated_video_editing_backend.services.capture import CaptureService
 from automated_video_editing_backend.services.robot import RobotCommandNotSentError, RobotService
 
-# The four-quadrant planner has one deliberately hidden source of timing variation. Operators
-# choose one anchor duration; each real anchor window varies around it by at most 30%.
-_CW_ANCHOR_DWELL_JITTER = (0.70, 1.30)
-_CW_PHASE_QUADRANTS = "quadrants"
-_CW_PHASE_ANCHOR = "anchor"
-_CW_LEG_MARGIN = 0.6
-_CW_COMMAND_RETRY_SECONDS = 0.5
-_CW_ZOOM_SETTLE_SECONDS = 1.0
-_CW_POSE_TOLERANCE_DEG = 2.0
+from automated_video_editing_backend.services.camera_program import camera_program
+
+_CW_POSE_TOLERANCE_DEG = 0.5
 _CW_POSE_POLL_SECONDS = 0.2
 _CW_POSE_STABLE_SAMPLES = 2
-_CW_RUNNER_STOP_TIMEOUT_SECONDS = 3.0
-_FINAL_ANCHOR_TIMEOUT_SECONDS = 3.0
-# Route-point dwell is deliberately not an operator control. It only gives the robot a short,
-# usable stationary shot after navigation; non-recording trial runs skip it entirely.
-_POINT_DWELL_BASELINE_SECONDS = 7.5
-_DWELL_JITTER = (0.70, 1.30)
-# Operator-facing timeout configuration was removed. Keep one execution-level value so
-# legacy saved routes that still contain 180 seconds cannot silently restore the old behavior.
 _ARRIVAL_TIMEOUT_SECONDS = 60.0
-
-
-def _clamp(value: float, low: float, high: float) -> float:
-    return max(low, min(high, value))
-
-
-def _randomized_point_dwell_seconds(
-    baseline: float = _POINT_DWELL_BASELINE_SECONDS,
-) -> float:
-    return random.uniform(
-        baseline * _DWELL_JITTER[0],
-        baseline * _DWELL_JITTER[1],
-    )
-
-
-def _consume_background_task(task: asyncio.Task[Any]) -> None:
-    """Retrieve a detached task's result so a late failure is not reported as unhandled."""
-    with suppress(asyncio.CancelledError, Exception):
-        task.result()
 
 
 class CruisePreflightError(ValueError):
@@ -105,20 +69,9 @@ class CruiseService:
         self._origin_monotonic = 0.0
         self._capture_visit: CruiseSegment | None = None
         self._camerawork_config_provider = camerawork_config_provider or CameraworkConfig
-        # Our last commanded pitch/zoom. Zoom has no heartbeat feedback, so we track what we sent
-        # to use as the next leg's start; pitch is tracked for the same reason (start continuity).
-        self._cw_yaw = 0.0
-        self._cw_pitch = 0.0
+        # Zoom uses the last command; yaw/pitch always come from physical heartbeat samples.
         self._cw_zoom = 1.0
-        self._point_dwell_baseline_seconds = _POINT_DWELL_BASELINE_SECONDS
-        self._cw_generation = 0
-        self._cw_owner_generation: ContextVar[int | None] = ContextVar(
-            f"cruise_camerawork_owner_{id(self)}",
-            default=None,
-        )
-        self._reset_camerawork_runtime()
-        # (video_time, yaw, pitch) samples recorded during an auto-camerawork run, written beside
-        # the video so the grader can tell a slow pan over a plain surface from a true freeze.
+        self._point_dwell_baseline_seconds = 7.5
         self._telemetry: list[tuple[float, float, float]] = []
         self._telemetry_task: asyncio.Task[None] | None = None
 
@@ -128,25 +81,6 @@ class CruiseService:
     @property
     def is_running(self) -> bool:
         return self._starting or (self._task is not None and not self._task.done())
-
-    def _reset_camerawork_runtime(self) -> None:
-        """Create one clean planner/runner state for a service or a new cruise."""
-        self._cw_generation += 1
-        self._cw_phase: str | None = None
-        self._cw_phase_deadline = 0.0
-        self._cw_pending_anchor_seconds = 0.0
-        self._cw_anchor_commanded = False
-        self._cw_anchor_zoomed = False
-        self._cw_last_quadrant: int | None = None
-        self._cw_base_stationary = True
-        self._cw_stationary_until = 0.0
-        self._cw_base_state_changed = asyncio.Event()
-        # Serializes the complete parked zoom-out/return cycle with the transition back to
-        # transit.  The route may not declare the base moving (and therefore may not dispatch
-        # the next goal) while a stationary-only zoom cycle still owns the lens.
-        self._cw_stationary_zoom_lock = asyncio.Lock()
-        self._cw_runner_stop = asyncio.Event()
-        self._cw_runner_task: asyncio.Task[None] | None = None
 
     async def start(self, request: CruiseRequest) -> CruiseRun:
         run, _validation = await self._start(request)
@@ -180,14 +114,20 @@ class CruiseService:
                         "A manual capture is running; stop it before starting a cruise"
                     )
 
-                camerawork = (
-                    self._camerawork_config_provider() if request.auto_camerawork else None
-                )
+                camerawork = self._camerawork_config_provider() if request.auto_camerawork else None
                 if camerawork is not None and not camerawork.configured:
                     raise ValueError(
                         "Automatic camerawork is not configured; save it in 镜头设置 first"
                     )
 
+                if camerawork is not None:
+                    for point in request.points:
+                        camera_program(
+                            camerawork,
+                            point.piece_ids
+                            if point.piece_ids is not None
+                            else camerawork.piece_ids,
+                        )
                 validation = await self._preflight_request(request, route_id=route_id)
                 if self._cancel.is_set():
                     raise ValueError("Cruise start was canceled")
@@ -216,7 +156,6 @@ class CruiseService:
                     ],
                 )
                 self._run = run
-                self._reset_camerawork_runtime()
                 self._task = asyncio.create_task(self._execute(request, run, camerawork))
                 log_event(
                     "info",
@@ -366,8 +305,7 @@ class CruiseService:
                     field="path_name",
                     value=map_name,
                     message=(
-                        f"Robot returned no paths for map '{map_name}', "
-                        "so paths were not verified"
+                        f"Robot returned no paths for map '{map_name}', so paths were not verified"
                     ),
                 )
             )
@@ -404,7 +342,7 @@ class CruiseService:
             # command-side tracking here.
             if camerawork is not None:
                 self._cw_zoom = 1.0
-                await self._return_to_anchor(camerawork)
+                await self._move_to_pose((0, 0), camerawork)
 
             session = await self.capture.start(request.title)
             run.capture_session_id = session.id
@@ -425,21 +363,13 @@ class CruiseService:
                     raise
                 self.capture.remember_pending_media(session, recording_state.media_url)
                 try:
-                    self.capture.remember_recording_clock(session, confirmation_delay_seconds=self._elapsed(),
-                                                         quality="application_estimate")
+                    self.capture.remember_recording_clock(
+                        session,
+                        confirmation_delay_seconds=self._elapsed(),
+                        quality="application_estimate",
+                    )
                 except OSError:
                     run.warnings.append("录制对时信息暂存失败；完整视频仍会保存")
-            if camerawork is not None:
-                self._initialize_camerawork_schedule(camerawork)
-                generation = self._cw_generation
-                self._cw_runner_task = asyncio.create_task(
-                    self._run_owned_camerawork(
-                        camerawork,
-                        self._cw_runner_stop,
-                        generation,
-                    )
-                )
-
             if request.auto_camerawork and request.record:
                 self._telemetry_task = asyncio.create_task(self._sample_telemetry())
 
@@ -466,7 +396,7 @@ class CruiseService:
             run.status = "failed"
             run.error = str(exc)
         finally:
-            camerawork_quiesced = await self._stop_camerawork_runner()
+            camerawork_quiesced = True
             await self._finish(
                 request,
                 run,
@@ -487,18 +417,13 @@ class CruiseService:
         camerawork: CameraworkConfig | None,
     ) -> None:
         self._capture_visit = segment
-        if camerawork is not None and not await self._begin_camerawork_transit():
-            segment.status = "skipped"
-            segment.departed_at_seconds = self._elapsed()
-            return
         if self._cancel.is_set():
             segment.status = "skipped"
             segment.departed_at_seconds = self._elapsed()
             return
 
-        # Only announce transit after the stationary zoom gate has released and cancellation has
-        # been re-checked. The robot protocol has no stop-motion command, so sending a new goal
-        # after the operator cancels would be irreversible.
+        # The previous point's entire program has completed before this method can run.
+        # The protocol has no stop-motion command; never dispatch after cancellation.
         segment.status = "navigating"
         segment.transit_start_seconds = self._elapsed()
         log_event(
@@ -521,19 +446,13 @@ class CruiseService:
         except ConnectionError:
             self._record_capture_transition(run, "navigation_uncertain")
             # The robot is gone; failing every remaining point one by one would be noise.
-            if camerawork is not None:
-                self._set_camerawork_stationary(True)
             raise
         except Exception as exc:
-            if camerawork is not None:
-                self._set_camerawork_stationary(True)
             await self._fail_segment(run, segment, str(exc))
             return
 
         if not _goal_accepted(result):
             self._record_capture_transition(run, "goal_rejected")
-            if camerawork is not None:
-                self._set_camerawork_stationary(True)
             await self._fail_segment(run, segment, "Robot rejected the goal (goal_check false)")
             return
 
@@ -554,10 +473,6 @@ class CruiseService:
             point_index=segment.index,
             result=arrival,
         )
-        if camerawork is not None:
-            # Preserve the current phase and in-flight target. The one route-wide runner merely
-            # learns that zoom is now safe; it does not redraw a target at the arrival boundary.
-            self._set_camerawork_stationary(True)
         if arrival == "canceled":
             segment.status = "skipped"
             segment.departed_at_seconds = self._elapsed()
@@ -567,7 +482,11 @@ class CruiseService:
             return
 
         segment.status = "arrived"
-        segment.arrived_at_seconds = segment.arrived_at_seconds if segment.arrived_at_seconds is not None else self._elapsed()
+        segment.arrived_at_seconds = (
+            segment.arrived_at_seconds
+            if segment.arrived_at_seconds is not None
+            else self._elapsed()
+        )
         self._record_capture_transition(run, "goal_done")
         marker = await self.capture.add_marker(
             segment.arrived_at_seconds,
@@ -577,7 +496,16 @@ class CruiseService:
             run.markers.append(marker)
         await self._publish_segment("CRUISE_POINT_ARRIVED", run, segment)
 
-        await self._dwell(record=request.record, camerawork=camerawork)
+        if camerawork is not None:
+            selected = request.points[segment.index].piece_ids
+            try:
+                await self._run_camera_program(run, segment, camerawork, selected)
+            except Exception as exc:
+                segment.error = str(exc)
+                await self._publish_segment("CRUISE_SHOT_FAILED", run, segment)
+                raise
+        elif request.record:
+            await self._sleep_or_cancel(self._point_dwell_baseline_seconds)
 
         segment.departed_at_seconds = self._elapsed()
         segment.dwell_seconds = segment.departed_at_seconds - segment.arrived_at_seconds
@@ -605,256 +533,6 @@ class CruiseService:
                     with suppress(asyncio.CancelledError):
                         await task
 
-    async def _dwell(
-        self,
-        *,
-        record: bool,
-        camerawork: CameraworkConfig | None,
-    ) -> None:
-        """Create an internal stationary capture window after a navigation arrival.
-
-        This is not a pause between camera targets and is intentionally absent from the request
-        schema. A non-recording one-point trial must return immediately. During a real recording,
-        quadrant motion can continue; zoom remains restricted to an anchor phase that overlaps
-        this stationary window.
-        """
-        dwell = (
-            _randomized_point_dwell_seconds(self._point_dwell_baseline_seconds)
-            if record
-            else 0.0
-        )
-        deadline = time.monotonic() + dwell
-        if camerawork is not None:
-            self._set_camerawork_stationary(True, until=deadline)
-        remaining = max(0.0, deadline - time.monotonic())
-        if remaining > 0:
-            await self._sleep_or_cancel(remaining)
-
-    def _set_camerawork_stationary(
-        self,
-        stationary: bool,
-        *,
-        until: float | None = None,
-    ) -> None:
-        stationary_until = float(until or 0.0) if stationary else 0.0
-        if (
-            self._cw_base_stationary == stationary
-            and self._cw_stationary_until == stationary_until
-        ):
-            return
-        self._cw_base_stationary = stationary
-        self._cw_stationary_until = stationary_until
-        self._cw_base_state_changed.set()
-
-    async def _begin_camerawork_transit(self) -> bool:
-        """Close parked zoom before navigation; false means cancellation won the gate."""
-        async with self._cw_stationary_zoom_lock:
-            if self._cancel.is_set():
-                return False
-            self._set_camerawork_stationary(False)
-            return True
-
-    async def _stop_camerawork_runner(self) -> bool:
-        """Retire the route-wide camera owner and report whether it actually exited."""
-        task = self._cw_runner_task
-        self._cw_runner_task = None
-        if task is None:
-            return True
-        # Revoke physical-command and state-mutation ownership, then wake every cooperative wait.
-        # Do not cancel here: cancelling while HardwareRobotAdapter is inside websocket.send()
-        # deliberately closes the transport because the frame may be partial. That would make
-        # the following recording Stop race a reconnect. Once an in-flight command returns, each
-        # production checkpoint sees the stale generation and exits without another command.
-        self._cw_generation += 1
-        self._cw_runner_stop.set()
-        self._cw_base_state_changed.set()
-        done, _pending = await asyncio.wait(
-            {task},
-            timeout=_CW_RUNNER_STOP_TIMEOUT_SECONDS,
-        )
-        if task in done:
-            with suppress(asyncio.CancelledError, Exception):
-                task.result()
-            return True
-        # Camera motion must never own the recording lifecycle. Keep the retired task detached
-        # (and deliberately uncancelled) so a wedged/slow send cannot tear down the shared socket
-        # immediately before finalization sends recording Stop.
-        log_event(
-            "error",
-            "cruise.camerawork.stop_timeout",
-            run_id=self._run.id if self._run else None,
-            timeout_seconds=_CW_RUNNER_STOP_TIMEOUT_SECONDS,
-        )
-        task.add_done_callback(_consume_background_task)
-        return False
-
-    async def _return_to_final_anchor(self, config: CameraworkConfig) -> None:
-        """Issue the post-capture resting command without letting it own run completion."""
-        generation = self._cw_generation
-
-        async def command() -> None:
-            owner = self._cw_owner_generation.set(generation)
-            try:
-                await self._return_to_anchor(config, wait=False)
-            finally:
-                self._cw_owner_generation.reset(owner)
-
-        task = asyncio.create_task(command())
-        done, _pending = await asyncio.wait(
-            {task},
-            timeout=_FINAL_ANCHOR_TIMEOUT_SECONDS,
-        )
-        if task in done:
-            with suppress(asyncio.CancelledError, Exception):
-                task.result()
-            return
-
-        # Revoke ownership before detaching. A transport that suppresses cancellation may finish
-        # its already-written command later, but it cannot update this or a subsequent run.
-        self._cw_generation += 1
-        task.cancel()
-        task.add_done_callback(_consume_background_task)
-        log_event(
-            "error",
-            "cruise.camerawork.final_anchor_timeout",
-            run_id=self._run.id if self._run else None,
-            timeout_seconds=_FINAL_ANCHOR_TIMEOUT_SECONDS,
-        )
-
-    async def _run_owned_camerawork(
-        self,
-        config: CameraworkConfig,
-        stop_requested: asyncio.Event,
-        generation: int,
-    ) -> None:
-        owner = self._cw_owner_generation.set(generation)
-        try:
-            await self._run_camerawork(config, stop_requested)
-        finally:
-            self._cw_owner_generation.reset(owner)
-
-    def _camerawork_owner_is_current(self) -> bool:
-        """Direct lifecycle calls are allowed; retired runner tasks are not."""
-        owner_context = getattr(self, "_cw_owner_generation", None)
-        if owner_context is None:
-            return True
-        owner = owner_context.get()
-        return owner is None or owner == self._cw_generation
-
-    @staticmethod
-    def _axis_halves(low: int, high: int) -> tuple[tuple[int, int], tuple[int, int]]:
-        """Split an inclusive integer range into non-empty lower and upper halves."""
-        upper_start = math.ceil((low + high) / 2.0)
-        return (low, upper_start - 1), (upper_start, high)
-
-    def _quadrant_bounds(
-        self,
-        quadrant: int,
-        config: CameraworkConfig,
-    ) -> tuple[tuple[int, int], tuple[int, int]]:
-        """Return one of the four yaw × pitch regions inside the operator's limits."""
-        yaw_low, yaw_high = self._axis_halves(config.yaw_min, config.yaw_max)
-        pitch_low, pitch_high = self._axis_halves(config.pitch_min, config.pitch_max)
-        bounds = {
-            1: (yaw_low, pitch_low),
-            2: (yaw_high, pitch_low),
-            3: (yaw_low, pitch_high),
-            4: (yaw_high, pitch_high),
-        }
-        return bounds[quadrant]
-
-    def _next_quadrant_target(
-        self,
-        config: CameraworkConfig,
-    ) -> tuple[int, tuple[float, float]]:
-        """Pick any quadrant except the immediately previous one, then a pose inside it."""
-        choices = [quadrant for quadrant in range(1, 5) if quadrant != self._cw_last_quadrant]
-        quadrant = random.choice(choices)
-        yaw_bounds, pitch_bounds = self._quadrant_bounds(quadrant, config)
-        return quadrant, (
-            random.randint(*yaw_bounds),
-            random.randint(*pitch_bounds),
-        )
-
-    def _camerawork_cycle_durations(
-        self,
-        config: CameraworkConfig,
-    ) -> tuple[float, float]:
-        """Return the roam budget and full post-arrival anchor hold for one cycle.
-
-        The requested percentage divides deliberate roam/hold time. Travel back to the anchor is
-        excluded because the operator's N seconds begins only after the anchor has been reached.
-        """
-        if config.anchor_time_percent <= 0:
-            return math.inf, 0.0
-        anchor_seconds = config.anchor_dwell_seconds * random.uniform(
-            *_CW_ANCHOR_DWELL_JITTER,
-        )
-        if config.anchor_time_percent >= 100:
-            return 0.0, anchor_seconds
-        quadrant_seconds = anchor_seconds * (
-            (100.0 - config.anchor_time_percent) / config.anchor_time_percent
-        )
-        return quadrant_seconds, anchor_seconds
-
-    def _enter_anchor_phase(self, seconds: float) -> None:
-        self._cw_phase = _CW_PHASE_ANCHOR
-        self._cw_pending_anchor_seconds = seconds
-        # There is no anchor deadline while travelling home. It is established only after the
-        # move has completed by heartbeat confirmation or its conservative travel budget.
-        self._cw_phase_deadline = math.inf
-        self._cw_anchor_commanded = False
-        self._cw_anchor_zoomed = False
-        # Anchor is a fifth timed state, not a reset of quadrant history. The next sweeping
-        # target still comes from one of the three quadrants other than the last one used.
-
-    def _start_camerawork_cycle(
-        self,
-        config: CameraworkConfig,
-        starts_at: float,
-    ) -> None:
-        quadrant_seconds, anchor_seconds = self._camerawork_cycle_durations(config)
-        self._cw_pending_anchor_seconds = anchor_seconds
-        if config.anchor_time_percent >= 100:
-            self._enter_anchor_phase(anchor_seconds)
-            return
-        self._cw_phase = _CW_PHASE_QUADRANTS
-        self._cw_phase_deadline = math.inf if math.isinf(quadrant_seconds) else (
-            starts_at + quadrant_seconds
-        )
-        self._cw_anchor_commanded = False
-        self._cw_anchor_zoomed = False
-
-    def _initialize_camerawork_schedule(self, config: CameraworkConfig) -> None:
-        """Start a complete cycle; never enter halfway through a promised anchor hold."""
-        now = time.monotonic()
-        self._cw_last_quadrant = None
-        self._start_camerawork_cycle(config, now)
-
-    def _advance_camerawork_schedule(
-        self,
-        config: CameraworkConfig,
-        transition_at: float,
-    ) -> None:
-        if self._cw_phase == _CW_PHASE_QUADRANTS:
-            self._enter_anchor_phase(self._cw_pending_anchor_seconds)
-            return
-        if config.anchor_time_percent >= 100 and self._cw_anchor_commanded:
-            # At 100% the camera never leaves the anchor. Renew the randomized hold/zoom window
-            # in place instead of pretending to enter a new anchor state and resending the same
-            # yaw/pitch command at every boundary.
-            _quadrant_seconds, anchor_seconds = self._camerawork_cycle_durations(config)
-            self._cw_pending_anchor_seconds = anchor_seconds
-            self._cw_phase_deadline = transition_at + anchor_seconds
-            self._cw_anchor_zoomed = False
-            return
-        self._start_camerawork_cycle(config, transition_at)
-
-    def _current_yaw(self, config: CameraworkConfig) -> float:
-        heartbeat = self.robot.heartbeat_yaw()
-        value = heartbeat if heartbeat is not None else self._cw_yaw
-        return _clamp(value, config.yaw_min, config.yaw_max)
-
     def _heartbeat_pitch(self) -> float | None:
         reader = getattr(self.robot, "heartbeat_pitch", None)
         return reader() if callable(reader) else None
@@ -863,10 +541,81 @@ class CruiseService:
         reader = getattr(self.robot, "heartbeat_revision", None)
         return reader() if callable(reader) else None
 
-    def _current_pitch(self, config: CameraworkConfig) -> float:
-        heartbeat = self._heartbeat_pitch()
-        value = heartbeat if heartbeat is not None else self._cw_pitch
-        return _clamp(value, config.pitch_min, config.pitch_max)
+    async def _move_to_pose(self, target: tuple[float, float], config: CameraworkConfig) -> None:
+        """One command, then fresh physical confirmation. A timeout never means arrival."""
+        if self._cancel.is_set():
+            raise asyncio.CancelledError
+        yaw, pitch = self.robot.heartbeat_yaw(), self._heartbeat_pitch()
+        if yaw is None or pitch is None:
+            raise ValueError("缺少云台角度反馈，已停止后续导航；请检查机器人心跳")
+        speed = config.speed_max
+        await asyncio.wait_for(
+            self.robot.set_gimbal(
+                GimbalMoveRequest(
+                    yaw_start=yaw,
+                    yaw_end=target[0],
+                    yaw_speed=speed,
+                    pitch_start=pitch,
+                    pitch_end=target[1],
+                    pitch_speed=speed,
+                    zoom_start=self._cw_zoom,
+                    zoom_end=config.anchor_zoom,
+                ),
+                context="cruise_fixed_piece",
+            ),
+            timeout=10,
+        )
+        revision = self._heartbeat_revision()
+        self._cw_zoom = config.anchor_zoom
+        budget = max(abs(target[0] - yaw), abs(target[1] - pitch)) / speed + 8.0
+        reached, _ = await self._await_camerawork_pose(*target, budget, after_revision=revision)
+        if self._cancel.is_set():
+            raise asyncio.CancelledError
+        if not reached:
+            raise ValueError(f"云台未确认到达 ({target[0]}, {target[1]})；已停止后续镜头和导航")
+
+    async def _run_camera_program(self, run, segment, config, selected) -> None:
+        pieces = camera_program(config, config.piece_ids if selected is None else selected)
+
+        async def record_piece(key, label, targets, kind):
+            shot = {
+                "id": key,
+                "label": label,
+                "kind": kind,
+                "start": self._elapsed(),
+                "end": None,
+                "status": "running",
+                "boundary_source": "command_to_pose_feedback",
+            }
+            segment.shots.append(shot)
+            await self._publish_segment("CRUISE_SHOT_STARTED", run, segment)
+            try:
+                for target in targets:
+                    await self._move_to_pose(target, config)
+                shot["status"] = "complete"
+            finally:
+                shot["end"] = self._elapsed()
+                if shot["status"] != "complete":
+                    shot["status"] = "incomplete"
+                await self._publish_segment("CRUISE_SHOT_FINISHED", run, segment)
+
+        previous = (0, 0)
+        for piece in pieces:
+            if self._cancel.is_set():
+                raise asyncio.CancelledError
+            # Even an unchanged intended pose may have drifted during chassis navigation.
+            observed = (self.robot.heartbeat_yaw(), self._heartbeat_pitch())
+            if previous != piece.poses[0] or any(
+                value is None or abs(value - desired) > _CW_POSE_TOLERANCE_DEG
+                for value, desired in zip(observed, piece.poses[0])
+            ):
+                await record_piece(
+                    f"prepare-{piece.id}", "镜头准备", [piece.poses[0]], "preparation"
+                )
+            await record_piece(piece.id, piece.label, piece.poses[1:], "shot")
+            previous = piece.poses[-1]
+        if previous != (0, 0):
+            await record_piece("return-origin", "回原点准备", [(0, 0)], "preparation")
 
     async def _await_camerawork_pose(
         self,
@@ -875,18 +624,13 @@ class CruiseService:
         budget: float,
         after_revision: int | None = None,
     ) -> tuple[bool, bool]:
-        """Wait for consecutive physical yaw/pitch samples, or use the time budget as fallback.
-
-        The second result says whether complete heartbeat feedback was seen. Callers may retry a
-        missed anchor only when the robot actually reported a different pose; no-feedback robots
-        already consumed the conservative travel budget and must not be commanded twice blindly.
-        """
+        """Require two distinct, post-command physical samples; expiry is never success."""
         deadline = time.monotonic() + max(0.0, budget)
         stable = 0
         observed = False
         last_revision = after_revision
         while time.monotonic() < deadline:
-            if not self._camerawork_owner_is_current() or self._cancel.is_set():
+            if self._cancel.is_set():
                 return False, observed
             yaw = self.robot.heartbeat_yaw()
             pitch = self._heartbeat_pitch()
@@ -894,9 +638,7 @@ class CruiseService:
             # A pose is usable only when the adapter reports a new complete yaw+pitch
             # heartbeat sample. Treating ``revision is None`` as fresh would repeatedly
             # count cached split-axis values at startup and could falsely confirm arrival.
-            fresh = revision is not None and (
-                last_revision is None or revision > last_revision
-            )
+            fresh = revision is not None and (last_revision is None or revision > last_revision)
             if fresh and yaw is not None and pitch is not None:
                 observed = True
                 last_revision = revision
@@ -912,364 +654,6 @@ class CruiseService:
             await asyncio.sleep(min(_CW_POSE_POLL_SECONDS, max(0.0, deadline - time.monotonic())))
         return False, observed
 
-    async def _camerawork_leg(
-        self,
-        target: tuple[float, float],
-        speed: float,
-        config: CameraworkConfig,
-        *,
-        quadrant: int | None = None,
-        context: str = "cruise_moving",
-    ) -> bool:
-        """One slow move to a fresh yaw/pitch target; zoom remains fixed.
-
-        A failed gimbal command must never break the cruise, so anything short of a lost
-        connection is swallowed. Fresh yaw/pitch feedback can confirm arrival; otherwise the
-        travel ÷ speed budget allows both axes time to move before the next command.
-        """
-        start_yaw = self._current_yaw(config)
-        start_pitch = self._current_pitch(config)
-        target_yaw, target_pitch = target
-        if not self._camerawork_owner_is_current():
-            return False
-        command = GimbalMoveRequest(
-            yaw_start=start_yaw, yaw_end=target_yaw, yaw_speed=speed,
-            pitch_start=start_pitch, pitch_end=target_pitch, pitch_speed=speed,
-            zoom_start=self._cw_zoom, zoom_end=self._cw_zoom,
-        )
-        try:
-            if not self._camerawork_owner_is_current():
-                return False
-            await self.robot.set_gimbal(command, context=context)
-        except ConnectionError:
-            raise
-        except Exception:
-            return False
-        if not self._camerawork_owner_is_current():
-            return False
-        # Capture the boundary after the command is written so no pre-command heartbeat can
-        # be mistaken for feedback to this target.
-        heartbeat_revision = self._heartbeat_revision()
-        self._cw_yaw = target_yaw
-        self._cw_pitch = target_pitch
-        if quadrant is not None:
-            self._cw_last_quadrant = quadrant
-        travel = max(abs(target_yaw - start_yaw), abs(target_pitch - start_pitch))
-        budget = (travel / speed + _CW_LEG_MARGIN) if speed > 0 else _CW_LEG_MARGIN
-        await self._await_camerawork_pose(
-            target_yaw,
-            target_pitch,
-            budget,
-            after_revision=heartbeat_revision,
-        )
-        return self._camerawork_owner_is_current() and not self._cancel.is_set()
-
-    async def _run_camerawork(
-        self,
-        config: CameraworkConfig,
-        stop_requested: asyncio.Event,
-    ) -> None:
-        """Own gimbal targets for the complete recording, across travel and point dwell."""
-        if self._cw_phase is None:
-            self._initialize_camerawork_schedule(config)
-        while (
-            self._camerawork_owner_is_current()
-            and not self._cancel.is_set()
-            and not stop_requested.is_set()
-        ):
-            now = time.monotonic()
-            if now >= self._cw_phase_deadline:
-                # A leg that began inside the roam budget always gets its complete physical/
-                # estimated arrival wait. Start the next state from *now* instead of catching up
-                # across stale deadlines: no anchor hold may be shortened or skipped.
-                self._advance_camerawork_schedule(config, now)
-                continue
-
-            phase_deadline = self._cw_phase_deadline
-            if self._cw_phase == _CW_PHASE_QUADRANTS:
-                quadrant, target = self._next_quadrant_target(config)
-                speed = random.randint(config.speed_min, config.speed_max)
-                moved = await self._camerawork_leg(
-                    target,
-                    speed,
-                    config,
-                    quadrant=quadrant,
-                    context=(
-                        "cruise_stationary_camerawork"
-                        if self._cw_base_stationary else "cruise_moving"
-                    ),
-                )
-                if not self._camerawork_owner_is_current():
-                    return
-                if not moved:
-                    await self._wait_for_camerawork_boundary(
-                        min(
-                            _CW_COMMAND_RETRY_SECONDS,
-                            max(0.0, phase_deadline - time.monotonic()),
-                        ),
-                        stop_requested,
-                    )
-                continue
-
-            if not self._cw_anchor_commanded:
-                moved = await self._camerawork_leg(
-                    (config.anchor_yaw, config.anchor_pitch),
-                    config.speed_max,
-                    config,
-                    context=(
-                        "cruise_stationary_camerawork"
-                        if self._cw_base_stationary else "cruise_moving"
-                    ),
-                )
-                if not self._camerawork_owner_is_current():
-                    return
-                if moved:
-                    self._cw_anchor_commanded = True
-                    # This is the only place the N±30% anchor timer starts. The preceding
-                    # heartbeat/estimated travel wait is therefore never charged to the hold.
-                    self._cw_phase_deadline = (
-                        time.monotonic() + self._cw_pending_anchor_seconds
-                    )
-                    phase_deadline = self._cw_phase_deadline
-                else:
-                    await self._wait_for_camerawork_boundary(
-                        _CW_COMMAND_RETRY_SECONDS,
-                        stop_requested,
-                    )
-                    continue
-
-            zoom_deadline = min(phase_deadline, self._cw_stationary_until)
-            if (
-                self._cw_base_stationary
-                and not self._cw_anchor_zoomed
-                and zoom_deadline > time.monotonic()
-            ):
-                handled = await self._parked_zoom_and_anchor(
-                    config,
-                    deadline=zoom_deadline,
-                )
-                if not self._camerawork_owner_is_current():
-                    return
-                if handled:
-                    self._cw_anchor_zoomed = True
-                else:
-                    await self._wait_for_camerawork_boundary(
-                        min(
-                            _CW_COMMAND_RETRY_SECONDS,
-                            max(0.0, zoom_deadline - time.monotonic()),
-                        ),
-                        stop_requested,
-                    )
-                    continue
-
-            remaining = phase_deadline - time.monotonic()
-            if remaining > 0:
-                await self._wait_for_camerawork_boundary(remaining, stop_requested)
-
-    async def _wait_for_camerawork_boundary(
-        self,
-        seconds: float,
-        stop_requested: asyncio.Event,
-    ) -> None:
-        """Wait for a phase edge while remaining interruptible by arrival or cancellation."""
-        if not self._camerawork_owner_is_current():
-            return
-        base_state_changed = self._cw_base_state_changed
-        local_stop = asyncio.create_task(stop_requested.wait())
-        canceled = asyncio.create_task(self._cancel.wait())
-        base_changed = asyncio.create_task(base_state_changed.wait())
-        try:
-            await asyncio.wait(
-                {local_stop, canceled, base_changed},
-                timeout=max(0.0, seconds),
-                return_when=asyncio.FIRST_COMPLETED,
-            )
-        finally:
-            if base_changed.done():
-                base_state_changed.clear()
-            for task in (local_stop, canceled, base_changed):
-                if not task.done():
-                    task.cancel()
-                    with suppress(asyncio.CancelledError):
-                        await task
-
-    def _parked_zoom_target(self, config: CameraworkConfig) -> float:
-        """Choose a visible zoom away from the anchor; this is called only after arrival."""
-        midpoint = (config.zoom_min + config.zoom_max) / 2.0
-        if config.anchor_zoom <= midpoint:
-            return round(random.uniform(midpoint, config.zoom_max), 2)
-        return round(random.uniform(config.zoom_min, midpoint), 2)
-
-    async def _parked_zoom_and_anchor(
-        self,
-        config: CameraworkConfig,
-        *,
-        deadline: float = math.inf,
-    ) -> bool:
-        """Confirm the anchor and fit a complete zoom-out/return inside the parked window."""
-        async with self._cw_stationary_zoom_lock:
-            if not self._camerawork_owner_is_current():
-                return False
-            # The base can become moving while this coroutine is waiting to acquire ownership.
-            # Re-check inside the gate so a stale stationary observation cannot emit a zoom.
-            if not self._cw_base_stationary:
-                return False
-            return await self._parked_zoom_and_anchor_locked(config, deadline=deadline)
-
-    async def _parked_zoom_and_anchor_locked(
-        self,
-        config: CameraworkConfig,
-        *,
-        deadline: float,
-    ) -> bool:
-        """Run one stationary-only anchor/zoom cycle while holding the transit gate."""
-        if not self._camerawork_owner_is_current() or deadline <= time.monotonic():
-            return False
-        anchored = await self._return_to_anchor(config, deadline=deadline)
-        if not self._camerawork_owner_is_current() or self._cancel.is_set():
-            return False
-        if not anchored:
-            # Keep the last command pointed at the anchor, but do not add zoom motion to a pose
-            # that the physical feedback says is still somewhere unsafe.
-            return False
-
-        # A partial zoom is worse than no zoom. Reserve one settle interval for each direction;
-        # short anchor/dwell windows simply hold the confirmed anchor composition.
-        if (
-            not self._cw_base_stationary
-            or deadline - time.monotonic() < 2 * _CW_ZOOM_SETTLE_SECONDS
-        ):
-            return True
-
-        # Arrival/dwell may have set the transition event before anchor confirmation finished.
-        # Consume that old edge, then re-check the live state so only a *new* departure can
-        # interrupt the zoom settle below.
-        self._cw_base_state_changed.clear()
-        if (
-            not self._cw_base_stationary
-            or deadline - time.monotonic() < 2 * _CW_ZOOM_SETTLE_SECONDS
-        ):
-            return True
-
-        zoom_target = self._parked_zoom_target(config)
-        try:
-            if not self._camerawork_owner_is_current():
-                return False
-            await self.robot.set_gimbal(
-                GimbalMoveRequest(
-                    yaw_start=config.anchor_yaw, yaw_end=config.anchor_yaw,
-                    yaw_speed=config.speed_min,
-                    pitch_start=config.anchor_pitch, pitch_end=config.anchor_pitch,
-                    pitch_speed=config.speed_min,
-                    zoom_start=self._cw_zoom, zoom_end=zoom_target,
-                ),
-                context="cruise_stationary_zoom",
-            )
-        except ConnectionError:
-            raise
-        except Exception:
-            with suppress(Exception):
-                await self._return_to_anchor(config, wait=False)
-            return False
-        if not self._camerawork_owner_is_current():
-            return False
-        self._cw_yaw = config.anchor_yaw
-        self._cw_pitch = config.anchor_pitch
-        self._cw_zoom = zoom_target
-        await self._wait_for_camerawork_boundary(
-            min(_CW_ZOOM_SETTLE_SECONDS, max(0.0, deadline - time.monotonic())),
-            self._cw_runner_stop,
-        )
-        if not self._camerawork_owner_is_current() or self._cancel.is_set():
-            return False
-        if not self._cw_base_stationary or deadline <= time.monotonic():
-            # Departure or an unexpectedly slow command must not leave zoom away from its anchor.
-            with suppress(Exception):
-                await self._return_to_anchor(config, wait=False)
-            return True
-        returned = await self._return_to_anchor(config, deadline=deadline)
-        if not self._camerawork_owner_is_current():
-            return False
-        if not returned:
-            with suppress(Exception):
-                await self._return_to_anchor(config, wait=False)
-        return returned
-
-    async def _return_to_anchor(
-        self,
-        config: CameraworkConfig,
-        *,
-        wait: bool = True,
-        deadline: float = math.inf,
-    ) -> bool:
-        """Command the complete resting pose and confirm physical yaw/pitch when available."""
-        attempts = 2 if wait else 1
-        ever_observed_conflict = False
-        for attempt in range(attempts):
-            if not self._camerawork_owner_is_current():
-                return False
-            if wait and deadline <= time.monotonic():
-                return False
-            start_yaw = self._current_yaw(config)
-            start_pitch = self._current_pitch(config)
-            start_zoom = self._cw_zoom
-            speed = config.speed_max
-            await self.robot.set_gimbal(
-                GimbalMoveRequest(
-                    yaw_start=start_yaw, yaw_end=config.anchor_yaw, yaw_speed=speed,
-                    pitch_start=start_pitch, pitch_end=config.anchor_pitch, pitch_speed=speed,
-                    zoom_start=start_zoom, zoom_end=config.anchor_zoom,
-                ),
-                context="cruise_stationary_anchor",
-            )
-            if not self._camerawork_owner_is_current():
-                return False
-            # This boundary must be taken after the command reaches the adapter. It excludes
-            # any heartbeat that raced in before the new target was actually written.
-            heartbeat_revision = self._heartbeat_revision()
-            self._cw_yaw = config.anchor_yaw
-            self._cw_pitch = config.anchor_pitch
-            self._cw_zoom = config.anchor_zoom
-            if not wait:
-                return False
-
-            started = time.monotonic()
-            travel = max(
-                abs(config.anchor_yaw - start_yaw),
-                abs(config.anchor_pitch - start_pitch),
-            )
-            full_budget = max(0.3, travel / speed + _CW_LEG_MARGIN)
-            budget = max(0.0, min(full_budget, deadline - time.monotonic()))
-            reached, observed = await self._await_camerawork_pose(
-                config.anchor_yaw,
-                config.anchor_pitch,
-                budget,
-                after_revision=heartbeat_revision,
-            )
-            if not self._camerawork_owner_is_current():
-                return False
-            if start_zoom != config.anchor_zoom:
-                remaining_zoom = _CW_ZOOM_SETTLE_SECONDS - (time.monotonic() - started)
-                if remaining_zoom > 0:
-                    await self._sleep_or_cancel(
-                        min(remaining_zoom, max(0.0, deadline - time.monotonic()))
-                    )
-            if reached:
-                return True
-            if observed:
-                ever_observed_conflict = True
-            if (
-                not observed
-                and not ever_observed_conflict
-                and budget >= full_budget - 1e-6
-            ):
-                # Compatibility fallback for robots that do not expose both axes: the complete
-                # conservative travel budget elapsed without a conflicting physical reading.
-                return True
-            if self._cancel.is_set() or attempt + 1 >= attempts:
-                return False
-        return False
-
     async def _sample_telemetry(self) -> None:
         """Record physical heartbeat yaw/pitch, never optimistic command endpoints."""
         while not self._cancel.is_set():
@@ -1277,11 +661,13 @@ class CruiseService:
                 yaw = self.robot.heartbeat_yaw()
                 pitch = self._heartbeat_pitch()
                 if yaw is not None and pitch is not None:
-                    self._telemetry.append((
-                        round(self._elapsed(), 3),
-                        round(float(yaw), 3),
-                        round(float(pitch), 3),
-                    ))
+                    self._telemetry.append(
+                        (
+                            round(self._elapsed(), 3),
+                            round(float(yaw), 3),
+                            round(float(pitch), 3),
+                        )
+                    )
             except Exception:
                 pass
             await asyncio.sleep(0.3)
@@ -1352,6 +738,7 @@ class CruiseService:
         media_sync_error = ""
         state = None
         if request.record and recording_start_attempted and not recording_start_rejected:
+
             def remember_final_url(media_url: str) -> None:
                 if session is not None and session.id == run.capture_session_id:
                     self.capture.remember_pending_media(session, media_url)
@@ -1410,11 +797,7 @@ class CruiseService:
             not request.record
             or recording_start_rejected
             or not recording_start_attempted
-            or (
-                state is not None
-                and not state.recording
-                and self._recording_status_known()
-            )
+            or (state is not None and not state.recording and self._recording_status_known())
         )
 
         if request.record and not run.media_local_path:
@@ -1450,16 +833,7 @@ class CruiseService:
                     "录制文件未同步到本地，点位信息未能写入；拍摄会话已保留以便重试"
                 )
             else:
-                run.warnings.append(
-                    "录制尚未确认停止，或文件未同步到本地；拍摄会话已保留以便重试"
-                )
-
-        # Capture lifecycle always wins over cosmetic resting position. Closing (or preserving)
-        # the recovery session first prevents a wedged gimbal transport from leaving the UI and
-        # recording lifecycle open. A runner that did not stop may still own the adapter gate, so
-        # do not compete with it. Even after a clean stop, the one-way final command is bounded.
-        if camerawork is not None and recording_is_stopped and camerawork_quiesced:
-            await self._return_to_final_anchor(camerawork)
+                run.warnings.append("录制尚未确认停止，或文件未同步到本地；拍摄会话已保留以便重试")
 
         run.ended_at = utc_now()
         log_event(
@@ -1500,7 +874,9 @@ class CruiseService:
         kind = event["type"]
         if kind == "record_write":
             self._origin_monotonic = event["monotonic"]
-            session.recording_clock.update(origin="record_write_estimate", quality="application_estimate")
+            session.recording_clock.update(
+                origin="record_write_estimate", quality="application_estimate"
+            )
         segment = self._capture_visit
         if (
             kind.startswith("goal_")
@@ -1513,7 +889,9 @@ class CruiseService:
         ):
             return
         index = segment.index if segment else None
-        if any(e["type"] == kind and e.get("visit_index") == index for e in session.recording_events):
+        if any(
+            e["type"] == kind and e.get("visit_index") == index for e in session.recording_events
+        ):
             return
         seconds = max(0.0, event["monotonic"] - self._origin_monotonic)
         if segment is not None:
@@ -1522,10 +900,15 @@ class CruiseService:
             elif kind == "goal_done":
                 segment.arrived_at_seconds = seconds
         try:
-            self.capture.remember_recording_event(session, {
-                "type": kind, "seconds": seconds, "visit_index": index,
-                "sequence": len(session.recording_events),
-            })
+            self.capture.remember_recording_event(
+                session,
+                {
+                    "type": kind,
+                    "seconds": seconds,
+                    "visit_index": index,
+                    "sequence": len(session.recording_events),
+                },
+            )
         except OSError:
             warning = "拍摄分段事件暂存失败；停止录制时会重试保存"
             if warning not in run.warnings:

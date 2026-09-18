@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from automated_video_editing_backend.services.recording_segments import iter_nodes
+
 import asyncio
 import json
 import logging
@@ -502,7 +504,7 @@ class MediaService:
     def _matches_pool(item: MediaItem, field: str) -> bool:
         kind, role = MEDIA_POOL_FIELDS[field]
         if field == "source_media_ids":
-            return MediaService.is_automatic_source(item)
+            return MediaService.is_automatic_source(item) and not item.metadata.get("capture_group")
         return item.kind == kind and item.metadata.get("role") == role
 
     @staticmethod
@@ -581,6 +583,25 @@ class MediaService:
                     retained_path_set.add(path)
             cleaned[field] = retained_paths
             result[field] = visible_ids
+        for source_id in result["source_media_ids"]:
+            source = self._items.get(source_id)
+            voice = self._items.get(source.metadata.get("bound_voice_id")) if source else None
+            if voice and voice.id not in result["voiceover_media_ids"]:
+                result["voiceover_media_ids"].append(voice.id)
+                cleaned["voiceover_media_ids"].append(voice.path)
+        keep = []
+        for mid in result["voiceover_media_ids"]:
+            item = self._items.get(mid)
+            if (
+                not item
+                or not item.metadata.get("binding_id")
+                or item.metadata.get("bound_source_id") in result["source_media_ids"]
+            ):
+                keep.append(mid)
+        result["voiceover_media_ids"] = keep
+        cleaned["voiceover_media_ids"] = [
+            self._items.get(mid, self._import_catalog.get(mid)).path for mid in keep
+        ]
         if cleaned != self._pool_paths:
             self._save_pool(cleaned)
         if self._capture_selections:
@@ -629,6 +650,27 @@ class MediaService:
                 seen_paths.add(item.path)
             updated[field] = paths
             result_ids[field] = accepted_ids
+        # A saved composition and its active voice enter the working set together.
+        voice_ids = result_ids["voiceover_media_ids"]
+        for source_id in result_ids["source_media_ids"]:
+            source = self._items.get(source_id)
+            voice_id = source.metadata.get("bound_voice_id") if source else None
+            voice = self._items.get(voice_id)
+            if voice and voice.id not in voice_ids:
+                voice_ids.append(voice.id)
+                updated["voiceover_media_ids"].append(voice.path)
+        # Old bound voices are not independent choices once their source leaves the pool.
+        retained = [
+            mid
+            for mid in voice_ids
+            if not (item := self._items.get(mid))
+            or not item.metadata.get("binding_id")
+            or item.metadata.get("bound_source_id") in result_ids["source_media_ids"]
+        ]
+        result_ids["voiceover_media_ids"] = retained
+        updated["voiceover_media_ids"] = [
+            self._items.get(mid, self._import_catalog.get(mid)).path for mid in retained
+        ]
         # Write first so a full disk or permissions error cannot make a failed PUT look
         # successful until the process restarts. The old in-memory and on-disk set both stay
         # intact when the atomic write does not land.
@@ -996,6 +1038,9 @@ class MediaService:
         self.forget_missing_imports()
         self._tag_cruise_points()
         self.captures.enrich(self._items)
+        from automated_video_editing_backend.services.composition_assets import enrich
+
+        enrich(list(self._items.values()))
         return list(self._items.values())
 
     def _tag_cruise_points(self) -> None:
@@ -1085,7 +1130,7 @@ class MediaService:
             return None
         if managed_root not in requested.parents or not requested.is_file():
             return None
-        for segment in group.get("segments", []):
+        for segment in iter_nodes(group.get("segments", [])):
             recorded_path = segment.get("path")
             if not recorded_path or segment.get("status") != "ready":
                 continue
@@ -1504,7 +1549,7 @@ class MediaService:
             ):
                 raise MediaDownloadNotReadyError("服务器返回的媒体文件尚未传输完整")
             if expected_kind == "video":
-                validate_downloaded_video(partial)
+                await asyncio.to_thread(validate_downloaded_video, partial)
             partial.replace(target)
         finally:
             if partial:

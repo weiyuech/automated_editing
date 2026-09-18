@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
-"""Fetch assets the app needs but does not carry in source: subtitle fonts, the local semantic
-model, and an FFmpeg that can draw text.
+"""Fetch assets the app needs but does not carry in source: subtitle fonts and an FFmpeg that can draw text.
 
 Two things here are not obvious and are the reason this script exists rather than a README
 paragraph telling someone to download three files.
@@ -19,7 +18,6 @@ variable fonts, so it takes that default. Each is therefore pinned to a static w
 which is a modification, which is why the licences are checked below before it happens.
 
 Run:  python scripts/prepare_assets.py [--platform darwin-x86_64|win64|linux64] [--force]
-      python scripts/prepare_assets.py --semantic-only
 """
 
 from __future__ import annotations
@@ -42,12 +40,8 @@ FONT_DIR = ROOT / "backend" / "src" / "automated_video_editing_backend" / "asset
 LICENSE_DIR = ROOT / "backend" / "src" / "automated_video_editing_backend" / "assets" / "font_licenses"
 # Also outside FONT_DIR, for the same reason: these are WOFF2, which libass cannot parse.
 PREVIEW_DIR = ROOT / "backend" / "src" / "automated_video_editing_backend" / "assets" / "font_previews"
+SEMANTIC_DIR = ROOT / "backend/src/automated_video_editing_backend/assets/semantic/bge-small-zh-v1.5"
 VENDOR_DIR = ROOT / "backend" / "vendor" / "ffmpeg"
-SEMANTIC_DIR = (
-    ROOT / "backend" / "src" / "automated_video_editing_backend" / "assets"
-    / "semantic" / "bge-small-zh-v1.5"
-)
-
 # Weight to pin a variable font to. 700 is the usual subtitle weight: heavy enough to hold an
 # outline against moving footage without the counters filling in at small sizes.
 SUBTITLE_WEIGHT = 700
@@ -162,9 +156,6 @@ FFMPEG_BUILDS = {
     },
 }
 
-# CPU-only semantic matching. This is the MIT-licensed BAAI model converted to ONNX by the
-# Hugging Face Transformers.js maintainer and pinned to one verified revision. INT8 is enough
-# for short point descriptions and keeps the installed footprint below 25 MB.
 SEMANTIC_ASSETS = {
     "model_int8.onnx": {
         "url": "https://huggingface.co/Xenova/bge-small-zh-v1.5/resolve/75c43b0/onnx/model_int8.onnx?download=true",

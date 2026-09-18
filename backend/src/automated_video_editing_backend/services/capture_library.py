@@ -27,6 +27,9 @@ from automated_video_editing_backend.services.capture import (
 )
 from automated_video_editing_backend.services.recording_segments import (
     build_timeline,
+    iter_nodes,
+    selected_nodes,
+    validate_tree,
     rebase_timeline,
     selected_ranges,
 )
@@ -62,12 +65,12 @@ class CaptureLibrary:
                     # mark those untouched entries explicitly; treat them as resumable pending
                     # work rather than disabling the entire optional grouping layer.
                     if isinstance(group, dict) and isinstance(group.get("segments"), list):
-                        for child in group["segments"]:
+                        for child in iter_nodes(group["segments"]):
                             if isinstance(child, dict):
                                 child.setdefault("status", "pending")
                                 child.setdefault("error", "")
                     self._validate_group(key, group)
-                    for child in group["segments"]:
+                    for child in iter_nodes(group["segments"]):
                         if (
                             child.get("path")
                             and self.directory not in Path(child["path"]).resolve().parents
@@ -127,8 +130,8 @@ class CaptureLibrary:
         ):
             raise ValueError("拍摄分组时间轴版本无效")
         seen_ids: set[str] = set()
-        seen_orders: set[int] = set()
-        for child in group["segments"]:
+        validate_tree(group["segments"], 0, group["duration"])
+        for child in iter_nodes(group["segments"]):
             if not isinstance(child, dict):
                 raise TypeError("拍摄子视频结构无效")
             if (
@@ -138,7 +141,6 @@ class CaptureLibrary:
                 or not isinstance(child.get("order"), int)
                 or isinstance(child["order"], bool)
                 or child["order"] < 0
-                or child["order"] in seen_orders
                 or child.get("status") not in {"pending", "ready", "failed"}
                 or not isinstance(child.get("kind"), str)
                 or not isinstance(child.get("label"), str)
@@ -163,7 +165,6 @@ class CaptureLibrary:
             ):
                 raise ValueError("拍摄子视频时间范围无效")
             seen_ids.add(child["id"])
-            seen_orders.add(child["order"])
 
     def _commit(self, group: dict) -> None:
         if self.problem:
@@ -233,7 +234,7 @@ class CaptureLibrary:
                         *(existing.get("obsolete_paths") or []),
                         *(
                             segment.get("path")
-                            for segment in existing["segments"]
+                            for segment in iter_nodes(existing["segments"])
                             if segment.get("path")
                         ),
                     ]
@@ -273,7 +274,7 @@ class CaptureLibrary:
             item = by_path.get(group["master_path"])
             master_exists = Path(group["master_path"]).is_file()
             children_exist = any(
-                s.get("path") and Path(s["path"]).is_file() for s in group["segments"]
+                s.get("path") and Path(s["path"]).is_file() for s in iter_nodes(group["segments"])
             )
             if item is None and not master_exists and not children_exist:
                 # Once every user-facing member has gone, remove disposable selection inputs
@@ -295,7 +296,7 @@ class CaptureLibrary:
             }
             public["master_available"] = master_exists
             public["size_bytes"] = Path(item.path).stat().st_size if master_exists else 0
-            for segment in public["segments"]:
+            for segment in iter_nodes(public["segments"]):
                 path = Path(segment["path"]) if segment.get("path") else None
                 available = bool(path and path.is_file())
                 segment["available"] = available
@@ -411,7 +412,7 @@ class CaptureLibrary:
         group = deepcopy(self.groups[key])
         protected_paths = [
             group["master_path"],
-            *(segment.get("path") for segment in group["segments"] if segment.get("path")),
+            *(segment.get("path") for segment in iter_nodes(group["segments"]) if segment.get("path")),
         ]
         if any(
             self.is_path_in_use(path) or self.external_path_in_use(path) for path in protected_paths
@@ -426,7 +427,7 @@ class CaptureLibrary:
                         *(group.get("obsolete_paths") or []),
                         *(
                             segment.get("path")
-                            for segment in group["segments"]
+                            for segment in iter_nodes(group["segments"])
                             if segment.get("path")
                         ),
                     ]
@@ -436,7 +437,7 @@ class CaptureLibrary:
             group["segments"] = []
         # Missing ready children were explicitly removed or moved. Only this explicit
         # action re-creates them; ordinary scans and restarts never do so.
-        for segment in group["segments"]:
+        for segment in iter_nodes(group["segments"]):
             if not segment.get("path") or not Path(segment["path"]).is_file():
                 segment["status"] = "pending"
         group.update(status="pending", error="")
@@ -458,7 +459,7 @@ class CaptureLibrary:
                     group["segments"] = build_timeline(
                         group["evidence"], duration, group["offset_seconds"]
                     )
-                    for segment in group["segments"]:
+                    for segment in iter_nodes(group["segments"]):
                         segment.update(status="pending", error="")
                     group["timeline_version"] = digest(
                         [group["fingerprint"], group["offset_seconds"], group["segments"]]
@@ -469,11 +470,11 @@ class CaptureLibrary:
                 # a queued render can never observe a file changing underneath it.
                 folder = self.directory / digest(key) / group["timeline_version"]
                 folder.mkdir(parents=True, exist_ok=True)
-                for segment in group["segments"]:
+                for segment in iter_nodes(group["segments"]):
                     # Never regenerate an already-published child just because it was trashed.
                     if segment.get("status") == "ready":
                         continue
-                    target = folder / f"{segment['order'] + 1:03d}-{segment['id']}.mp4"
+                    target = folder / f"{digest(segment['id'])}.mp4"
                     self._active.add(str(target))
                     try:
                         await self._encode(master, [(segment["start"], segment["end"])], target)
@@ -488,7 +489,7 @@ class CaptureLibrary:
                     self._commit(deepcopy(group))
                 group["status"] = (
                     "failed"
-                    if any(s.get("status") == "failed" for s in group["segments"])
+                    if any(s.get("status") == "failed" for s in iter_nodes(group["segments"]))
                     else "ready"
                 )
                 group["error"] = (
@@ -523,7 +524,7 @@ class CaptureLibrary:
 
     def _cleanup_obsolete(self, group: dict) -> list[str]:
         """Remove superseded derived children only after their replacement is complete."""
-        current = {str(Path(s["path"]).resolve()) for s in group["segments"] if s.get("path")}
+        current = {str(Path(s["path"]).resolve()) for s in iter_nodes(group["segments"]) if s.get("path")}
         remaining: list[str] = []
         for raw_path in group.get("obsolete_paths") or []:
             try:
@@ -566,9 +567,7 @@ class CaptureLibrary:
             group = await self.prepare(key)
         ranges = selected_ranges(group, selection)
         selected_ids = set(selection.get("segment_ids") or [])
-        selected_children = [
-            segment for segment in group["segments"] if segment["id"] in selected_ids
-        ]
+        selected_children = selected_nodes(group["segments"], selected_ids)
         if ranges == [(0.0, group["duration"])]:
             if Path(item.path).is_file():
                 return item

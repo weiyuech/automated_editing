@@ -538,8 +538,6 @@ async def test_real_websocket_cruise_times_out_bare_done_but_stops_and_saves_onc
     monkeypatch.setattr(robot_module, "_GIMBAL_PREVIOUS_COMMAND_WAIT_SECONDS", 0.3)
     monkeypatch.setattr(cruise_module, "_ARRIVAL_TIMEOUT_SECONDS", 0.12)
     monkeypatch.setattr(cruise_module, "_CW_POSE_POLL_SECONDS", 0.005)
-    monkeypatch.setattr(cruise_module, "_CW_COMMAND_RETRY_SECONDS", 0.02)
-    monkeypatch.setattr(cruise_module, "_CW_RUNNER_STOP_TIMEOUT_SECONDS", 0.3)
 
     commands: list[dict] = []
     goal_ids: list[int] = []

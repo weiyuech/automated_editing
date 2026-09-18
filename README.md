@@ -1,191 +1,141 @@
-# Automated Video Editing
+# 可控拍摄与精确拼接
 
-A desktop operator console for robot-assisted filming and automated video editing.
+Electron + Vue 操作台，Python/FastAPI 负责机器人协议、录制证据、树形选择、旁白时间映射和 FFmpeg 导出。当前流程是**选择镜头、完成拍摄、在媒体库保存组合、整篇配音、在工作台预览并导出**。不再自动打分选镜头、随机运镜、识别音乐节拍或凑成 15／30 秒。
 
-This project is intentionally isolated from other checkouts. All source, scripts, caches, logs, previews, media, and exports live under this folder.
+`archive/` 是改版前的完整备份，保持原样。运行、清理和源码交付不应进入该目录。
 
-## Architecture
+## 固定镜头怎样拍
 
-- `frontend/`: Electron + Vue desktop UI with a vertical operator-console layout.
-- `backend/`: Python FastAPI backend for robot control, capture sessions, media analysis, edit planning, and rendering.
-- `scripts/`: root-safe scripts. Scripts refuse to write outside this project root.
-- `data/`, `.cache/`, `logs/`, `exports/`, `previews/`: generated/runtime folders.
+在「镜头设置 → 镜头控制」填写矩形范围，选择 4／8 点、速度、固定倍率和默认镜头，点击「保存固定运镜设置」。原点固定为 `(yaw, pitch) = (0, 0)`；两轴范围都必须跨过零点。协议方向是 **正 yaw 向左、负 yaw 向右；负 pitch 向上、正 pitch 向下**。
 
-## Why Electron + Python
+| 模式 | 固定顺序 | 片段数 |
+| --- | --- | --- |
+| 4 点 | 原点→左、左→右、右→原点、原点→上、上→下、下→原点 | 6 |
+| 8 点 | 上述六段，再加原点→左上→原点、原点→右上→原点、原点→右下→原点、原点→左下→原点 | 10 |
 
-Electron gives the app a polished local desktop shell: native file pickers, video preview UI, process management, packaged installs, and future hardware control panels. Python owns the heavy lifting: robot adapters, video analysis, timeline planning, and FFmpeg rendering.
+左右边缘分别是 `(yaw_max, 0)`、`(yaw_min, 0)`；上下边缘分别是 `(0, pitch_min)`、`(0, pitch_max)`。四角是这些边界的组合。每个角的去程、回程合为一个镜头。
 
-## Development
+在「拍摄」巡游清单里启用固定运镜，展开各点的「本点镜头」可覆盖默认选择。镜头始终按表中顺序执行；跳选时先移到镜头起点，这段标为「镜头准备」。选定镜头完成后回原点，再发送下一点导航。底盘行进时不执行镜头序列。没有启用固定运镜的普通录制仍保留原有到点取景窗口。
 
-Prerequisites: Python 3.12, Node.js 22.13 or newer, and Corepack (included with the supported Node.js release).
+**到位依据：**每条云台指令发送后，需要两次不同的新心跳，yaw、pitch 都进入目标 ±0.5°。等待上限为较长轴的角度行程／速度 + 8 秒；超时是失败，会停止后续镜头和导航，不再把预计时间结束当作到位。真实硬件的反馈精度和更新频率仍需现场验证。
 
-From the repository root, prepare the Python environment and start the desktop app:
+**停止含义：**停止会取消后续任务，并沿用录制停止、下载和恢复逻辑。现有协议没有底盘或云台硬件急停命令；已经发出的运动可能继续完成。停止后不会另发一个用于收尾的云台动作。
+
+## 录像始终保留树结构
+
+```text
+一次拍摄（完整原片始终保留）
+├─ 完整录制
+├─ 起点 → A：行进
+├─ A：停留
+│  ├─ 原点 → 左        2.5 秒
+│  ├─ 左 → 右         4.0 秒
+│  └─ 右 → 原点       2.5 秒
+└─ A → B：行进
+```
+
+- 勾选根节点等于选择完整录制；取消根节点则本次拍摄全部不参与。
+- 展开后可选择点位、镜头或行进区间。父节点与后代只算一次；完整录制被选中时只使用原片一次。
+- 从全选状态取消一个子镜头，会同时取消「完整录制」的全片选择，保留其余子区间。完整原片文件仍在根节点内，不会隐藏或删除。
+- 同一次拍摄选若干镜头，先按原片时间顺序合成**一个输入视频**。时间树和来源区间仍保存，不会变成多条独立录像。
+- 跨拍摄按录制时间排序，拍摄内部始终按树中的先后顺序排列，不受勾选顺序影响。只有媒体库提供树形组合；源视频素材池只接收独立视频。
+- 镜头开始、结束来自应用指令与机器人反馈，显示实际记录的区间和时长；中断镜头会标识未完成。相机视频的起始时钟与应用录制时钟仍可能存在偏移，沿用分段校准机制，不宣称帧级硬件同步。
+
+## 具体操作步骤
+
+1. 「镜头设置」保存范围与固定镜头；「拍摄」建立巡游清单，按点选择镜头后开始录制。也可先导入已有录像检查拼接流程。
+2. 打开「媒体库 → 选择与组合预览」，展开拍摄，勾选点位、镜头或行进区间。点击「生成组合预览」，展开「查看各层画面与时长」可逐层预览。
+3. 勾选「这就是本次要保存的组合」，点击「确认，保存到媒体库」。新视频在媒体库顶层独立显示，原始录制树保留。可以重复调整选择、预览并保存多份不同组合；同一预览重复保存不会生成重复文件。
+4. 如需旁白，打开「资产制作 → 旁白制作」，开启「按组合画面对齐」，选择刚保存的组合，输入完整文案。可开启「大模型润色（先审阅）」生成整篇改写稿，修改后选择「保留原文」或「采用改写稿」。关闭画面对齐则为普通导入视频制作普通旁白。
+5. 点击「合成一条完整旁白」。每次点击只调用一次 TTS，合成一条完整音频。在右侧同步试听视频与旁白，勾选「我已试听，确认使用这条旁白」，再点击「确认应用此旁白」。仅调整速度可点「按当前速度重新试听（不重新合成）」；改文案需重新合成。
+6. 将组合「加入媒体池」，或在「剪辑台 → 源视频素材池 → 从媒体库添加」加入。绑定旁白同步入池；勾选或取消组合时旁白同步，操作绑定旁白也会联动对应视频。移出绑定旁白会将对应组合一起移出本次媒体池，不删除文件。
+7. 剪辑台保留左侧媒体池、右侧工作台和 2×2 选用汇总。选用音乐、片头／片尾、原声与字幕设置，点击「生成成片预览」。每个输入分别制作一条成片，已保存组合内部不会拆成多个输入。
+8. 逐条试听、检查，勾选「已试听并检查，这是本次要导出的成片」，点击「确认导出」。在「渲染队列」查看完成状态；有字幕时仍保留带字幕成片和无字幕母版。
+
+调整选择或设置后必须重新预览。媒体库的“确认”只代表这一次组合符合意图，不限制继续保存其他组合，也不强制把所有点位都选上。
+
+## 旁白、备注与时长：Q&A
+
+**拍摄备注还在使用吗？** 在使用。备注随录制和组合来源树保留，作为大模型理解画面与点位的上下文。口播事实以用户输入文案为准，拍摄指令不会自动变成台词。
+
+**是一条旁白，还是许多小旁白拼起来？** 一份审阅后的完整文案，一次完整 TTS 请求，一条原始音频。点位与行进区间只是文案和实测检查的时间参考，不各自合成录音。
+
+**怎样对齐组合？** 大模型根据画面顺序、实际区间、拍摄备注和原文安排整篇文案。合成后使用真实音频时长与可靠的逐词时间；已有段落绑定优先，BAAI 辅助检查和找回修改后的对应关系。相似度门槛和领先第二候选的差值共同限制自动匹配；不确定、过渡或逆序内容保留为待核对，不调换画面顺序。
+
+**LLM 返回的稿件还可以改吗？** 可以直接在「审阅改写稿」中修改，再选「采用改写稿」。手动修改不会清空原来的段落参考；未改部分沿用参考，改动部分重新匹配。也可点击「基于当前改写稿再润色」，它使用当前修改稿继续润色。合成后修改文字需要重新合成语音。
+
+**怎样控制播放速度？** 基础速度可选 0.9、1.0、1.1 倍；默认原速，可允许自动在 0.9～1.1 倍内微调。可靠时间与完整对应关系都具备时，在真实词间空隙处分段处理同一音轨，按需等待下一画面；所有词和字幕使用相同时间变换。缺少可靠对应时只调整整条速度。不是分段调用 TTS；最终仍是一条完整旁白。播放速度调整复用内部原音频缓存，不消耗新一次 TTS。实际音频放不下时提示精简，不截断语句、不拉长画面、不自动付费重试。
+
+**没有可靠逐词时间怎么办？** 可以同步试听，并明确提示无法精确检查或调整局部对应。BAAI 只判断语义，不能生成音频时间戳。此时按实际整条语音区间显示整句，不把字数估算当成真实词级时间。
+
+**旁白何时跟视频绑定？** 合成完成只产生待审候选。同步试听后点击「确认应用此旁白」才更新视频旁 `.composition.json` 中唯一的有效绑定。候选未确认、处理失败或超时均保留原绑定；重调速度会生成新的试听版本，旧试听不能确认新版本。确认后入池、选用、重启、改名和导出继续一对一联动。
+
+**字体和已有旁白怎么查看？** 字体菜单用各字体自己的字形显示名称和固定字幕样例。「已有旁白」展开后在固定高度内滚动，可按名称搜索、筛选当前组合；点选一条使用共享播放器试听，列表不会堆出大量播放器。
+
+**最终长度由谁决定？** 由已确认的画面长度决定，片头、片尾另计；编码按 30 fps 的帧粒度校验。音乐从头截取，短于所需区间则后段留白；不分析节拍、不循环凑时长。默认音乐从片头结束后开始，开启「音乐覆盖片头、片尾」后覆盖整个成片。组合旁白始终从主体开始，字幕与它一起偏移。
+
+**源文件能否清理？** 尚未保存的组合预览会保护其依赖素材，可通过「移除预览」释放。已保存组合是独立文件，保留层级来源记录，不再依赖原片才能播放。正在制作或导出的素材仍受占用保护。
+
+## 代码从哪里检查与修改
+
+路径以项目根目录为起点。
+
+| 职责 | 文件与入口 |
+| --- | --- |
+| 六段／十段镜头的顺序、坐标和 ID | `backend/src/automated_video_editing_backend/services/camera_program.py` → `camera_program()` |
+| 点位完成后才放行下一点；镜头边界与到位等待 | `services/cruise.py` → `_run_segment()`、`_run_camera_program()`、`_move_to_pose()`、`_await_camerawork_pose()` |
+| WS 协议发送、心跳、录制恢复、停止 | `services/robot.py` → `set_gimbal()`、`start_recording()`、`stop_recording()`、`_handle_message()`、`wait_for_arrival()` |
+| 范围、镜头选择的数据校验 | `core/models.py` → `CameraworkProfile`、`CruisePoint` |
+| 构建树、父子去重、区间重排 | `services/recording_segments.py` → `build_timeline()`、`selected_ranges()`、`rebase_timeline()` |
+| 原片、子片段、内部组合文件与清理占用 | `services/capture_library.py`、`services/media.py` |
+| 组合快照、媒体库保存、工作台预览与导出确认 | `services/composition.py` → `CompositionService` |
+| 整篇文案、一次合成、同步试听和确认绑定 | `services/mapped_narration.py` → `MappedNarrationService` |
+| 大模型和 TTS 供应商请求、额度 | `services/llm.py`、`services/tts.py` |
+| 最终导出、字幕与母版、音视频混合 | `services/jobs.py`、`services/render.py`、`services/timeline.py`、`services/subtitles.py` |
+| API | `api/routes.py` → `/api/compositions`、`/{id}/save`、`/api/studio/previews`、`/{id}/confirm`、`/{id}/narration/draft`、`/{id}/narration` |
+| 媒体库树形组合与预览 | `frontend/src/renderer/src/components/ControlledComposer.vue`、`CompositionTree.vue` |
+| 媒体池、2×2 汇总、成片预览和确认 | `components/StudioMediaPool.vue`、`StudioWorkbench.vue` |
+| BAAI 辅助对应、音频和字幕统一时间变换 | `services/semantic.py`、`services/narration_alignment.py`、`services/narration_audio.py` |
+| 单一旁白界面与对齐开关 | `components/NarrationPanel.vue` |
+| 持久化视频／旁白绑定及选用联动 | `services/composition_assets.py`、`frontend/src/shared/composition-selection.js` |
+| 递归拍摄选择 | `components/CaptureGroupPicker.vue`、`CaptureTreeNode.vue`、`capture-group-policy.js` |
+| 固定镜头设置与巡游点覆盖 | `components/CameraProgramPicker.vue`、`camerawork-policy.js`、`App.vue` |
+
+表中省略前缀的后端路径均位于 `backend/src/automated_video_editing_backend/`；前端路径均位于 `frontend/src/renderer/src/`。
+
+## 协议与诊断要点
+
+- 机器人地址只来自「设置 → 机器人硬件 → WebSocket 地址」中保存的配置。空地址不会自动猜测连接。Ping 只检查连接，不启动拍摄。
+- 到点依据属于当前导航指令的 `goal_status`，不等待 `object_status`、不要求识别或对齐目标物。导航归属、新旧连接隔离、录制会话恢复继续由原协议层处理。
+- 心跳中的 `system`、`map`、`navigation`、`task`、`gimbal` 各有职责；`ready` 或 `goal_status=done` 不能证明相机录制成功。相机 ACK、录制状态、停止结果及媒体下载校验分别检查。
+- `fail` 是机器人对相应请求的失败回复；仅凭这个词不能断定是命令时序、相机状态还是设备内部问题。结合 `logs/diagnostics.log` 同一连接、请求和录制会话的前后记录检查。
+- 实际 yaw/pitch 使用心跳，固定 zoom 是应用下发值；不能把下发成功当作硬件已到位。
+- `tools/robot-control-console.html` 是独立直连调试页：手动角度控制和固定 4／8 点停稳测试，固定 mode=1、zoom=1。它不控制底盘、不录制、不复用正式应用设置。不要与正式应用同时连接同一设备。已移除旧随机四区域与比例循环。
+
+更完整的原协议约束见 [机器人适配器约定](docs/robot_adapter_contract.md) 和 [现场协议资料](docs/live_robot_api_requirements.md)。
+
+## 开发与验证
+
+建议 Python 3.12、Node.js ≥22.13，前端 pnpm 版本由 `frontend/package.json` 固定。
 
 ```bash
 python3.12 -m venv .venv
-.venv/bin/python -m pip install -e 'backend[dev,beat]'
-
+.venv/bin/python -m pip install -e 'backend[dev,assets]'
+.venv/bin/python scripts/prepare_assets.py
 cd frontend
 corepack pnpm install --frozen-lockfile
 corepack pnpm run dev
 ```
 
-Do not use a path under `~/.cache/codex-runtimes/`; it is an internal, temporary Codex path and can change. The `packageManager` field in `frontend/package.json` makes Corepack use the project's pinned pnpm version.
-
-Electron starts and stops the Python backend automatically. For backend-only API diagnostics, run this separately from the repository root (not at the same time as the Electron app):
+Electron 管理本地后端及每次启动的私有桥接令牌。后端单独调试可运行 `.venv/bin/python scripts/run_backend.py`，不要与正式应用同时控制现场设备。运行数据位于 `data/`、`.cache/`、`logs/`、`exports/`、`previews/`；云服务配置保存在 `data/settings.local.json`，接口返回脱敏信息。
 
 ```bash
-.venv/bin/python scripts/run_backend.py
+.venv/bin/pytest backend/tests -q
+.venv/bin/ruff check backend/src backend/tests
+npm --prefix frontend run test:main
+npm --prefix frontend run build
 ```
 
-The Electron main process generates a random bridge token and starts the Python backend with that token. The token is not shown in the UI or logs.
+核心回归覆盖模拟机器人录制与停止、固定镜头完成前禁止下一导航、陈旧心跳不算到位、嵌套选择去重、部分录像作为单一输入、预览重启后导出、组合变化拦截旧旁白、真实 FFmpeg 拼接与实测 TTS 超时提示。真实机器人动作和付费大模型／语音接口需现场验证；模拟测试不替代这些验证。
 
-## Basic Workflow
-
-1. Open the app with `corepack pnpm run dev` from `frontend/`. Electron starts the Python backend automatically.
-2. In Media Library, import local videos/music or paste a direct media URL, such as an `.mp4`, `.mov`, `.webm`, `.mp3`, or `.wav` URL. Streaming pages such as YouTube/TikTok/Bilibili need a later `yt-dlp` connector.
-3. In Edit Studio, choose a music file, keep `Mute source video noise` enabled, keep `Cut to music beats` enabled, and create the edit job.
-4. Render Queue tracks progress. Finished MP4 exports are written under `exports/` in the repository root.
-
-The Ping button is only a local connection check: it sends a WebSocket `PING` and expects `PONG`. It does not start robot motion, capture, or rendering.
-
-## Stable Editing Stack
-
-Beat detection is installed through the `backend[beat]` extra. It pins `librosa`, `numba`, and `llvmlite` to versions with prebuilt Python 3.12 macOS x86_64 wheels, avoiding local LLVM source builds. The backend sets `NUMBA_CACHE_DIR` to `.cache/numba` so compiled beat-analysis functions stay inside the app folder.
-
-- FFmpeg: trimming, transitions, audio mixing, encoding, export.
-- PySceneDetect: scene boundary detection.
-- librosa: music beat and onset detection.
-- OpenCV: optional frame-level inspection and thumbnail/proxy helpers.
-
-The initial app is designed to work with mock robot control first. Real hardware can be added by implementing the `RobotAdapter` interface.
-
-## Media Vault
-
-Media is organized by role instead of treated as one flat pile. Downloads are raw source media or music, exports are rendered results, and previews/cache are cleanup candidates. Edit Studio only uses explicitly selected raw clips, so exported MP4s do not get accidentally folded back into later renders. See `docs/media_vault.md` for the design rules.
-
-## 巡游完整录像与分段录像
-
-一次巡游只录制一条完整视频。文件保存后，应用会依据本次导航事件在电脑上生成“行进 / 停留 / 状态未确认”等分段，并在媒体库里收在同一次拍摄下面。自动剪辑可选完整录像或若干分段，但一次拍摄始终只占一个源视频名额；手动微调可以直接选用单个已生成分段。
-
-原片暂时不存在时，只允许使用仍在磁盘上的分段；声音轨无法确认时不发布可能错误的无声文件；重启、校准、删除和缓存清理均保留任务占用保护。完整交互和文件规则见 [docs/cruise_recording_segments.md](docs/cruise_recording_segments.md)。
-
-## Settings, LLM, And Timed TTS
-
-Provider credentials are owned by the backend `SettingsService` and stored locally in `data/settings.local.json`. API routes return masked status only, and blank secret fields in the UI keep the existing local value. Provider changes apply immediately; restart is only needed after code changes.
-
-The timed voiceover path uses Volcengine's fast sync TTS endpoint with `with_timestamp=1`. It writes the generated audio and matching word-timing JSON under `data/tts/`, then registers the audio as a voiceover asset. Render jobs keep background music and voiceover separate so the voice can sit above lowered music instead of replacing it.
-
-## 巡游自动运镜
-
-以下说明对应当前源码。自动运镜默认关闭；开启后使用「镜头设置」里保存的一套配置。核心规划位于 [cruise.py](backend/src/automated_video_editing_backend/services/cruise.py)，协议发送位于 [robot.py](backend/src/automated_video_editing_backend/services/robot.py)。
-
-### 内部目标选择和锚点
-
-界面不会向使用者解释区域编号；使用者只需要设置允许范围、锚点、速度，以及
-回到锚点的节奏。以下区域划分只是实现与测试说明。
-
-用户设置的 yaw 与 pitch 范围分别从中点切成两半，组合成四个区域：
-
-| | yaw 较小的一半 | yaw 较大的一半 |
-| --- | --- | --- |
-| pitch 较小的一半 | 区域 1 | 区域 2 |
-| pitch 较大的一半 | 区域 3 | 区域 4 |
-
-- 第一个区域从四个区域中随机选择。
-- 此后每个区域都从上一个区域以外的三个区域中等概率选择；锚点阶段不会清除这个记忆。因此 `1 → 4 → 1 → 4` 合法，`1 → 1` 不合法。
-- 选定区域后，yaw 与 pitch 都在该区域的整数角度范围内随机选择。目标始终在用户保存的总范围内。
-- 普通目标没有停留阶段：连续两次新心跳进入目标 ±2°，或完整预计行程时间结束后，
-  立即选择下一个目标。
-- 锚点是唯一带有明确停留时间的目标，不是「随机停在某个角度」。
-
-已退役的方向策略只保存在 [docs/archive/camerawork-directional-v1.md](docs/archive/camerawork-directional-v1.md)，不会参与运行。
-
-### 锚点时间怎样计算
-
-界面只提供两个节奏参数：
-
-- `anchor_time_percent`：回到锚点并停留的计划时间占比，默认 20%。
-- `anchor_dwell_seconds`：每次确认回到锚点后停留的基准时长，默认 5 秒。
-
-每个周期先在基准时长的 ±30% 内生成实际锚点时长 `A`，再按时间比例计算四区域时长：
-
-```text
-Q = A × (100 - anchor_time_percent) / anchor_time_percent
-```
-
-一个周期先执行 `Q 秒普通自动运镜`，再发送回锚点指令。只有连续两次新心跳进入
-锚点 ±2°，或完整预计返回时间结束后，才开始完整的 `A 秒锚点停留`。返回路程不占用
-这段停留时间。普通运镜预算如果在一次移动途中结束，会先完成该次移动，再回锚点；
-不会截断移动，也不会为了追赶旧时间线而缩短或跳过锚点停留。
-
-`anchor_time_percent` 划分的是计划中的普通运镜和锚点停留时间；回锚点的路程属于转换
-开销，因此真实墙钟占比会有轻微差异。完整动作和完整停留优先于机械追求百分比。
-每个锚点停留结束后才生成下一周期。内部的 ±30% 变化不作为额外界面设置。
-
-- 设为 0%：只做四区域运镜。
-- 设为 100%：开始前回到锚点并连续续接完整停留；不会反复发送无意义的回锚指令。
-- 其他数值：按计划时间分配，不是按指令条数抽签。
-
-开始前和录制停止后的安全回锚点不属于这个随机周期，也不会污染成片中的锚点时间占比。
-
-### 行进、到点和变焦
-
-同一套时间状态跨越底盘行进与到点停留，不会在每个点额外强塞一段锚点画面：
-
-- 普通自动运镜：底盘行进或停稳时都可以缓慢改变 yaw/pitch；到达一个目标后立即继续，
-  不增加额外停顿。
-- 回锚点、底盘行进时：只回到并保持锚点 yaw/pitch，zoom 保持当前值。
-- 已到锚点、底盘停稳时：完整锚点停留已经开始，此时才允许变焦，并在离开前恢复
-  完整锚点。
-
-因此「锚点停留时间」包含停稳时的锚点变焦时间，而不是另设一个静止概率。变焦没有
-机器人心跳回传；应用只能记录最近下发的倍率。已经退役的到点扫视不会参与运行。
-
-机器人到达路线点位后仍会保留一小段内部取景窗口，默认以 7.5 秒为中心做 ±30% 变化；
-这是底盘停稳的拍摄窗口，不是镜头目标停顿，也不作为用户设置。不开录像的「试跑」会
-完全跳过这段窗口。
-
-巡游到点始终只依据 `goal_status`。应用不会等待 `object_status`，并会在下发前移除旧清单里的 `goal_object`；目标物识别或对准失败不能阻止拍摄。这是高于旧协议数据的产品规则。
-
-### 如何核对应用与机器人
-
-在正式应用打开「镜头设置 → 镜头控制 → 拍摄诊断」：
-
-| 项目 | 应用下发 | 机器人心跳 |
-| --- | --- | --- |
-| 水平 yaw | 最近一条指令的起点与目标 | 实测角度 |
-| 俯仰 pitch | 最近一条指令的起点与目标 | 实测角度 |
-| 变焦 zoom | 应用内部记录 | 机器人不回传 |
-
-「已下发」只证明 WebSocket 写入成功，不证明机器人已经执行。完整记录在运行数据目录的 `logs/diagnostics.log`，可搜索 `robot.command.sent` 和 `gimbal_control`。断开连接或心跳过旧时，界面不会把应用保存的目标伪装成实测值。
-
-### 独立 HTML 调试页
-
-[tools/robot-control-console.html](tools/robot-control-console.html) 直接连接机器人 WebSocket，
-不经过 Python 后端。它保留手动 yaw/pitch 控制、心跳实测和目标偏差，并用与正式应用
-相同的自动运镜与锚点计时逻辑模拟巡游。
-
-- 调试页只验证 yaw/pitch；界面不展示变焦，发送包固定为 1×。
-- 配置使用本地存储 v2；旧 v1 的锚点、角度范围和速度会安全迁移，并补上默认 20% / 5 秒。已退役字段不会迁入新规划器。
-- 「模拟到达点位」只把底盘状态从行进切为停稳；它不重置时间阶段、区域历史或自动运镜，也不会额外发送一个目标。「停止并回锚点」才会结束模拟并回锚点。
-- 修改 HTML 不会自动修改正式应用；两份实现必须一起维护。
-
-### 主要修改位置和测试
-
-| 内容 | 位置 |
-| --- | --- |
-| 配置模型、默认值与范围 | [models.py](backend/src/automated_video_editing_backend/core/models.py) 的 `CameraworkConfig` |
-| 内部目标选择、锚点计时、停稳变焦 | [cruise.py](backend/src/automated_video_editing_backend/services/cruise.py) |
-| 自动运镜设置与拍摄诊断 | [App.vue](frontend/src/renderer/src/App.vue) |
-| 机器人命令、心跳和最近下发快照 | [robot.py](backend/src/automated_video_editing_backend/services/robot.py) |
-| 独立现场调试页 | [tools/robot-control-console.html](tools/robot-control-console.html) |
-
-修改后至少运行：
-
-```bash
-.venv/bin/python -m pytest backend/tests/test_cruise_camerawork.py backend/tests/test_robot.py
-node --test tools/tests/robot-control-console.test.mjs
-```
-
-更完整的巡游生命周期、故障策略和接口说明见 [docs/cruise_capture.md](docs/cruise_capture.md)。
+当前保留 NumPy、ONNX Runtime、tokenizers 和轻量 BAAI 模型用于本地文本对应，按需加载、限制推理线程与缓存。PySceneDetect、librosa、OpenCV、PyAV 及节拍检测仍已移除。FFmpeg／ffprobe 负责媒体探测、拼接、旁白微调、混音、字幕和编码。开发环境模型准备：`python scripts/prepare_assets.py --semantic-only`；发布流程自动校验并打包。

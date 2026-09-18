@@ -52,6 +52,7 @@ SCRIPT_FILES = (
 )
 
 EXCLUDED_PARTS = {
+    "archive",
     ".git",
     ".github",
     ".claude",
@@ -74,7 +75,7 @@ SECRET_PATTERNS = {
     "private key": re.compile(rb"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----"),
 }
 
-# Product features such as semantic matching remain in source.  These terms identify development
+# These terms identify development
 # assistant metadata or authorship claims, which do not belong in a neutral source delivery.
 ASSISTANT_TRACE_PATTERNS = {
     "Codex metadata": re.compile(rb"\bcodex\b", re.IGNORECASE),

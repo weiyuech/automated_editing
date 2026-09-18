@@ -4,6 +4,10 @@ import asyncio
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 import re
+import math
+import json
+from fractions import Fraction
+import subprocess
 from typing import TypeVar
 
 import httpx
@@ -57,39 +61,70 @@ def validate_downloaded_video(path: str | Path) -> None:
     own HTTP length. Opening the container, decoding real frames, and probing near the declared
     end prevents that snapshot from closing the capture recovery session as if it were final.
     """
+    from automated_video_editing_backend.services.render import RenderService
+
+    renderer = RenderService()
+    duration = renderer.probe_duration(str(path))
+    if duration is None or not math.isfinite(duration) or duration <= 0:
+        raise MediaDownloadNotReadyError("摄像头视频容器尚未写入完整")
+    probe = subprocess.run(
+        [
+            renderer.ffprobe_binary(),
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=avg_frame_rate",
+            "-of",
+            "json",
+            str(path),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
     try:
-        import cv2
-    except (ImportError, ModuleNotFoundError) as exc:  # pragma: no cover - declared dependency
-        raise RuntimeError("缺少视频完整性校验组件，无法安全保存摄像头录像") from exc
-
-    capture = cv2.VideoCapture(str(path))
-    try:
-        if not capture.isOpened():
-            raise MediaDownloadNotReadyError("摄像头视频容器尚未写入完整")
-
-        width = float(capture.get(cv2.CAP_PROP_FRAME_WIDTH) or 0.0)
-        height = float(capture.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0.0)
-        frame_count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-        first_ok, first = capture.read()
-        if not first_ok or first is None or width <= 0 or height <= 0:
-            raise MediaDownloadNotReadyError("摄像头视频尚未包含可读取画面")
-
-        if frame_count > 2:
-            # Avoid the exact final index: a few demuxers round frame counts upward by one. A
-            # probe at 95% still catches the large missing tail produced by an in-progress file.
-            probe_index = max(1, min(frame_count - 2, int(frame_count * 0.95)))
-            if capture.set(cv2.CAP_PROP_POS_FRAMES, probe_index):
-                tail_ok, tail = capture.read()
-                if not tail_ok or tail is None:
-                    raise MediaDownloadNotReadyError("摄像头视频尾部尚未写入完整")
-        else:
-            # A camera recording must contain motion-time media, not a still image renamed as a
-            # video. For unknown/very small frame counts, require a second decodable frame.
-            second_ok, second = capture.read()
-            if not second_ok or second is None:
-                raise MediaDownloadNotReadyError("摄像头视频尚未包含完整画面序列")
-    finally:
-        capture.release()
+        fps = float(Fraction(json.loads(probe.stdout)["streams"][0]["avg_frame_rate"]))
+        margin = 2 / fps if fps > 0 else 1.0
+    except (ValueError, KeyError, IndexError, ZeroDivisionError):
+        margin = 1.0
+    tail = max(0, min(duration * 0.95, duration - margin))
+    for position, frames in ((0, 2), (tail, 1)):
+        try:
+            result = subprocess.run(
+                [
+                    renderer.ffmpeg_binary(),
+                    "-v",
+                    "error",
+                    "-xerror",
+                    "-err_detect",
+                    "explode",
+                    "-ss",
+                    str(position),
+                    "-i",
+                    str(path),
+                    "-map",
+                    "0:v:0",
+                    "-frames:v",
+                    str(frames),
+                    "-vf",
+                    "scale=16:16",
+                    "-pix_fmt",
+                    "gray",
+                    "-f",
+                    "rawvideo",
+                    "pipe:1",
+                ],
+                capture_output=True,
+                timeout=30,
+                check=False,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise MediaDownloadNotReadyError("摄像头视频画面校验超时") from exc
+        if result.returncode or len(result.stdout) < frames * 256:
+            raise MediaDownloadNotReadyError("摄像头视频画面或尾部尚未写入完整")
 
 
 def exception_detail(exc: BaseException) -> str:
@@ -144,6 +179,7 @@ async def retry_camera_media_download(
     on_retry: Callable[[int, int, float, BaseException], None] | None = None,
 ) -> T:
     """Retry only transient camera-transfer failures, preserving cancellation and hard errors."""
+
     async def run_attempts() -> T:
         if initial_delay_seconds > 0:
             await asyncio.sleep(initial_delay_seconds)
@@ -170,7 +206,5 @@ async def retry_camera_media_download(
             return await run_attempts()
     except TimeoutError as exc:
         if timeout.expired():
-            raise TimeoutError(
-                f"摄像头媒体传输超过 {overall_timeout_seconds:g} 秒"
-            ) from exc
+            raise TimeoutError(f"摄像头媒体传输超过 {overall_timeout_seconds:g} 秒") from exc
         raise

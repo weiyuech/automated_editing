@@ -130,44 +130,11 @@ test('selecting the full row canonicalizes every child and child choices keep ti
   assert.deepEqual(changeCaptureChild(capture, firstClick, 'a', true)?.segment_ids, ['a', 'c'])
 })
 
-test('fine-tune capture children have unique UI ids but retain their root media id and real path', () => {
+test('fine-tune keeps one whole input per recording; subsets go through composition', () => {
   const capture = group()
-  const root = {
-    id: 'root-media-id',
-    name: 'capture.mp4',
-    path: '/managed/capture.mp4',
-    kind: 'video',
-    metadata: { role: 'raw_video', capture_group: capture }
-  }
-
+  const root = { id: 'root', path: '/managed/capture.mp4', metadata: { capture_group: capture } }
   const [result] = captureTuneSourceGroups([root])
-  assert.equal(result.title, capture.title)
-  assert.equal(result.sources[0].id, root.id)
-  assert.equal(result.sources[0].path, root.path)
-  assert.deepEqual(
-    result.sources.slice(1).map((source) => ({ id: source.id, media_id: source.media_id, path: source.path })),
-    [
-      { id: 'capture-segment:root-media-id:a', media_id: root.id, path: '/managed/a.mp4' },
-      { id: 'capture-segment:root-media-id:c', media_id: root.id, path: '/managed/c.mp4' }
-    ]
-  )
-  assert.equal(new Set(result.sources.map((source) => source.id)).size, result.sources.length)
-  assert.deepEqual(captureTuneClipIdentity(result.sources[1]), {
-    media_id: root.id,
-    source_path: '/managed/a.mp4'
-  })
-})
-
-test('fine-tune omits a missing master while keeping available child files', () => {
-  const capture = { ...group(), master_available: false }
-  const root = {
-    id: 'offline-root',
-    path: '/missing/master.mp4',
-    kind: 'video',
-    metadata: { role: 'raw_video', capture_group: capture }
-  }
-
-  const [result] = captureTuneSourceGroups([root])
-  assert.deepEqual(result.sources.map((source) => source.path), ['/managed/a.mp4', '/managed/c.mp4'])
-  assert.ok(result.sources.every((source) => source.media_id === root.id))
+  assert.equal(result.sources.length, 1)
+  assert.deepEqual(captureTuneClipIdentity(result.sources[0]), { media_id: 'root', source_path: root.path })
+  assert.deepEqual(captureTuneSourceGroups([{ ...root, metadata: { capture_group: { ...capture, master_available: false } } }]), [])
 })

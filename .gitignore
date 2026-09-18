@@ -1,4 +1,7 @@
 # Python
+# Frozen baseline requested by the operator. Never edit or package this directory.
+/archive/
+
 __pycache__/
 *.py[cod]
 .venv/

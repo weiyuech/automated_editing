@@ -1,5 +1,15 @@
 from __future__ import annotations
 
+from automated_video_editing_backend.core.composition import (
+    CompositionRequest,
+    CompositionConfirm,
+    MappedNarrationRequest,
+    NarrationAllocateRequest,
+    NarrationAdjustRequest,
+    NarrationConfirmRequest,
+    StudioPreviewRequest,
+)
+
 import asyncio
 from contextlib import suppress
 from pathlib import Path
@@ -375,38 +385,44 @@ def build_router(
         return framing_test.status()
 
     @router.post("/framing-test/confirm")
-    async def framing_test_confirm(
-        request: FramingPreferenceSaveRequest, _: Secured = None
-    ):
+    async def framing_test_confirm(request: FramingPreferenceSaveRequest, _: Secured = None):
         # A centred 16:9/9:16 preset needs no test clip. Only a custom position claims to have
         # been chosen from the real lens, so only that mode requires a live preview.
         if request.mode == "custom" and framing_test.preview_path is None:
             raise HTTPException(status_code=409, detail="自定义位置需要先完成取景测试")
         crop_x = 0.5 if request.mode == "center" else request.crop_x
         crop_y = 0.5 if request.mode == "center" else request.crop_y
-        summary = settings.update(SettingsUpdateRequest.model_validate({
-            "automation": {
-                "output_aspect_ratio": request.aspect_ratio,
-                "framing_configured": True,
-                "framing_mode": request.mode,
-                "framing_crop_x": crop_x,
-                "framing_crop_y": crop_y,
-            }
-        }))
+        summary = settings.update(
+            SettingsUpdateRequest.model_validate(
+                {
+                    "automation": {
+                        "output_aspect_ratio": request.aspect_ratio,
+                        "framing_configured": True,
+                        "framing_mode": request.mode,
+                        "framing_crop_x": crop_x,
+                        "framing_crop_y": crop_y,
+                    }
+                }
+            )
+        )
         await framing_test.discard()
         return summary
 
     @router.post("/framing-preference/clear")
     async def framing_preference_clear(_: Secured = None):
         """Return future edits to their source frame; a test preview may remain on screen."""
-        return settings.update(SettingsUpdateRequest.model_validate({
-            "automation": {
-                "framing_configured": False,
-                "framing_mode": "center",
-                "framing_crop_x": 0.5,
-                "framing_crop_y": 0.5,
-            }
-        }))
+        return settings.update(
+            SettingsUpdateRequest.model_validate(
+                {
+                    "automation": {
+                        "framing_configured": False,
+                        "framing_mode": "center",
+                        "framing_crop_x": 0.5,
+                        "framing_crop_y": 0.5,
+                    }
+                }
+            )
+        )
 
     @router.post("/camerawork-preference")
     async def camerawork_preference_save(
@@ -418,9 +434,11 @@ def build_router(
         administrator-only provider settings page.
         """
         profile = CameraworkConfig(configured=True, **request.model_dump())
-        return settings.update(SettingsUpdateRequest.model_validate({
-            "automation": {"camerawork": profile.model_dump(mode="json")}
-        }))
+        return settings.update(
+            SettingsUpdateRequest.model_validate(
+                {"automation": {"camerawork": profile.model_dump(mode="json")}}
+            )
+        )
 
     @router.get("/capture/sessions")
     async def capture_sessions(_: Secured = None):
@@ -430,7 +448,9 @@ def build_router(
     async def capture_start(request: CaptureStartRequest, _: Secured = None):
         require_camera_not_reserved()
         if cruise.is_running:
-            raise HTTPException(status_code=409, detail="A cruise is running; it already controls recording")
+            raise HTTPException(
+                status_code=409, detail="A cruise is running; it already controls recording"
+            )
         if capture.active_session() is not None:
             raise HTTPException(status_code=409, detail="已有采集正在进行，请先停止当前采集")
         # Persist ownership before sending Start. A disk failure must never leave the robot
@@ -628,7 +648,9 @@ def build_router(
         return vault.safe_cleanup()
 
     @router.post("/media/captures/{capture_id}/regenerate")
-    async def capture_regenerate(capture_id: str, request: CaptureRegenerateRequest, _: Secured = None):
+    async def capture_regenerate(
+        capture_id: str, request: CaptureRegenerateRequest, _: Secured = None
+    ):
         try:
             media.captures.retry(capture_id, request.offset_seconds)
             return {"status": "pending"}
@@ -636,9 +658,7 @@ def build_router(
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @router.post("/media/trash-preflight")
-    async def media_trash_preflight(
-        request: MediaTrashPreflightRequest, _: Secured = None
-    ):
+    async def media_trash_preflight(request: MediaTrashPreflightRequest, _: Secured = None):
         """Refuse a desktop trash operation while an accepted edit still owns any path."""
         if any(jobs.is_path_in_use(path) for path in dict.fromkeys(request.paths)):
             raise HTTPException(
@@ -695,6 +715,83 @@ def build_router(
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+    @router.post("/studio/previews")
+    async def studio_previews(request: StudioPreviewRequest, _: Secured = None):
+        try:
+            return await jobs.compositions.studio_previews(request)
+        except (ValueError, OSError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @router.post("/compositions/{key}/save")
+    async def composition_save(key: str, request: CompositionConfirm, _: Secured = None):
+        try:
+            return await jobs.compositions.save_material(key, request.signature)
+        except (ValueError, OSError) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @router.get("/compositions")
+    async def compositions_list(_: Secured = None):
+        return jobs.compositions.list()
+
+    @router.post("/compositions")
+    async def compositions_create(request: CompositionRequest, _: Secured = None):
+        try:
+            return await jobs.compositions.create(request)
+        except (ValueError, OSError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @router.get("/compositions/{key}")
+    async def compositions_get(key: str, _: Secured = None):
+        try:
+            return jobs.compositions.public(jobs.compositions.get(key))
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @router.delete("/compositions/{key}")
+    async def compositions_discard(key: str, _: Secured = None):
+        try:
+            jobs.compositions.discard(key)
+            return {"removed": True}
+        except (ValueError, OSError) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @router.post("/compositions/{key}/confirm")
+    async def compositions_confirm(key: str, request: CompositionConfirm, _: Secured = None):
+        try:
+            return await jobs.compositions.confirm(key, request.signature)
+        except (ValueError, OSError) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @router.post("/compositions/{key}/narration/draft")
+    async def mapped_narration_draft(
+        key: str, request: NarrationAllocateRequest, _: Secured = None
+    ):
+        try:
+            return await jobs.narration.allocate(key, request)
+        except (ValueError, OSError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @router.post("/compositions/{key}/narration")
+    async def mapped_narration_create(key: str, request: MappedNarrationRequest, _: Secured = None):
+        try:
+            return await jobs.narration.start(key, request)
+        except (ValueError, OSError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @router.post("/compositions/{key}/narration/adjust")
+    async def mapped_narration_adjust(key: str, request: NarrationAdjustRequest, _: Secured = None):
+        try:
+            return await jobs.narration.adjust(key, request)
+        except (ValueError, OSError) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @router.post("/compositions/{key}/narration/confirm")
+    async def mapped_narration_confirm(key: str, request: NarrationConfirmRequest, _: Secured = None):
+        try:
+            return jobs.narration.confirm(key, request.attempt_id, request.review_id)
+        except (ValueError, OSError) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
     @router.get("/jobs")
     async def jobs_list(_: Secured = None):
         return jobs.list_jobs()
@@ -702,7 +799,9 @@ def build_router(
     @router.post("/editing/capabilities")
     async def editing_capabilities(request: EditingCapabilityRequest, _: Secured = None):
         try:
-            return await jobs.editing_capabilities(request.media_ids, request.music_media_ids, request.capture_selections)
+            return await jobs.editing_capabilities(
+                request.media_ids, request.music_media_ids, request.capture_selections
+            )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -902,7 +1001,7 @@ def build_router(
     @router.post("/tts/generate")
     async def tts_generate(request: TTSGenerateRequest, _: Secured = None):
         try:
-            # Capture notes describe the picture for local semantic matching. They are never
+            # Capture notes describe the picture for explicit composition mapping. They are never
             # narration input: a camera/location reminder must not become customer-facing speech.
             if not request.text.strip():
                 raise ValueError("Voiceover needs text")
@@ -946,7 +1045,9 @@ def build_router(
     @router.post("/seedance/frame")
     async def seedance_frame(request: SeedanceFrameRequest, _: Secured = None):
         try:
-            return await seedance.extract_frame(request.source_video_media_id, request.timestamp_seconds)
+            return await seedance.extract_frame(
+                request.source_video_media_id, request.timestamp_seconds
+            )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except RuntimeError as exc:

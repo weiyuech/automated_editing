@@ -1,9 +1,6 @@
-import random
 
-import pytest
 
 from automated_video_editing_backend.core.models import (
-    EditBatchRequest,
     EditJobRequest,
     EditTimeline,
     MediaItem,
@@ -49,62 +46,11 @@ def _timeline(**kw):
 
 # ── distribution ────────────────────────────────────────────────────────────────────────────
 
-def test_deal_effects_empty_pool_decorates_nothing():
-    svc = JobService(DummyEvents(), None, None, None, None)
-    assert svc._deal_effects([], 3, "auto", random.Random(0)) == [None, None, None]
-
-
-def test_deal_effects_all_scope_gives_every_output_one():
-    svc = JobService(DummyEvents(), None, None, None, None)
-    assert svc._deal_effects(["e1"], 3, "all", random.Random(0)) == ["e1", "e1", "e1"]
-
-
-def test_deal_effects_auto_scope_decorates_best_ranked_outputs_only():
-    svc = JobService(DummyEvents(), None, None, None, None)
-    # 2 effects, 5 outputs, best-first ranking [2,0,...] -> outputs 2 and 0 get distinct effects.
-    res = svc._deal_effects(["e1", "e2"], 5, "auto", random.Random(1), ranking=[2, 0, 4, 1, 3])
-    assert sum(1 for x in res if x) == 2
-    assert res[2] is not None and res[0] is not None
-    assert res[1] is None and res[3] is None and res[4] is None
-    assert res[0] != res[2]
-
-
-def test_deal_effects_auto_without_ranking_is_random_subset():
-    svc = JobService(DummyEvents(), None, None, None, None)
-    res = svc._deal_effects(["e1", "e2"], 5, "auto", random.Random(2))
-    assert sum(1 for x in res if x) == 2
-    assert {x for x in res if x} == {"e1", "e2"}
-
 
 # ── timeline decoration ─────────────────────────────────────────────────────────────────────
 
 def _service(items, duration=3.0):
     return JobService(DummyEvents(), FakeMedia(items), None, None, FakeRenderer(duration))
-
-
-def test_media_pool_accepts_only_generated_video_effects():
-    source = MediaItem(
-        id="source",
-        path="/x/source.mp4",
-        kind="video",
-        metadata={"source": "local_import", "role": "raw_video"},
-    )
-    effect = MediaItem(
-        id="effect", path="/x/effect.mp4", kind="video", metadata={"role": "seedance_effect"},
-    )
-    service = _service([source, effect])
-
-    service._validate_batch_request(EditBatchRequest(
-        media_ids=[source.id],
-        intro_effect_media_ids=[effect.id],
-        outro_effect_media_ids=[effect.id],
-    ))
-
-    with pytest.raises(ValueError, match="Effect pool"):
-        service._validate_batch_request(EditBatchRequest(
-            media_ids=[source.id],
-            intro_effect_media_ids=[source.id],
-        ))
 
 
 def test_intro_prepends_shifts_clips_and_pushes_bed_when_cover_off():

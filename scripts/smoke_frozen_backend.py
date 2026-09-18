@@ -45,7 +45,6 @@ def main() -> int:
     base = f"http://127.0.0.1:{port}"
     with tempfile.TemporaryDirectory(prefix="ave-release-smoke-") as profile:
         env["APP_ROOT"] = profile
-        env["NUMBA_CACHE_DIR"] = str(Path(profile) / "numba")
         with tempfile.TemporaryFile(mode="w+b") as log:
             process = subprocess.Popen(
                 args.command,

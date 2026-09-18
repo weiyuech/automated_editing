@@ -106,7 +106,9 @@ class MediaRenameService:
                         try:
                             payload = json.loads(paired.read_text(encoding="utf-8"))
                         except (OSError, json.JSONDecodeError) as exc:
-                            raise ValueError(f"{paired.name} 无法更新新的成片文件名：{exc}") from exc
+                            raise ValueError(
+                                f"{paired.name} 无法更新新的成片文件名：{exc}"
+                            ) from exc
                         if not isinstance(payload, dict):
                             raise ValueError(f"{paired.name} 格式不正确，无法更新成片文件名")
                         if "video" in payload:
@@ -130,6 +132,12 @@ class MediaRenameService:
             moves.append((capture_sidecar, capture_target))
         if move_gimbal_sidecar:
             moves.append((gimbal_sidecar, gimbal_target))
+        from automated_video_editing_backend.services.composition_assets import manifest_path
+
+        if manifest_path(source).is_file():
+            if manifest_path(target).exists():
+                raise ValueError("目标组合记录已存在")
+            moves.append((manifest_path(source), manifest_path(target)))
         moves.extend(export_sidecars)
         self._rename_files(moves, rewritten_subtitles)
 
@@ -232,9 +240,7 @@ class MediaRenameService:
         if asset_id:
             candidates.append(self.seedance.effects_dir / f"{asset_id}.json")
         candidates.extend(
-            path
-            for path in self.seedance.effects_dir.glob("*.json")
-            if path not in candidates
+            path for path in self.seedance.effects_dir.glob("*.json") if path not in candidates
         )
         for metadata_path in candidates:
             try:

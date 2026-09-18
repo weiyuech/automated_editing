@@ -226,7 +226,7 @@ function managedCompanionPaths(targetPath) {
     || isInsideDirectory(join(root, 'data', 'capture_segments'), targetPath)
   )) {
     // Capture notes use the complete media filename, including its extension.
-    return [`${targetPath}.capture.json`, `${targetPath}.gimbal.json`]
+    return [`${targetPath}.capture.json`, `${targetPath}.gimbal.json`, `${targetPath}.composition.json`]
   }
   if (AUDIO_FILE_EXTS.has(extension) && isInsideDirectory(join(root, 'data', 'tts'), targetPath)) {
     return [`${stem}.json`]
@@ -301,7 +301,6 @@ async function startBackend() {
     APP_BACKEND_PORT: String(backendPort),
     APP_BRIDGE_TOKEN: BRIDGE_TOKEN,
     APP_MANAGED_BY_ELECTRON: '1',
-    NUMBA_CACHE_DIR: join(root, '.cache', 'numba'),
     ...externalMediaTools,
     ...(app.isPackaged
       ? {}

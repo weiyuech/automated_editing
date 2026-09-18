@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "automated-video-editing-backend"
-version = "0.1.7"
-description = "Python backend for robot-assisted automated video editing"
+version = "0.1.8"
+description = "Python backend for controlled robot capture and precise video concatenation"
 requires-python = ">=3.11"
 dependencies = [
   "fastapi>=0.111",
@@ -14,30 +14,12 @@ dependencies = [
   "python-multipart>=0.0.9",
   "httpx>=0.27",
   "websockets>=12",
-  "numpy>=1.26,<2.3",
-  # PySceneDetect 0.7.1 already supplies the audited OpenCV 5 runtime. Depending on both the
-  # GUI and headless wheels installs the same cv2 namespace twice and doubles the binary audit
-  # surface, so this is intentionally one dependency path.
-  "scenedetect==0.7.1",
-  # CPU-only local semantic matching. The 24 MB INT8 model is fetched as a pinned asset by
-  # scripts/prepare_assets.py; no network call is made while editing.
-  "onnxruntime>=1.19,<2",
-  "tokenizers>=0.20,<1",
+  "numpy>=1.26",
+  "onnxruntime>=1.18",
+  "tokenizers>=0.19",
 ]
 
 [project.optional-dependencies]
-# The fully bundled edition uses PyAV for direct container reads.  The external-media-tools
-# edition deliberately omits this extra because official PyAV wheels bundle an FFmpeg build;
-# it uses the timestamp-repaired OpenCV proxy path instead.
-pyav = [
-  "av>=12"
-]
-beat = [
-  "librosa==0.11.0",
-  "numba==0.61.2",
-  "llvmlite==0.44.0"
-]
-
 # Needed only by scripts/prepare_assets.py, never at runtime. It pins the bundled variable fonts
 # to a single weight: Google ships Noto Sans SC and Noto Serif SC with the lightest weight as the
 # default instance, libass does not instance variable fonts, and Thin text over footage cannot be
@@ -62,3 +44,7 @@ asyncio_mode = "auto"
 
 [tool.ruff]
 line-length = 100
+
+[tool.ruff.lint]
+# Preserve this project's established correctness checks across Ruff default changes.
+select = ["E4", "E7", "E9", "F"]
