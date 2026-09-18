@@ -435,8 +435,11 @@ async def test_library_saves_independent_root_materials_in_tree_order(studio, tm
     previews = await studio.studio_previews(
         StudioPreviewRequest(media_ids=[material.id, another.id], subtitles=False)
     )
+    # Completed renders leave the active-task registry immediately. Snapshot the
+    # remaining tasks before yielding, then verify every persisted result below.
+    pending = [studio.tasks[p["id"]] for p in previews if p["id"] in studio.tasks]
+    await asyncio.wait_for(asyncio.gather(*pending), 30)
     for preview in previews:
-        await studio.tasks[preview["id"]]
         r = studio.get(preview["id"])
         assert r["status"] == "ready", r["error"]
         assert len(r["timeline"]["clips"]) == 1
