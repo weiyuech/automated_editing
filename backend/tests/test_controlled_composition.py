@@ -323,7 +323,9 @@ async def test_one_complete_synthesis_binds_saved_video_and_follows_pool(studio,
     assert state["status"] == "ready"
     assert tts.calls == [request.text]
     assert studio.renderer.probe_duration(state["audio_path"]) == pytest.approx(0.6, abs=0.002)
-    metadata = json.loads(Path(state["audio_path"]).with_suffix(".json").read_text())
+    metadata = json.loads(
+        Path(state["audio_path"]).with_suffix(".json").read_text(encoding="utf-8")
+    )
     assert metadata["whole_audio"] is True
     assert metadata["mapped_cues"] == [
         {"text": request.text, "start": 0, "end": pytest.approx(0.6)}
@@ -826,7 +828,9 @@ async def test_local_audio_waits_for_next_point_and_subtitle_clock_follows(studi
     assert state["status"] == "pending_review", state.get("error")
     assert state["local_alignment"]
     assert state["checks"][1]["actual_start"] == pytest.approx(2.1)
-    words = json.loads(Path(state["audio_path"]).with_suffix(".json").read_text())["words"]
+    words = json.loads(
+        Path(state["audio_path"]).with_suffix(".json").read_text(encoding="utf-8")
+    )["words"]
     assert words[1]["start_time"] == 2100
     # The rendered audio really contains silence before B, not only a changed metadata clock.
     samples = subprocess.check_output(
