@@ -171,13 +171,10 @@ onUnmounted(() => {
     </div>
     <div class="workbench-scroll">
       <div class="intro">
-        <strong>以你确认的画面为准</strong>
+        <strong>以您确认的画面为准</strong>
         <p>
-          每个选中的视频分别生成一条成片，保留完整画面和顺序。需要跨点位拼接，请先在媒体库保存组合。
+          请从左侧选用视频，每条独立成片，保留完整画面与顺序。机器人录制或跨点位拼接，请先在媒体库确认并保存组合。
         </p>
-      </div>
-      <div v-if="!sources.length" class="empty">
-        从左侧选用视频。机器人录制请先在媒体库组合并确认。
       </div>
       <div v-for="item in sources" :key="item.id" class="input-row">
         <span>{{ name(item) }}</span

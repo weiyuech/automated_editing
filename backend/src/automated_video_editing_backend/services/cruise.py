@@ -25,7 +25,8 @@ from automated_video_editing_backend.services.robot import RobotCommandNotSentEr
 
 from automated_video_editing_backend.services.camera_program import camera_program
 
-_CW_POSE_TOLERANCE_DEG = 0.5
+# Per-axis arrival tolerance for every pose; commanded targets remain exact.
+_CW_POSE_TOLERANCE_DEG = 2.0
 _CW_POSE_POLL_SECONDS = 0.2
 _CW_POSE_STABLE_SAMPLES = 2
 _ARRIVAL_TIMEOUT_SECONDS = 60.0
