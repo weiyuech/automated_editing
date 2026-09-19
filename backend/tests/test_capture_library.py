@@ -296,7 +296,7 @@ async def test_one_bad_pending_capture_does_not_starve_the_next_one(tmp_path, mo
         captures.groups[key]["status"] = "ready"
         reached_healthy.set()
 
-    monkeypatch.setattr(captures, "prepare", prepare)
+    monkeypatch.setattr(captures, "ensure_timeline", prepare)
     await captures.start(lambda: None)
     try:
         await asyncio.wait_for(reached_healthy.wait(), timeout=0.5)
@@ -818,3 +818,51 @@ def test_derived_capture_document_is_not_published_if_gimbal_write_fails(tmp_pat
         captures._write_evidence(group, target, [(0.0, 1.0)])
 
     assert not sidecar_path(target).exists()
+
+
+@pytest.mark.asyncio
+async def test_lazy_timeline_is_previewable_and_persistent_without_child_encoding(
+    tmp_path, monkeypatch
+):
+    master = _video(tmp_path / "master.mp4", 2)
+    sidecar_path(master).write_text(json.dumps(_evidence()))
+    item = MediaItem(id="root", path=str(master), kind="video", metadata={"role": "raw_video"})
+    captures = CaptureLibrary(tmp_path / "captures.json", tmp_path / "segments")
+    captures.enrich({item.id: item})
+
+    async def forbidden(*args, **kwargs):
+        raise AssertionError("Automatic timeline preparation must not encode videos")
+
+    monkeypatch.setattr(captures, "_encode", forbidden)
+    group = await captures.ensure_timeline("capture-1")
+    assert group["status"] == "ready"
+    assert group["segments"]
+    assert all(
+        child["status"] == "virtual" and not child.get("path") for child in group["segments"]
+    )
+    assert not list(captures.directory.rglob("*.mp4"))
+    restored = CaptureLibrary(captures.path, captures.directory)
+    restored.enrich({item.id: item})
+    public = item.metadata["capture_group"]
+    assert public["master_available"]
+    assert public["segments"][0]["status"] == "virtual"
+    assert not restored.problem
+    # Calibration only updates time intervals; the original media is untouched.
+    before = master.read_bytes()
+    restored.retry("capture-1", 0.1)
+    adjusted = await restored.ensure_timeline("capture-1")
+    assert adjusted["timeline_version"] != group["timeline_version"]
+    assert master.read_bytes() == before
+    assert not list(restored.directory.rglob("*.mp4"))
+
+
+@pytest.mark.asyncio
+async def test_other_capture_timeline_does_not_wait_for_an_encoding_group(tmp_path, monkeypatch):
+    master = _video(tmp_path / "master.mp4", 2)
+    captures = CaptureLibrary(tmp_path / "captures.json", tmp_path / "segments")
+    for key in ("one", "two"):
+        captures.groups[key] = _group(master, id=key, status="pending", duration=0)
+        captures.groups[key].pop("timeline_version", None)
+    async with captures._group_lock("one"):
+        group = await asyncio.wait_for(captures.ensure_timeline("two"), timeout=2)
+    assert group["status"] == "ready"

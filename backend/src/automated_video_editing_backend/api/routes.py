@@ -5,8 +5,8 @@ from automated_video_editing_backend.core.composition import (
     CompositionConfirm,
     MappedNarrationRequest,
     NarrationAllocateRequest,
+    NarrationPromptRequest,
     NarrationAdjustRequest,
-    NarrationConfirmRequest,
     StudioPreviewRequest,
 )
 
@@ -755,12 +755,28 @@ def build_router(
         except (ValueError, OSError) as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 
+    @router.post("/compositions/{key}/cancel")
+    async def compositions_cancel(key: str, _: Secured = None):
+        try:
+            return await jobs.compositions.cancel(key)
+        except (ValueError, OSError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
     @router.post("/compositions/{key}/confirm")
     async def compositions_confirm(key: str, request: CompositionConfirm, _: Secured = None):
         try:
             return await jobs.compositions.confirm(key, request.signature)
         except (ValueError, OSError) as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @router.post("/compositions/{key}/narration/prompt")
+    async def mapped_narration_prompt_preview(
+        key: str, request: NarrationPromptRequest, _: Secured = None
+    ):
+        try:
+            return jobs.narration.prompt(key, request)
+        except (ValueError, OSError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @router.post("/compositions/{key}/narration/draft")
     async def mapped_narration_draft(
@@ -782,13 +798,6 @@ def build_router(
     async def mapped_narration_adjust(key: str, request: NarrationAdjustRequest, _: Secured = None):
         try:
             return await jobs.narration.adjust(key, request)
-        except (ValueError, OSError) as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
-
-    @router.post("/compositions/{key}/narration/confirm")
-    async def mapped_narration_confirm(key: str, request: NarrationConfirmRequest, _: Secured = None):
-        try:
-            return jobs.narration.confirm(key, request.attempt_id, request.review_id)
         except (ValueError, OSError) as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 
@@ -973,6 +982,20 @@ def build_router(
         except RuntimeError as exc:
             raise HTTPException(status_code=500, detail=str(exc)) from exc
 
+    @router.post("/tts/prompt")
+    async def tts_prompt_preview(request: VoiceoverDraftRequest, _: Secured = None):
+        try:
+            baseline = llm.voiceover_prompt(request.text, request.target_seconds)
+            return {
+                **llm.voiceover_prompt(
+                    request.text, request.target_seconds,
+                    instructions=request.instructions, system_prompt=request.system_prompt,
+                ),
+                "baseline_system": baseline["system"],
+            }
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
     @router.post("/tts/draft", response_model=VoiceoverDraftResult)
     async def tts_draft(request: VoiceoverDraftRequest, _: Secured = None):
         """Create an LLM draft without synthesising or spending TTS quota.
@@ -985,7 +1008,10 @@ def build_router(
             source_text = request.text.strip()
             if not source_text:
                 raise ValueError("Voiceover needs text")
-            draft_text = await llm.draft_voiceover(source_text, request.target_seconds)
+            draft_text = await llm.draft_voiceover(
+                source_text, request.target_seconds,
+                instructions=request.instructions, system_prompt=request.system_prompt,
+            )
             if not draft_text.strip():
                 raise ValueError("Nothing usable was found in the text")
             return VoiceoverDraftResult(

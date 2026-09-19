@@ -1,5 +1,7 @@
 <script setup>
 import { computed, onMounted, onUnmounted, ref } from 'vue'
+import PreviewProgress from './PreviewProgress.vue'
+import { isPreviewPending } from '../preview-progress.js'
 import CaptureGroupPicker from './CaptureGroupPicker.vue'
 import CompositionTree from './CompositionTree.vue'
 import {
@@ -18,13 +20,16 @@ const title = ref('我的组合'),
   search = ref(''),
   busy = ref(false),
   error = ref(''),
-  message = ref('')
+  message = ref(''),
+  cancelling = ref(false)
 const reviewed = ref(false),
   video = ref(null),
   stopAt = ref(null),
   builtChoice = ref('')
 let timer,
-  disposed = false
+  disposed = false,
+  selectionRevision = 0,
+  refreshRevision = 0
 const sources = computed(() =>
   items.value
     .filter(
@@ -77,10 +82,12 @@ async function safe(fn) {
   }
 }
 async function refresh() {
+  const requested = ++refreshRevision
   const [m, r] = await Promise.all([
     props.api('/media'),
     props.api('/compositions'),
   ])
+  if (disposed || requested !== refreshRevision) return
   items.value = m
   records.value = r.filter((c) => c.request.purpose === 'library')
 }
@@ -102,6 +109,8 @@ function toggle(item, checked) {
   if (!captureGroup(item)) delete choices.value[item.id]
 }
 function load(r) {
+  selectionRevision++
+  cancelling.value = false
   record.value = r || null
   reviewed.value = false
   message.value = ''
@@ -126,17 +135,42 @@ function load(r) {
     }
   builtChoice.value = fingerprint.value
 }
+function updateRecord(updated) {
+  record.value = updated
+  const index = records.value.findIndex(item => item.id === updated.id)
+  if (index === -1) records.value.unshift(updated)
+  else records.value.splice(index, 1, updated)
+}
 async function build() {
+  refreshRevision++
+  const requested = ++selectionRevision
+  const input = JSON.stringify(request.value)
   await safe(async () => {
-    record.value = await props.api('/compositions', {
-      method: 'POST',
-      body: JSON.stringify(request.value),
-    })
-    builtChoice.value = fingerprint.value
+    const created = await props.api('/compositions', { method: 'POST', body: input })
+    if (disposed || requested !== selectionRevision) return
+    // Show the queued record immediately; media scanning is unrelated to starting
+    // a preview and must not keep the creation button busy.
+    updateRecord(created)
+    builtChoice.value = input
     reviewed.value = false
     message.value = ''
-    await refresh()
   })
+}
+async function cancel() {
+  if (!isPreviewPending(record.value) || cancelling.value) return
+  const requested = ++selectionRevision
+  refreshRevision++
+  const id = record.value.id
+  cancelling.value = true
+  error.value = ''
+  try {
+    const updated = await props.api(`/compositions/${id}/cancel`, { method: 'POST' })
+    if (!disposed && requested === selectionRevision && record.value?.id === id) updateRecord(updated)
+  } catch (e) {
+    if (!disposed && requested === selectionRevision) error.value = e.message
+  } finally {
+    if (!disposed && requested === selectionRevision) cancelling.value = false
+  }
 }
 async function save() {
   await safe(async () => {
@@ -194,11 +228,16 @@ function timeUpdate() {
 }
 async function poll() {
   if (disposed) return
+  const requested = selectionRevision
+  const id = record.value?.id
+  const current = () => !disposed && requested === selectionRevision && record.value?.id === id
   try {
-    if (['queued', 'building'].includes(record.value?.status))
-      record.value = await props.api(`/compositions/${record.value.id}`)
+    if (isPreviewPending(record.value) && !cancelling.value) {
+      const updated = await props.api(`/compositions/${id}`)
+      if (current()) updateRecord(updated)
+    }
   } catch (e) {
-    error.value = e.message
+    if (current()) error.value = e.message
   }
   if (!disposed) timer = setTimeout(poll, 1500)
 }
@@ -231,7 +270,7 @@ onUnmounted(() => {
         <option value="">新组合</option>
         <option v-for="r in records" :key="r.id" :value="r.id">
           {{ r.title }} · {{ formatCaptureTime(r.duration)
-          }}{{ r.material_path ? ' · 已保存' : '' }}
+          }}{{ r.status === 'cancelled' ? ' · 已取消' : r.material_path ? ' · 已保存' : '' }}
         </option></select
       ><button
         v-if="record && !record.material_path"
@@ -304,17 +343,8 @@ onUnmounted(() => {
           }}
         </button>
         <div v-if="record" class="review">
-          <p>
-            {{ record.message }}
-            <strong v-if="record.duration"
-              >· {{ formatCaptureTime(record.duration) }}</strong
-            >
-          </p>
-          <progress
-            v-if="['queued', 'building'].includes(record.status)"
-            :value="record.progress"
-            max="1"
-          />
+          <PreviewProgress :record="record" :cancelling="cancelling" @cancel="cancel" />
+          <p v-if="record.duration">画面时长 {{ formatCaptureTime(record.duration) }}</p>
           <p v-if="record.error" class="error">{{ record.error }}</p>
           <template v-if="record.status === 'ready'"
             ><video
@@ -452,7 +482,7 @@ video {
 summary {
   cursor: pointer;
   font-size: 13px;
-  padding: 14px 0;
+  padding: 8px 0;
 }
 .confirm {
   display: flex;

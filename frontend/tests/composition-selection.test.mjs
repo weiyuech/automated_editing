@@ -3,6 +3,9 @@ import assert from 'node:assert/strict'
 import {
   linkedVoiceSelection,
   poolWithoutVoice,
+  poolWithItems,
+  poolWithoutSources,
+  activeVoiceSource,
 } from '../src/shared/composition-selection.js'
 import { isMediaPoolEligible } from '../src/shared/media-policy.js'
 
@@ -38,7 +41,7 @@ test('checking and unchecking combinations derives exactly their active narratio
       voices,
       ['va'],
     ),
-    ['vb'],
+    [],
   )
 })
 test('removing a bound voice removes its source membership but preserves unrelated inputs', () => {
@@ -50,6 +53,7 @@ test('removing a bound voice removes its source membership but preserves unrelat
       },
       ['va'],
       voices,
+      sources,
     ),
     { source_media_ids: ['b'], voiceover_media_ids: ['vb', 'ordinary'] },
   )
@@ -91,4 +95,27 @@ test('flat pool accepts saved combinations but excludes recording trees and supe
     }),
     true,
   )
+})
+
+test('either asset adds its active counterpart; removing sources removes only their paired voice', () => {
+  const empty = { source_media_ids: [], voiceover_media_ids: [] }
+  const paired = { source_media_ids: ['a'], voiceover_media_ids: ['va'] }
+  assert.deepEqual(poolWithItems(empty, 'source', ['a'], sources, voices), paired)
+  assert.deepEqual(poolWithItems(empty, 'voiceover', ['va'], sources, voices), paired)
+  assert.deepEqual(poolWithoutSources(paired, ['a'], sources, voices), empty)
+  assert.equal(activeVoiceSource(voices[0], sources)?.id, 'a')
+  assert.equal(activeVoiceSource(voices[2], sources), null)
+})
+test('regeneration swaps selected voice by reciprocal binding without reviving historical audio', () => {
+  const nextSources = [{ id: 'a', metadata: { bound_voice_id: 'new' } }]
+  const nextVoices = [
+    { id: 'va', metadata: { binding_id: 'old' } },
+    { id: 'new', metadata: { binding_id: 'new', bound_source_id: 'a' } },
+    { id: 'pending', metadata: { binding_id: 'pending' } },
+  ]
+  assert.deepEqual(linkedVoiceSelection(['a'], nextSources, nextVoices, ['va']), ['new'])
+  assert.equal(activeVoiceSource(nextVoices[0], nextSources), null)
+  assert.deepEqual(poolWithoutVoice(
+    { source_media_ids: ['a'], voiceover_media_ids: ['new'] }, ['va'], nextVoices, nextSources,
+  ), { source_media_ids: ['a'], voiceover_media_ids: ['new'] })
 })

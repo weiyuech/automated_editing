@@ -1,4 +1,6 @@
 <script setup>
+import PreviewProgress from './PreviewProgress.vue'
+import { isPreviewPending } from '../preview-progress.js'
 import SubtitleFontPicker from './SubtitleFontPicker.vue'
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 const props = defineProps({
@@ -31,9 +33,12 @@ const records = ref([]),
   accepted = ref({}),
   busy = ref(false),
   error = ref(''),
-  built = ref('')
+  built = ref(''),
+  cancelling = ref({})
 let timer,
-  disposed = false
+  disposed = false,
+  generation = 0
+const recordRevisions = new Map()
 const request = computed(() => ({
   title: title.value,
   media_ids: props.sources.map((i) => i.id),
@@ -50,7 +55,7 @@ const request = computed(() => ({
 const clean = computed(() => built.value === JSON.stringify(request.value))
 const active = computed(() => records.value.find((r) => r.id === current.value))
 const rendering = computed(() =>
-  records.value.some((r) => ['queued', 'building'].includes(r.status)),
+  records.value.some(isPreviewPending),
 )
 const exportable = computed(() =>
   records.value.filter(
@@ -72,12 +77,17 @@ async function safe(fn) {
   }
 }
 async function build() {
+  const epoch = ++generation
   await safe(async () => {
     const input = request.value
-    records.value = await props.api('/studio/previews', {
+    const created = await props.api('/studio/previews', {
       method: 'POST',
       body: JSON.stringify(input),
     })
+    if (disposed || generation !== epoch) return
+    records.value = created
+    cancelling.value = {}
+    recordRevisions.clear()
     built.value = JSON.stringify(input)
     current.value = records.value[0]?.id || ''
     accepted.value = {}
@@ -95,15 +105,39 @@ async function confirm() {
     }
   })
 }
+async function cancel(record) {
+  if (!isPreviewPending(record) || cancelling.value[record.id]) return
+  const epoch = generation
+  const revision = (recordRevisions.get(record.id) || 0) + 1
+  recordRevisions.set(record.id, revision)
+  cancelling.value[record.id] = true
+  error.value = ''
+  try {
+    const updated = await props.api(`/compositions/${record.id}/cancel`, { method: 'POST' })
+    if (!disposed && generation === epoch && records.value.includes(record)) {
+      Object.assign(record, updated)
+      delete accepted.value[record.id]
+    }
+  } catch (e) {
+    if (!disposed && generation === epoch) error.value = e.message
+  } finally {
+    if (!disposed && generation === epoch) delete cancelling.value[record.id]
+  }
+}
 async function poll() {
   if (disposed) return
-  try {
-    for (const record of records.value)
-      if (['queued', 'building'].includes(record.status))
-        Object.assign(record, await props.api(`/compositions/${record.id}`))
-  } catch (e) {
-    error.value = e.message
-  }
+  const epoch = generation
+  await Promise.all(records.value.filter(record => isPreviewPending(record) && !cancelling.value[record.id]).map(async record => {
+    const revision = recordRevisions.get(record.id) || 0
+    const current = () => !disposed && generation === epoch && records.value.includes(record)
+      && (recordRevisions.get(record.id) || 0) === revision
+    try {
+      const updated = await props.api(`/compositions/${record.id}`)
+      if (current()) Object.assign(record, updated)
+    } catch (e) {
+      if (current()) error.value = e.message
+    }
+  }))
   if (!disposed) timer = setTimeout(poll, 1500)
 }
 onMounted(() => {
@@ -218,6 +252,7 @@ onUnmounted(() => {
         {{ rendering ? '正在生成预览…' : '生成成片预览' }}
       </button>
       <section v-if="records.length" class="previews">
+        <PreviewProgress v-for="record in records.filter(item => isPreviewPending(item) || item.status === 'cancelled')" :key="record.id" :record="record" :cancelling="Boolean(cancelling[record.id])" :show-title="records.length > 1" @cancel="cancel(record)" />
         <label
           >查看预览<select v-model="current" class="field">
             <option v-for="r in records" :key="r.id" :value="r.id">
@@ -227,6 +262,8 @@ onUnmounted(() => {
                   ? '已提交导出'
                   : r.status === 'ready'
                     ? '待确认'
+                    : r.status === 'cancelled'
+                      ? '已取消'
                     : r.status === 'failed'
                       ? '失败'
                       : '生成中'
@@ -235,17 +272,12 @@ onUnmounted(() => {
           </select></label
         >
         <template v-if="active"
-          ><p>
+          ><p v-if="!isPreviewPending(active) && active.status !== 'cancelled'">
             {{ active.message
             }}<span v-if="active.duration">
               · {{ Number(active.duration).toFixed(2) }} 秒</span
             >
           </p>
-          <progress
-            v-if="['queued', 'building'].includes(active.status)"
-            :value="active.progress"
-            max="1"
-          />
           <p v-if="active.error" class="danger">{{ active.error }}</p>
           <p v-for="warning in active.warnings" :key="warning" class="warn">
             {{ warning }}

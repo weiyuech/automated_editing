@@ -496,11 +496,13 @@
                       <span><span class="role-pill" :class="row.role || 'export'">{{ row.capture ? '拍摄' : roleLabel('export') }}</span></span>
                       <span class="group-name">
                         <span class="group-caret" :class="{ open: expandedVaultGroups[row.key] }">▸</span>
-                        {{ row.name }}
+                        <span class="group-copy">
+                          <span class="group-title" :title="row.name">{{ row.name }}</span>
+                          <span class="group-count">{{ row.capture ? `完整录制 · ${captureLeaves(row.capture.segments).length} 个片段` : `${row.members.length} 个版本` }}</span>
+                        </span>
                       </span>
                       <span>{{ formatBytes(row.size_bytes) }}</span>
                       <span class="asset-actions">
-                        <span class="group-count">{{ row.capture ? '1 次拍摄 · ' : '' }}{{ row.members.length }} 个视频</span>
                         <button class="danger" @click.stop="trashVaultGroup(row)">全部删除</button>
                       </span>
                     </div>
@@ -525,15 +527,9 @@
                           <button class="danger" :disabled="!member.can_delete" @click="trashAsset(member)">删除</button>
                         </span>
                       </div>
-                    <CaptureGroupPicker v-if="row.capture" :group="row.capture" :disabled="true" @preview="previewPoolItem" />
-                    <div v-if="row.capture" class="capture-group-tools">
-                        <span>{{ row.capture.error || row.capture.timing_note }}</span>
-                        <label>边界偏移（秒）<input type="number" min="-120" max="120" step="0.1"
-                          :value="captureOffsets[row.capture.id] ?? row.capture.offset_seconds"
-                          @input="captureOffsets[row.capture.id] = $event.target.value" /></label>
-                        <button :disabled="row.capture.status === 'generating'" @click="retryCapture(row.capture, true)">应用校准</button>
-                        <button :disabled="row.capture.status === 'generating'" @click="retryCapture(row.capture)">重新生成缺失片段</button>
-                      </div>
+                      <CaptureGroupDetails v-if="row.capture" :group="row.capture"
+                        :offset="captureOffsets[row.capture.id]" @update:offset="captureOffsets[row.capture.id] = $event"
+                        @preview="previewPoolItem" @retry="retryCapture(row.capture, $event)" />
                     </template>
                     <div v-else-if="row.type === 'asset'" class="asset-row compact">
                       <span class="role-pill" :class="row.asset.role">{{ roleKindLabel(row.asset.role, row.asset.kind) }}</span>
@@ -573,12 +569,14 @@
                 <span><span class="role-pill" :class="row.role || 'export'">{{ row.capture ? '拍摄' : roleLabel('export') }}</span></span>
                 <span class="group-name">
                   <span class="group-caret" :class="{ open: expandedVaultGroups[row.key] }">▸</span>
-                  {{ row.name }}
+                  <span class="group-copy">
+                    <span class="group-title" :title="row.name">{{ row.name }}</span>
+                    <span class="group-count">{{ row.capture ? `完整录制 · ${captureLeaves(row.capture.segments).length} 个片段` : `${row.members.length} 个版本` }}</span>
+                  </span>
                 </span>
                 <span>{{ formatBytes(row.size_bytes) }}</span>
                 <span>{{ formatDate(row.modified_at) }}</span>
                 <span class="asset-actions">
-                  <span class="group-count">{{ row.capture ? '1 次拍摄 · ' : '' }}{{ row.members.length }} 个视频</span>
                   <button class="danger" @click.stop="trashVaultGroup(row)">全部删除</button>
                 </span>
               </div>
@@ -604,15 +602,9 @@
                     <button class="danger" :disabled="!member.can_delete" @click="trashAsset(member)">删除</button>
                   </span>
                 </div>
-              <CaptureGroupPicker v-if="row.capture" :group="row.capture" :disabled="true" @preview="previewPoolItem" />
-                    <div v-if="row.capture" class="capture-group-tools">
-                        <span>{{ row.capture.error || row.capture.timing_note }}</span>
-                        <label>边界偏移（秒）<input type="number" min="-120" max="120" step="0.1"
-                          :value="captureOffsets[row.capture.id] ?? row.capture.offset_seconds"
-                          @input="captureOffsets[row.capture.id] = $event.target.value" /></label>
-                        <button :disabled="row.capture.status === 'generating'" @click="retryCapture(row.capture, true)">应用校准</button>
-                        <button :disabled="row.capture.status === 'generating'" @click="retryCapture(row.capture)">重新生成缺失片段</button>
-                      </div>
+                <CaptureGroupDetails v-if="row.capture" :group="row.capture"
+                  :offset="captureOffsets[row.capture.id]" @update:offset="captureOffsets[row.capture.id] = $event"
+                  @preview="previewPoolItem" @retry="retryCapture(row.capture, $event)" />
               </template>
               <div v-else-if="row.type === 'asset'" class="table-row">
                 <span><span class="role-pill" :class="row.asset.role">{{ roleKindLabel(row.asset.role, row.asset.kind) }}</span></span>
@@ -1203,15 +1195,16 @@ import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import StatusCard from './components/StatusCard.vue'
 import Panel from './components/Panel.vue'
 import LogList from './components/LogList.vue'
-import CaptureGroupPicker from './components/CaptureGroupPicker.vue'
+import CaptureGroupDetails from './components/CaptureGroupDetails.vue'
 import CameraProgramPicker from './components/CameraProgramPicker.vue'
 import ControlledComposer from './components/ControlledComposer.vue'
 import StudioMediaPool from './components/StudioMediaPool.vue'
 import StudioWorkbench from './components/StudioWorkbench.vue'
 import NarrationPanel from './components/NarrationPanel.vue'
-import { linkedVoiceSelection, poolWithoutVoice } from '../../shared/composition-selection.js'
+import { activeVoiceSource, linkedVoiceSelection, poolWithItems, poolWithoutVoice, poolWithoutSources } from '../../shared/composition-selection.js'
 import {
   captureGroup,
+  captureLeaves,
   captureSearchText,
   captureTuneClipIdentity,
   captureTuneSourceGroups,
@@ -3006,7 +2999,9 @@ function toggleAutomationMusic(id, checked) {
 
 function toggleAutomationVoiceover(id, checked) {
   const item = voiceoverPoolItems.value.find(i => i.id === id)
-  if (item?.metadata?.bound_source_id) { toggleSourceSelection(item.metadata.bound_source_id, checked); return }
+  const source = activeVoiceSource(item, sourcePoolItems.value)
+  if (source) { toggleSourceSelection(source.id, checked); return }
+  if (item?.metadata?.binding_id) return
   const linked = selectedAutomationVoiceoverIds.value.filter(key => voiceoverPoolItems.value.find(i => i.id === key)?.metadata?.binding_id)
   selectedAutomationVoiceoverIds.value = checked ? [...linked, id] : linked
 }
@@ -3130,18 +3125,17 @@ async function addPendingItemsToPool() {
   }
   const ids = [...new Set([...(mediaPool.value[field] || []), ...eligibleIds])]
   const added = eligibleIds.length
-  const next = { ...mediaPool.value, [field]: ids, capture_selections: [] }
-  if (mediaLibraryTab.value === 'voiceover') {
-    const pairedSources = voiceoverItems.value.filter(i => eligibleIds.includes(i.id)).map(i => i.metadata?.bound_source_id).filter(Boolean)
-    next.source_media_ids = [...new Set([...next.source_media_ids, ...pairedSources])]
-  }
+  const next = ['source', 'voiceover'].includes(mediaLibraryTab.value)
+    ? poolWithItems(mediaPool.value, mediaLibraryTab.value, eligibleIds, sourceVideoItems.value, voiceoverItems.value)
+    : { ...mediaPool.value, [field]: ids }
+  next.capture_selections = []
   if (await saveMediaPool(next, `已加入媒体池 ${added} 项。`)) closeMediaLibrary()
 }
 
 async function removeFromMediaPool(kind, id) {
   const field = MEDIA_POOL_FIELDS[kind]
   if (!field) return
-  await saveMediaPool(kind === 'voiceover' ? poolWithoutVoice(mediaPool.value, [id], voiceoverItems.value) : {
+  await saveMediaPool(kind === 'voiceover' ? poolWithoutVoice(mediaPool.value, [id], voiceoverItems.value, sourceVideoItems.value) : kind === 'source' ? poolWithoutSources(mediaPool.value, [id], sourceVideoItems.value, voiceoverItems.value) : {
     ...mediaPool.value, [field]: mediaPool.value[field].filter((item) => item !== id)
   })
 }
@@ -3149,7 +3143,7 @@ async function removeFromMediaPool(kind, id) {
 async function clearMediaPool(kind) {
   const field = MEDIA_POOL_FIELDS[kind]
   if (!field) return
-  await saveMediaPool(kind === 'voiceover' ? poolWithoutVoice(mediaPool.value, mediaPool.value.voiceover_media_ids, voiceoverItems.value) : { ...mediaPool.value, [field]: [] })
+  await saveMediaPool(kind === 'voiceover' ? poolWithoutVoice(mediaPool.value, mediaPool.value.voiceover_media_ids, voiceoverItems.value, sourceVideoItems.value) : kind === 'source' ? poolWithoutSources(mediaPool.value, mediaPool.value.source_media_ids, sourceVideoItems.value, voiceoverItems.value) : { ...mediaPool.value, [field]: [] })
 }
 
 function previewPoolItem(item) {

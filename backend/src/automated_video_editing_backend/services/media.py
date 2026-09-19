@@ -583,30 +583,65 @@ class MediaService:
                     retained_path_set.add(path)
             cleaned[field] = retained_paths
             result[field] = visible_ids
-        for source_id in result["source_media_ids"]:
-            source = self._items.get(source_id)
-            voice = self._items.get(source.metadata.get("bound_voice_id")) if source else None
-            if voice and voice.id not in result["voiceover_media_ids"]:
-                result["voiceover_media_ids"].append(voice.id)
-                cleaned["voiceover_media_ids"].append(voice.path)
-        keep = []
-        for mid in result["voiceover_media_ids"]:
-            item = self._items.get(mid)
-            if (
-                not item
-                or not item.metadata.get("binding_id")
-                or item.metadata.get("bound_source_id") in result["source_media_ids"]
-            ):
-                keep.append(mid)
-        result["voiceover_media_ids"] = keep
-        cleaned["voiceover_media_ids"] = [
-            self._items.get(mid, self._import_catalog.get(mid)).path for mid in keep
-        ]
+        self._link_pool_pairs(result)
+        for field in ("source_media_ids", "voiceover_media_ids"):
+            cleaned[field] = [
+                self._items.get(mid, self._import_catalog.get(mid)).path
+                for mid in result[field]
+            ]
         if cleaned != self._pool_paths:
             self._save_pool(cleaned)
         if self._capture_selections:
             result["capture_selections"] = self._capture_selections
         return result
+
+    def _link_pool_pairs(self, pool, *, previous_paths=None, strict=False) -> None:
+        """Keep only reciprocal current bindings, independently of scanner IDs.
+
+        PUT sends the entire pool. Removing either member of an existing pair removes
+        both; adding either member of a new pair adds both. Reads repair old one-sided
+        pools, and replace superseded voices only when their source is still pooled.
+        """
+        sources = pool["source_media_ids"]
+        voices = pool["voiceover_media_ids"]
+        pairs = {}
+        for source in self._items.values():
+            voice = self._items.get(source.metadata.get("bound_voice_id"))
+            if (
+                voice is not None
+                and self._matches_pool(source, "source_media_ids")
+                and self._matches_pool(voice, "voiceover_media_ids")
+                and voice.metadata.get("binding_id")
+                and voice.metadata.get("bound_source_id") == source.id
+            ):
+                pairs[source.id] = voice.id
+        active_voices = set(pairs.values())
+        invalid = [
+            mid for mid in voices
+            if (item := self._items.get(mid))
+            and item.metadata.get("binding_id")
+            and mid not in active_voices
+        ]
+        if invalid and strict:
+            raise ValueError("旁白尚未绑定或已被替换，请选择该组合当前绑定的旁白")
+        voices[:] = [mid for mid in voices if mid not in invalid]
+        for source_id, voice_id in pairs.items():
+            has_source, has_voice = source_id in sources, voice_id in voices
+            if not has_source and not has_voice:
+                continue
+            source, voice = self._items[source_id], self._items[voice_id]
+            removed = previous_paths is not None and (
+                (not has_source and source.path in previous_paths["source_media_ids"])
+                or (not has_voice and voice.path in previous_paths["voiceover_media_ids"])
+            )
+            if removed:
+                sources[:] = [mid for mid in sources if mid != source_id]
+                voices[:] = [mid for mid in voices if mid != voice_id]
+            else:
+                if not has_source:
+                    sources.append(source_id)
+                if not has_voice:
+                    voices.append(voice_id)
 
     def ensure_media_pool_initialized(self) -> None:
         """Persist the pre-existing working set before publishing a new generated asset.
@@ -650,27 +685,12 @@ class MediaService:
                 seen_paths.add(item.path)
             updated[field] = paths
             result_ids[field] = accepted_ids
-        # A saved composition and its active voice enter the working set together.
-        voice_ids = result_ids["voiceover_media_ids"]
-        for source_id in result_ids["source_media_ids"]:
-            source = self._items.get(source_id)
-            voice_id = source.metadata.get("bound_voice_id") if source else None
-            voice = self._items.get(voice_id)
-            if voice and voice.id not in voice_ids:
-                voice_ids.append(voice.id)
-                updated["voiceover_media_ids"].append(voice.path)
-        # Old bound voices are not independent choices once their source leaves the pool.
-        retained = [
-            mid
-            for mid in voice_ids
-            if not (item := self._items.get(mid))
-            or not item.metadata.get("binding_id")
-            or item.metadata.get("bound_source_id") in result_ids["source_media_ids"]
-        ]
-        result_ids["voiceover_media_ids"] = retained
-        updated["voiceover_media_ids"] = [
-            self._items.get(mid, self._import_catalog.get(mid)).path for mid in retained
-        ]
+        self._link_pool_pairs(result_ids, previous_paths=self._pool_paths, strict=True)
+        for field in ("source_media_ids", "voiceover_media_ids"):
+            updated[field] = [
+                self._items.get(mid, self._import_catalog.get(mid)).path
+                for mid in result_ids[field]
+            ]
         # Write first so a full disk or permissions error cannot make a failed PUT look
         # successful until the process restarts. The old in-memory and on-disk set both stay
         # intact when the atomic write does not land.

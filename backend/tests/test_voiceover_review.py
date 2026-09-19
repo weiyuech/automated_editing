@@ -6,14 +6,37 @@ from automated_video_editing_backend.services.seedance import SeedanceService
 from automated_video_editing_backend.services.tts import TTSService
 
 
+def test_prompt_preview_is_read_only_and_keeps_baseline_for_custom_rules(monkeypatch):
+    monkeypatch.setenv("APP_BRIDGE_TOKEN", "review-test-token")
+
+    async def must_not_call_provider(*args, **kwargs):
+        raise AssertionError("查看提示词不得调用大模型或语音服务")
+
+    monkeypatch.setattr(LLMService, "_chat", must_not_call_provider)
+    monkeypatch.setattr(TTSService, "synthesize", must_not_call_provider)
+    client = TestClient(main_module.create_app())
+    headers = {"x-bridge-token": "review-test-token"}
+    custom = client.post("/api/tts/prompt", headers=headers, json={
+        "text": "产品介绍", "instructions": "简洁自然", "system_prompt": "自定义完整规则",
+    })
+    assert custom.status_code == 200
+    assert custom.json()["system"] == "自定义完整规则"
+    assert "简洁自然" in custom.json()["user"]
+    baseline = client.post("/api/tts/prompt", headers=headers, json={"text": "产品介绍"})
+    assert baseline.status_code == 200
+    assert baseline.json()["system"] == custom.json()["baseline_system"]
+
+
 def test_draft_endpoint_returns_review_text_without_calling_tts(monkeypatch):
     monkeypatch.setenv("APP_BRIDGE_TOKEN", "review-test-token")
     calls = {"llm": 0, "tts": 0}
 
-    async def draft(_self, raw_text, target_seconds=None):
+    async def draft(_self, raw_text, target_seconds=None, *, instructions="", system_prompt=None):
         calls["llm"] += 1
         assert raw_text == "原始 OPC 文案"
         assert target_seconds == 30
+        assert instructions == "不要添加开场白"
+        assert system_prompt is None
         return "改写后的 OPC 旁白"
 
     async def must_not_synthesise(_self, *_args, **_kwargs):
@@ -27,7 +50,7 @@ def test_draft_endpoint_returns_review_text_without_calling_tts(monkeypatch):
     response = client.post(
         "/api/tts/draft",
         headers={"x-bridge-token": "review-test-token"},
-        json={"text": "  原始 OPC 文案  ", "target_seconds": 30},
+        json={"text": "  原始 OPC 文案  ", "target_seconds": 30, "instructions": "不要添加开场白"},
     )
 
     assert response.status_code == 200

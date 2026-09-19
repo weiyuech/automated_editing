@@ -2,7 +2,7 @@
   "appId": "com.weiyuech.automatedediting",
   "productName": "自动视频剪辑",
   "extraMetadata": {
-    "version": "0.1.8"
+    "version": "0.1.9"
   },
   "asar": true,
   "directories": {

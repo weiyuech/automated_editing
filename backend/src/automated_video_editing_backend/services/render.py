@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import asyncio
 import functools
+from contextvars import ContextVar
 import json
 import math
 import os
@@ -16,6 +16,7 @@ from pydantic import ValidationError
 from automated_video_editing_backend.core.models import EditTimeline, SubtitleTrack
 from automated_video_editing_backend.core.store import read_json, write_json
 from automated_video_editing_backend.services import subtitles as subtitle_layer
+from automated_video_editing_backend.services import encoding
 
 # Music sits under narration at this level. amix's own normalisation is switched off, so this
 # is the level you actually hear; with normalisation left on, ffmpeg halved both tracks and the
@@ -70,6 +71,9 @@ def _filter_argument(path: Path | str) -> str:
     return f"'{text}'"
 
 
+_ENCODING_CONTEXT = ContextVar("render_encoding_context", default=(0.0, None))
+
+
 class RenderService:
     def build_ffmpeg_args(
         self, timeline: EditTimeline, subtitle_path: Path | str | None = None
@@ -82,14 +86,23 @@ class RenderService:
         crop_x = max(0.0, min(1.0, float(timeline.output_crop_x)))
         crop_y = max(0.0, min(1.0, float(timeline.output_crop_y)))
         args = [self.ffmpeg_binary(), "-y"]
+        clip_inputs = []
+        video_inputs = {}
+        next_index = 0
         for clip in timeline.clips:
+            # Multiple selected ranges of one recording share its decoder. Images keep
+            # separate demuxers because their loop duration is an input-specific option.
+            if clip.kind == "video" and clip.source_path in video_inputs:
+                clip_inputs.append(video_inputs[clip.source_path])
+                continue
             if clip.kind == "image":
-                # A still has no duration to trim to. Without looping it to the requested
-                # length the export gets a single frame — a flash, not a held picture.
                 args += ["-loop", "1", "-framerate", "30", "-t", f"{clip.duration:.3f}"]
             args += ["-i", clip.source_path]
+            clip_inputs.append(next_index)
+            if clip.kind == "video":
+                video_inputs[clip.source_path] = next_index
+            next_index += 1
 
-        next_index = len(timeline.clips)
         bed_input_index = None
         if timeline.audio_bed:
             bed_input_index = next_index
@@ -121,7 +134,7 @@ class RenderService:
                     f"crop={width}:{height}:(iw-ow)*{crop_x:.6f}:(ih-oh)*{crop_y:.6f},"
                 )
             filter_parts.append(
-                f"[{index}:v]"
+                f"[{clip_inputs[index]}:v]setpts=PTS-STARTPTS,"
                 f"trim=start={clip.start:.3f}:duration={clip.duration:.3f},"
                 "setpts=PTS-STARTPTS,"
                 # An explicit preset fills and crops. With no preset, the native first-source
@@ -162,7 +175,7 @@ class RenderService:
             # effect its own delayed slice lets it be moved/reordered without touching the
             # uninterrupted bed that carries narration and the subtitle clock.
             steps = [
-                f"[{index}:a:0]atrim=start={clip.start:.3f}:duration={clip.duration:.3f}",
+                f"[{clip_inputs[index]}:a:0]aresample=async=1:first_pts=0,atrim=start={clip.start:.3f}:duration={clip.duration:.3f}",
                 "asetpts=PTS-STARTPTS",
                 f"volume={clip.audio_volume:.3f}",
             ]
@@ -175,9 +188,10 @@ class RenderService:
         if timeline.include_original_audio:
             for index, clip in enumerate(timeline.clips):
                 filter_parts.append(
-                    f"[{index}:a]"
+                    f"[{clip_inputs[index]}:a]aresample=async=1:first_pts=0,"
                     f"atrim=start={clip.start:.3f}:duration={clip.duration:.3f},"
-                    "asetpts=PTS-STARTPTS,aresample=48000"
+                    "asetpts=PTS-STARTPTS,aresample=48000,"
+                    f"apad=whole_dur={clip.duration:.3f},atrim=duration={clip.duration:.3f}"
                     f"[oa{index}]"
                 )
             original_inputs = "".join(f"[oa{index}]" for index in range(len(timeline.clips)))
@@ -475,7 +489,7 @@ class RenderService:
         args = self.build_ffmpeg_args(timeline, None)
         args[-1] = str(target)
         try:
-            await self._run(args)
+            await self.encode(args, duration=self._timeline_duration(timeline))
             # Give the master its own paired timing layer. Generated-media entries are rebuilt
             # by scanning after an app restart, so an in-memory pointer to the delivery's
             # sidecar is not durable.
@@ -506,7 +520,7 @@ class RenderService:
             raise
         return str(target)
 
-    async def render(self, timeline: EditTimeline) -> str:
+    async def render(self, timeline: EditTimeline, progress=None) -> str:
         target = Path(timeline.output_path)
         family = (
             target,
@@ -526,7 +540,8 @@ class RenderService:
                     f"当前 FFmpeg 不能把字幕压进画面（缺少 libass）：{self.ffmpeg_binary()}。"
                     "请运行 scripts/prepare_assets.py 获取可用的 FFmpeg。"
                 )
-            await self._run(self.build_ffmpeg_args(timeline, subtitle_path))
+            await self.encode(self.build_ffmpeg_args(timeline, subtitle_path),
+                              duration=self._timeline_duration(timeline), progress=progress)
         except BaseException:
             # FFmpeg creates/truncates its target before it knows every decoder/filter will
             # succeed. This family was proven absent above and belongs only to this invocation,
@@ -537,21 +552,22 @@ class RenderService:
             raise
         return timeline.output_path
 
-    async def _run(self, args: list[str]) -> None:
-        process = await asyncio.create_subprocess_exec(
-            *args,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
+    @staticmethod
+    def _timeline_duration(timeline: EditTimeline) -> float:
+        return max((clip.timeline_start + clip.duration for clip in timeline.clips), default=0.0)
+
+    async def encode(self, args: list[str], *, duration: float, progress=None) -> None:
+        # Context-local so concurrent renders cannot leak callbacks or durations. Keep _run
+        # as the narrow subprocess seam used by existing render adapters and test doubles.
+        token = _ENCODING_CONTEXT.set((duration, progress))
         try:
-            _stdout, stderr = await process.communicate()
-        except asyncio.CancelledError:
-            if process.returncode is None:
-                process.kill()
-            await process.wait()
-            raise
-        if process.returncode != 0:
-            raise RuntimeError(stderr.decode("utf-8", errors="replace")[-2000:])
+            await self._run(args)
+        finally:
+            _ENCODING_CONTEXT.reset(token)
+
+    async def _run(self, args: list[str]) -> None:
+        duration, progress = _ENCODING_CONTEXT.get()
+        await encoding.encode(args, duration=duration, progress=progress)
 
     def probe_duration(self, path: str) -> float | None:
         """Length in seconds, or None when ffprobe cannot say."""

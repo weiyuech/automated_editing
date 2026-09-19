@@ -1,7 +1,7 @@
 <script setup>
 import { computed, ref } from 'vue'
 import CaptureTreeNode from './CaptureTreeNode.vue'
-import { captureSelectionState, changeCaptureChild, fullCaptureSelection, formatCaptureTime, captureStatus, normalizeCaptureSelection } from '../capture-group-policy.js'
+import { captureSelectionState, changeCaptureChild, fullCaptureSelection, formatCaptureTime, normalizeCaptureSelection } from '../capture-group-policy.js'
 
 const props = defineProps({ group: { type: Object, required: true }, modelValue: { type: Object, default: null }, disabled: Boolean })
 const emit = defineEmits(['update:modelValue', 'preview', 'retry'])
@@ -48,16 +48,18 @@ function preview(segment = null) {
 </template>
 
 <style scoped>
-.capture-picker { border: 1px solid var(--border, #ded9ec); border-radius: 10px; margin: 6px 0; overflow: hidden; }
-.capture-picker-selected { background: rgba(115, 89, 190, .045); }
-.capture-picker-root { display: flex; gap: 10px; align-items: center; padding: 10px 12px; }
+.capture-picker { min-width: 0; width: 100%; border: 1px solid var(--border, #ded9ec); border-radius: 10px; margin: 6px 0; overflow: hidden; background: var(--tree-recording); }
+.capture-picker-selected { border-color: var(--purple); }
+.capture-picker-root { display: flex; gap: 10px; align-items: center; padding: 10px 12px; background: var(--tree-root); }
 .capture-picker input { flex: none; accent-color: #7961bf; }
 .capture-picker-disclosure { display: flex; align-items: center; gap: 8px; flex: 1; min-width: 0; text-align: left; border: 0; background: transparent; padding: 0; color: inherit; }
-.capture-picker-disclosure strong, .capture-picker-child strong { display: block; font-size: 13px; overflow-wrap: anywhere; }
-.capture-picker small { display: block; font-size: 11px; font-weight: normal; opacity: .7; margin-top: 3px; }
-.capture-picker-duration { font-size: 12px; font-variant-numeric: tabular-nums; opacity: .7; }
-.capture-picker-children { margin-left: 25px; border-left: 1px solid var(--border, #ded9ec); }
-.capture-picker-child { display: flex; align-items: center; justify-content: space-between; gap: 8px; border-top: 1px solid var(--border, #ded9ec); padding: 9px 12px; }
+.capture-picker-disclosure > span:last-child { min-width: 0; }
+.capture-picker-disclosure strong, .capture-picker-child strong { display: block; font-size: 12px; font-weight: 500; overflow-wrap: break-word; }
+.capture-picker-disclosure strong { font-size: 15px; }
+.capture-picker small { display: block; font-size: 12px; font-weight: normal; opacity: .7; margin-top: 3px; }
+.capture-picker-duration { flex: none; white-space: nowrap; font-size: 12px; font-variant-numeric: tabular-nums; opacity: .7; }
+.capture-picker-children { margin-left: 25px; border-left: 1px solid var(--border, #ded9ec); background: var(--tree-recording); }
+.capture-picker-child { display: flex; align-items: center; justify-content: space-between; gap: 8px; border-top: 1px solid var(--border, #ded9ec); padding: 9px 12px; background: var(--tree-recording); }
 .capture-picker-child label { display: flex; align-items: center; gap: 10px; min-width: 0; cursor: pointer; }
 .capture-picker-note { font-size: 11px; opacity: .75; margin: 10px 12px; }
 .capture-picker-note button { margin-left: 8px; }

@@ -14,7 +14,7 @@ import logging
 import math
 import shutil
 from collections.abc import Callable
-from contextlib import suppress
+from contextlib import asynccontextmanager, suppress
 from copy import deepcopy
 from pathlib import Path
 
@@ -92,7 +92,7 @@ class CaptureLibrary:
                 self.groups = {}
         self.renderer = RenderService()
         self.slots = asyncio.Semaphore(1)
-        self._lock = asyncio.Lock()
+        self._locks: dict[str, asyncio.Lock] = {}
         self._active: set[str] = set()
         self._worker: asyncio.Task | None = None
         self.external_path_in_use: Callable[[str], bool] = lambda _path: False
@@ -141,7 +141,7 @@ class CaptureLibrary:
                 or not isinstance(child.get("order"), int)
                 or isinstance(child["order"], bool)
                 or child["order"] < 0
-                or child.get("status") not in {"pending", "ready", "failed"}
+                or child.get("status") not in {"pending", "virtual", "ready", "failed"}
                 or not isinstance(child.get("kind"), str)
                 or not isinstance(child.get("label"), str)
                 or not isinstance(child.get("boundary_source"), str)
@@ -387,7 +387,10 @@ class CaptureLibrary:
                     if self.groups[key]["status"] != "pending":
                         continue
                     try:
-                        await self.prepare(key)
+                        if self.groups[key].get("materialize_requested"):
+                            await self.prepare(key)
+                        else:
+                            await self.ensure_timeline(key)
                     except asyncio.CancelledError:
                         raise
                     except Exception:
@@ -412,7 +415,11 @@ class CaptureLibrary:
         group = deepcopy(self.groups[key])
         protected_paths = [
             group["master_path"],
-            *(segment.get("path") for segment in iter_nodes(group["segments"]) if segment.get("path")),
+            *(
+                segment.get("path")
+                for segment in iter_nodes(group["segments"])
+                if segment.get("path")
+            ),
         ]
         if any(
             self.is_path_in_use(path) or self.external_path_in_use(path) for path in protected_paths
@@ -435,35 +442,80 @@ class CaptureLibrary:
             )
             group["offset_seconds"] = offset
             group["segments"] = []
+            group.pop("timeline_version", None)
         # Missing ready children were explicitly removed or moved. Only this explicit
         # action re-creates them; ordinary scans and restarts never do so.
         for segment in iter_nodes(group["segments"]):
             if not segment.get("path") or not Path(segment["path"]).is_file():
                 segment["status"] = "pending"
-        group.update(status="pending", error="")
+        group.update(status="pending", error="", materialize_requested=offset is None)
         self._commit(group)
 
+    @asynccontextmanager
+    async def _group_lock(self, key, progress=None):
+        lock = self._locks.setdefault(key, asyncio.Lock())
+        if lock.locked() and progress:
+            progress({"stage": "waiting", "message": "等待此录制的处理完成"})
+        async with lock:
+            yield
+
+    async def ensure_timeline(self, key: str, progress=None) -> dict:
+        """Read source timing once. Tree nodes are intervals, not pre-encoded files."""
+        current = self.groups[key]
+        if current.get("timeline_version") and current["duration"] > 0:
+            if current["status"] == "pending" and not current.get("materialize_requested"):
+                current = deepcopy(current)
+                current.update(status="ready", error="")
+                for segment in iter_nodes(current["segments"]):
+                    if segment.get("status") == "pending" and not segment.get("path"):
+                        segment["status"] = "virtual"
+                self._commit(current)
+            return deepcopy(current)
+        async with self._group_lock(key, progress):
+            group = deepcopy(self.groups[key])
+            if group.get("timeline_version") and group["duration"] > 0:
+                return group
+            master = Path(group["master_path"])
+            self._active.add(str(master.resolve()))
+            try:
+                if progress:
+                    progress({"stage": "preparing", "message": "读取录制时长与片段区间"})
+                if not master.is_file():
+                    raise ValueError("完整录制文件不存在，无法建立分段时间轴")
+                duration = await asyncio.to_thread(self.renderer.probe_duration, str(master))
+                if not duration or not math.isfinite(duration):
+                    raise ValueError("无法读取完整录制的有效时长")
+                group["duration"] = duration
+                group["segments"] = build_timeline(
+                    group["evidence"], duration, group["offset_seconds"]
+                )
+                for segment in iter_nodes(group["segments"]):
+                    segment.update(status="virtual", error="")
+                group["timeline_version"] = digest(
+                    [group["fingerprint"], group["offset_seconds"], group["segments"]]
+                )
+                group.update(status="ready", error="")
+                self._commit(group)
+                return deepcopy(group)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                group.update(status="failed", error=str(exc))
+                self._commit(group)
+                raise
+            finally:
+                self._active.discard(str(master.resolve()))
+
     async def prepare(self, key: str) -> dict:
-        async with self._lock:
+        """Explicitly materialize children only when the operator requests it."""
+        await self.ensure_timeline(key)
+        async with self._group_lock(key):
             group = deepcopy(self.groups[key])
             master = Path(group["master_path"])
             self._active.add(str(master.resolve()))
             try:
                 if not master.is_file():
                     raise ValueError("完整录制文件不存在；已生成的子视频仍可使用")
-                if not group["segments"]:
-                    duration = await asyncio.to_thread(self.renderer.probe_duration, str(master))
-                    if not duration or not math.isfinite(duration):
-                        raise ValueError("无法读取完整录制的有效时长")
-                    group["duration"] = duration
-                    group["segments"] = build_timeline(
-                        group["evidence"], duration, group["offset_seconds"]
-                    )
-                    for segment in iter_nodes(group["segments"]):
-                        segment.update(status="pending", error="")
-                    group["timeline_version"] = digest(
-                        [group["fingerprint"], group["offset_seconds"], group["segments"]]
-                    )
                 group.update(status="generating", error="")
                 self._commit(deepcopy(group))
                 # A published child is immutable. Calibration creates a new timeline version so
@@ -509,6 +561,7 @@ class CaptureLibrary:
                         group["obsolete_paths"] = remaining
                     else:
                         group.pop("obsolete_paths", None)
+                group["materialize_requested"] = False
                 self._commit(group)
                 return group
             except asyncio.CancelledError:
@@ -524,7 +577,9 @@ class CaptureLibrary:
 
     def _cleanup_obsolete(self, group: dict) -> list[str]:
         """Remove superseded derived children only after their replacement is complete."""
-        current = {str(Path(s["path"]).resolve()) for s in iter_nodes(group["segments"]) if s.get("path")}
+        current = {
+            str(Path(s["path"]).resolve()) for s in iter_nodes(group["segments"]) if s.get("path")
+        }
         remaining: list[str] = []
         for raw_path in group.get("obsolete_paths") or []:
             try:
@@ -557,14 +612,14 @@ class CaptureLibrary:
             return
         selected_ranges(group, selection)
 
-    async def resolve(self, item: MediaItem, selection: dict) -> MediaItem:
+    async def resolve(self, item: MediaItem, selection: dict, progress=None) -> MediaItem:
         self.validate_selection(selection)
         key = selection["capture_id"]
         group = self.groups[key]
         if not group["segments"]:
             if selection.get("include_full") and Path(item.path).is_file():
                 return item
-            group = await self.prepare(key)
+            group = await self.ensure_timeline(key, progress)
         ranges = selected_ranges(group, selection)
         selected_ids = set(selection.get("segment_ids") or [])
         selected_children = selected_nodes(group["segments"], selected_ids)
@@ -573,7 +628,7 @@ class CaptureLibrary:
                 return item
             if selection.get("include_full"):
                 raise ValueError("完整录制已移走或删除，请选择仍可用的子片段")
-        async with self._lock:
+        async with self._group_lock(key, progress):
             signature = digest([group["fingerprint"], group["timeline_version"], ranges])
             target = self.directory / digest(key) / "inputs" / f"{signature}.mp4"
             master = Path(group["master_path"])
@@ -582,7 +637,9 @@ class CaptureLibrary:
             try:
                 if not target.is_file() or not sidecar_path(target).is_file():
                     if master.is_file():
-                        await self._encode(master, ranges, target)
+                        await self._encode(
+                            master, ranges, target, **({"progress": progress} if progress else {})
+                        )
                         self._write_evidence(group, target, ranges)
                     else:
                         if not selected_children:
@@ -602,7 +659,9 @@ class CaptureLibrary:
                                 ranges,
                                 group,
                             )
-                        await self._concat_children(sources, target)
+                        await self._concat_children(
+                            sources, target, **({"progress": progress} if progress else {})
+                        )
                         self._write_evidence_from_children(
                             group, target, ranges, selected_children, sources
                         )
@@ -701,11 +760,13 @@ class CaptureLibrary:
         if not write_json(sidecar_path(target), payload):
             raise OSError("子视频来源信息保存失败")
 
-    async def _concat_children(self, sources: list[Path], target: Path) -> None:
+    async def _concat_children(self, sources: list[Path], target: Path, progress=None) -> None:
         """Join already-published children when the complete recording is offline."""
         target.parent.mkdir(parents=True, exist_ok=True)
         temporary = target.with_suffix(".part.mp4")
         filters_path = target.with_suffix(".filters.txt")
+        if progress:
+            progress({"stage": "waiting", "message": "等待片段处理资源"})
         async with self.slots:
             audio_flags = [
                 await asyncio.to_thread(self.renderer.has_audio_stream, str(source))
@@ -747,16 +808,7 @@ class CaptureLibrary:
                 "+faststart",
                 str(temporary),
             ]
-            process = None
             try:
-                process = await asyncio.create_subprocess_exec(
-                    *args,
-                    stdout=asyncio.subprocess.DEVNULL,
-                    stderr=asyncio.subprocess.PIPE,
-                )
-                _, stderr = await process.communicate()
-                if process.returncode:
-                    raise ValueError("子片段组合失败：" + stderr.decode(errors="replace")[-1000:])
                 source_durations = [
                     await asyncio.to_thread(self.renderer.probe_duration, str(source))
                     for source in sources
@@ -767,22 +819,25 @@ class CaptureLibrary:
                 ):
                     raise ValueError("无法确认所选子片段的时长，未发布组合视频")
                 expected = sum(source_durations)
+                temporary.unlink(missing_ok=True)  # This call owns the unpublished staging path.
+                await self.renderer.encode(args, duration=expected, progress=progress)
                 duration = await asyncio.to_thread(self.renderer.probe_duration, str(temporary))
                 if not duration or not expected or abs(duration - expected) > 0.15:
                     raise ValueError("组合视频时长校验失败，未发布不完整文件")
                 temporary.replace(target)
             finally:
-                if process and process.returncode is None:
-                    process.kill()
-                    await process.wait()
                 temporary.unlink(missing_ok=True)
                 filters_path.unlink(missing_ok=True)
 
-    async def _encode(self, source: Path, ranges: list[tuple[float, float]], target: Path) -> None:
+    async def _encode(
+        self, source: Path, ranges: list[tuple[float, float]], target: Path, progress=None
+    ) -> None:
         """Decode exact intervals; concat picture and sound on the same zero-based clock."""
         target.parent.mkdir(parents=True, exist_ok=True)
         temporary = target.with_suffix(".part.mp4")
         filters_path = target.with_suffix(".filters.txt")
+        if progress:
+            progress({"stage": "waiting", "message": "等待片段处理资源"})
         async with self.slots:
             has_audio = await asyncio.to_thread(self.renderer.has_audio_stream, str(source))
             if has_audio is None:
@@ -831,22 +886,16 @@ class CaptureLibrary:
                 "+faststart",
                 str(temporary),
             ]
-            process = None
             try:
-                process = await asyncio.create_subprocess_exec(
-                    *args, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE
+                temporary.unlink(missing_ok=True)  # This call owns the unpublished staging path.
+                await self.renderer.encode(
+                    args, duration=sum(end - start for start, end in ranges), progress=progress
                 )
-                _, stderr = await process.communicate()
-                if process.returncode:
-                    raise ValueError("视频片段生成失败：" + stderr.decode(errors="replace")[-1000:])
                 duration = await asyncio.to_thread(self.renderer.probe_duration, str(temporary))
                 expected = sum(end - start for start, end in ranges)
                 if not duration or abs(duration - expected) > 0.15:
                     raise ValueError("子视频时长校验失败，未发布不完整文件")
                 temporary.replace(target)
             finally:
-                if process and process.returncode is None:
-                    process.kill()
-                    await process.wait()
                 temporary.unlink(missing_ok=True)
                 filters_path.unlink(missing_ok=True)

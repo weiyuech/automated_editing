@@ -154,7 +154,7 @@ def test_original_audio_is_only_wired_when_the_timeline_says_so():
     ]
 
     assert "[0:a]" not in muted_graph
-    assert "[0:a]atrim=start=1.000:duration=3.000" in kept_graph
+    assert "[0:a]aresample=async=1:first_pts=0,atrim=start=1.000:duration=3.000" in kept_graph
     assert "concat=n=1:v=0:a=1[origraw]" in kept_graph
 
 
@@ -266,7 +266,7 @@ def test_effect_audio_is_ducked_and_aligned_without_changing_the_voice_bed():
     graph = args[args.index("-filter_complex") + 1]
 
     assert "[2:a:0]atrim=start=1.250,asetpts=PTS-STARTPTS[bed]" in graph
-    assert "[1:a:0]atrim=start=0.500:duration=2.000" in graph
+    assert "[1:a:0]aresample=async=1:first_pts=0,atrim=start=0.500:duration=2.000" in graph
     assert "volume=0.300,adelay=3000:all=1[fxa1]" in graph
     assert "[bed][fxa1]amix=inputs=2:duration=longest" in graph
     assert "normalize=0" in graph

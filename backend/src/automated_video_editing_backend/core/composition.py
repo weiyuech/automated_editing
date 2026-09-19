@@ -39,6 +39,9 @@ class MappedNarrationRequest(BaseModel):
     sections: list[NarrationBinding] = Field(default_factory=list, max_length=100)
     playback_rate: float = Field(default=1.0, ge=0.9, le=1.1)
     auto_tempo: bool = True
+    direct_narration: bool = False
+    note_assignments: list[NarrationBinding] = Field(default_factory=list, max_length=100)
+    general_notes: list[str] = Field(default_factory=list, max_length=100)
 
 
 class NarrationReviewRequest(BaseModel):
@@ -50,14 +53,16 @@ class NarrationAdjustRequest(NarrationReviewRequest):
     auto_tempo: bool = True
 
 
-class NarrationConfirmRequest(NarrationReviewRequest):
-    review_id: str = Field(min_length=1)
+class NarrationPromptRequest(BaseModel):
+    text: str = Field(default="", max_length=8000)
+    instructions: str = Field(default="", max_length=2000)
+    system_prompt: str | None = Field(default=None, min_length=1, max_length=12000)
+    measured_feedback: bool = False
 
 
-class NarrationAllocateRequest(BaseModel):
+class NarrationAllocateRequest(NarrationPromptRequest):
     text: str = Field(min_length=1, max_length=8000)
     node_ids: list[str] = Field(default_factory=list, max_length=100)
-    measured_feedback: bool = False
 
 
 class StudioPreviewRequest(BaseModel):

@@ -62,7 +62,10 @@ class LLMService:
         except Exception as exc:  # noqa: BLE001 - provider health check reports every failure
             return ProviderTestResult(ok=False, provider="doubao", message=str(exc))
 
-    async def draft_voiceover(self, raw_text: str, target_seconds: float | None = None) -> str:
+    async def draft_voiceover(
+        self, raw_text: str, target_seconds: float | None = None, *,
+        instructions: str = "", system_prompt: str | None = None
+    ) -> str:
         """Draft narration solely from text the operator deliberately supplied for speech.
 
         Capture notes have a different job: they describe which point contains which subject
@@ -78,6 +81,16 @@ class LLMService:
         if not self._configured(cfg):
             raise ValueError("LLM is enabled but settings are incomplete")
 
+        return await self._chat(
+            cfg, **self.voiceover_prompt(
+                raw_text, target_seconds, instructions=instructions, system_prompt=system_prompt
+            )
+        )
+
+    def voiceover_prompt(
+        self, raw_text: str, target_seconds=None, *, instructions="", system_prompt=None
+    ) -> dict:
+        """Build the complete prompt without provider configuration or a network call."""
         body = raw_text.strip() or "（无）"
         target_chars = self._target_chars(target_seconds)
         if target_chars:
@@ -94,13 +107,13 @@ class LLMService:
             max_tokens = 380
             temperature = 0.55
 
-        return await self._chat(
-            cfg,
-            system=system,
-            user=user,
-            max_tokens=max_tokens,
-            temperature=temperature,
-        )
+        if instructions.strip():
+            user += f"\n\n本次补充要求（控制表达与重点，不作为新增事实）：\n{instructions.strip()}"
+        if system_prompt is not None:
+            if not system_prompt.strip():
+                raise ValueError("自定义提示词不能为空，可恢复默认提示词")
+            system = system_prompt
+        return dict(system=system, user=user, max_tokens=max_tokens, temperature=temperature)
 
     def _target_chars(self, target_seconds: float | None) -> int | None:
         """Seconds → target 字数 at the measured 口播 rate, scaled by the TTS speed_ratio.

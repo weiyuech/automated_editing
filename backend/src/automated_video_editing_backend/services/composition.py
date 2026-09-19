@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import shutil
+import time
+from contextlib import suppress
 from copy import deepcopy
 from pathlib import Path
 from uuid import uuid4
@@ -15,7 +17,6 @@ from automated_video_editing_backend.services.composition_assets import (
     save_manifest,
 )
 from automated_video_editing_backend.core.models import (
-    CaptureSelection,
     EditJobRequest,
     EditTimeline,
     TimelineClip,
@@ -24,6 +25,7 @@ from automated_video_editing_backend.core.paths import GENERATED_DIRS
 from automated_video_editing_backend.core.store import read_json, write_json
 from automated_video_editing_backend.services.capture import read_sidecar
 from automated_video_editing_backend.services.capture_library import digest
+from automated_video_editing_backend.services.narration_context import original_recording_ids
 from automated_video_editing_backend.services.recording_segments import (
     rebase_timeline,
     selected_ranges,
@@ -56,6 +58,11 @@ def compact_tree(nodes: list[dict], prefix: str, offset: float) -> list[dict]:
             "duration": node["end"] - node["start"],
             "children": compact_tree(node.get("children", []), prefix, offset),
             "notes": node.get("notes", []),
+            **(
+                {"source_recording_ids": node["source_recording_ids"]}
+                if node.get("source_recording_ids")
+                else {}
+            ),
         }
         for key, node in grouped.items()
     ]
@@ -92,10 +99,16 @@ class CompositionService:
 
     @staticmethod
     def public(record):
+        elapsed = max(
+            0, (record.get("finished_at") or time.time()) - record.get("started_at", time.time())
+        )
         return {
-            key: deepcopy(value)
-            for key, value in record.items()
-            if key not in {"timeline", "files", "groups"}
+            "elapsed_seconds": round(elapsed, 1),
+            **{
+                key: deepcopy(value)
+                for key, value in record.items()
+                if key not in {"timeline", "files", "groups"}
+            },
         }
 
     def get(self, key):
@@ -139,12 +152,52 @@ class CompositionService:
             "request": request.model_dump(),
             "status": "queued",
             "progress": 0,
-            "message": "等待拼接",
+            "message": "等待准备预览",
+            "stage": "preparing",
+            "started_at": time.time(),
             "tree": [],
             "error": "",
         }
         self.save(record)
         self.tasks[record["id"]] = asyncio.create_task(self._build(record, request))
+        return self.public(record)
+
+    def _progress(self, record, detail):
+        # Updates stay in memory while running; stage boundaries and terminal states persist.
+        # A slow disk must not turn every FFmpeg progress frame into another bottleneck.
+        stage = detail.get("stage", "encoding")
+        defaults = {
+            "waiting": "等待可用编码资源",
+            "encoding": "正在生成预览",
+            "verifying": "校验预览时长",
+        }
+        record.update({key: value for key, value in detail.items() if key != "fraction"})
+        record["message"] = detail.get("message", defaults.get(stage, "准备预览"))
+        if "fraction" in detail:
+            record["progress"] = 0.45 + 0.5 * max(0, min(1, detail["fraction"]))
+
+    async def cancel(self, key):
+        record = self.get(key)
+        if (
+            record.get("job_id")
+            or record.get("material_path")
+            or record["status"] not in {"queued", "building"}
+        ):
+            return self.public(record)
+        task = self.tasks.get(key)
+        if task:
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
+            self.tasks.pop(key, None)
+        record.update(
+            status="cancelled",
+            stage="cancelled",
+            message="已取消预览生成",
+            error="",
+            finished_at=time.time(),
+        )
+        self.save(record)
         return self.public(record)
 
     async def _build(self, record, request):
@@ -157,6 +210,7 @@ class CompositionService:
                 self.jobs._resolve_framing(job_request)
             choices = {s.capture_id: s.model_dump() for s in request.capture_selections}
             tree, clips, files, groups = [], [], {}, {}
+            record["files"] = files  # Lease originals as soon as asynchronous preparation begins.
             source_paths = []
             cursor = 0.0
             ids = [request.intro_effect_media_id] if request.intro_effect_media_id else []
@@ -183,8 +237,12 @@ class CompositionService:
                     files[item.path] = file_identity(item.path)
                 group = item.metadata.get("capture_group") if not is_effect else None
                 children = []
+                clip_ranges = None
                 notes = (read_sidecar(item.path) or {}).get("notes", [])
                 original = item
+                origins = (
+                    [f"capture:{group['id']}"] if group else [f"file:{Path(item.path).resolve()}"]
+                )
                 if not is_effect:
                     source_paths.append(item.path)
                 if item.metadata.get("composition_id"):
@@ -192,10 +250,13 @@ class CompositionService:
                         str(manifest_path(item.path))
                     )
                     notes = item.metadata.get("notes", [])
+                    origins = item.metadata.get("source_recording_ids") or original_recording_ids(
+                        item.metadata.get("composition_tree", [])
+                    )
                 if group:
-                    stored = self.media.captures.groups[group["id"]]
-                    if not stored["segments"]:
-                        stored = await self.media.captures.prepare(group["id"])
+                    stored = await self.media.captures.ensure_timeline(
+                        group["id"], lambda detail: self._progress(record, detail)
+                    )
                     choice = choices.pop(
                         group["id"], {"capture_id": group["id"], "include_full": True}
                     )
@@ -205,12 +266,17 @@ class CompositionService:
                     children = compact_tree(
                         rebase_timeline(stored["segments"], ranges), original.id, cursor
                     )
-                    resolved = await self.media.resolve_capture_sources(
-                        [original.id], [CaptureSelection.model_validate(choice)]
-                    )
-                    item = self.media.get(resolved[0])
-                    # Keep the resolved root as one video input, never one independent input per shot.
-                    files[item.path] = file_identity(item.path)
+                    if Path(original.path).is_file():
+                        # Multiple render intervals still belong to ONE recording tree/input.
+                        # Trim directly in the final filtergraph instead of encoding a temporary
+                        # selection video and then decoding/encoding it again for the preview.
+                        clip_ranges = ranges
+                    else:
+                        resolved = await self.media.captures.resolve(
+                            original, choice, lambda detail: self._progress(record, detail)
+                        )
+                        item = resolved
+                        files[item.path] = file_identity(item.path)
                 else:
                     duration = await asyncio.to_thread(self.renderer.probe_duration, item.path)
                     ranges = [(0, duration)]
@@ -230,20 +296,25 @@ class CompositionService:
                         "children": children,
                         "notes": notes,
                         "media_id": original.id,
+                        "source_recording_ids": origins,
                         "source_ranges": ranges,
                     }
                 )
-                clips.append(
-                    TimelineClip(
-                        media_id=item.id,
-                        source_path=item.path,
-                        start=0,
-                        duration=duration,
-                        timeline_start=cursor,
-                        label=tree[-1]["label"],
-                        include_audio=is_effect and not request.effect_cover_audio,
+                part_cursor = cursor
+                for range_start, range_end in clip_ranges or [(0, duration)]:
+                    part_duration = range_end - range_start
+                    clips.append(
+                        TimelineClip(
+                            media_id=item.id,
+                            source_path=item.path,
+                            start=range_start,
+                            duration=part_duration,
+                            timeline_start=part_cursor,
+                            label=tree[-1]["label"],
+                            include_audio=is_effect and not request.effect_cover_audio,
+                        )
                     )
-                )
+                    part_cursor += part_duration
                 cursor += duration
                 record.update(progress=0.1 + 0.3 * (index + 1) / len(ids), message="组合选中的画面")
                 self.save(record)
@@ -368,12 +439,16 @@ class CompositionService:
                     [request.model_dump(), files, groups, timeline.model_dump(mode="json")]
                 ),
                 progress=0.5,
-                message="渲染拼接预览",
+                stage="waiting",
+                message="等待可用编码资源",
             )
             self.save(record)
             async with self.jobs._render_slots:
                 self.validate_files(record)
-                await self.renderer.render(timeline)
+                await self.renderer.render(
+                    timeline, progress=lambda detail: self._progress(record, detail)
+                )
+            self._progress(record, {"stage": "verifying"})
             self.validate_files(record)
             actual = await asyncio.to_thread(self.renderer.probe_duration, str(preview))
             if actual is None or abs(actual - cursor) > max(0.08, len(clips) / 30):
@@ -383,6 +458,8 @@ class CompositionService:
             )
             record.update(
                 status="ready",
+                stage="ready",
+                finished_at=time.time(),
                 progress=1,
                 message="请查看预览并确认最终组合",
                 preview_path=str(preview),
@@ -392,9 +469,13 @@ class CompositionService:
             self.save(record)
         except BaseException as exc:
             record.update(
-                status="failed",
-                error="预览已取消" if isinstance(exc, asyncio.CancelledError) else str(exc),
-                message="拼接预览未完成",
+                status="cancelled" if isinstance(exc, asyncio.CancelledError) else "failed",
+                stage="cancelled" if isinstance(exc, asyncio.CancelledError) else "failed",
+                error="" if isinstance(exc, asyncio.CancelledError) else str(exc),
+                message="预览已取消"
+                if isinstance(exc, asyncio.CancelledError)
+                else "拼接预览未完成",
+                finished_at=time.time(),
             )
             self.save(record)
             preview.unlink(missing_ok=True)
@@ -476,6 +557,7 @@ class CompositionService:
                 "composition_id": key,
                 "title": record["title"],
                 "composition_tree": record["tree"],
+                "source_recording_ids": original_recording_ids(record["tree"]),
                 "visual_signature": record["visual_signature"],
                 "duration_seconds": record["duration"],
                 "notes": [note for root in record["tree"] for note in root.get("notes", [])],
@@ -549,10 +631,28 @@ class CompositionService:
         target = str(Path(path).resolve())
         for record in self.records.values():
             narration = record.get("narration") or {}
+            if (
+                narration.get("status") == "ready"
+                and narration.get("source_audio_path")
+                and str(Path(narration["source_audio_path"]).resolve()) == target
+            ):
+                return (
+                    True  # Keep the raw take for later speed adjustments without another TTS call.
+                )
             if narration.get("status") in {"running", "pending_review", "needs_revision", "failed"}:
-                held = [record.get("material_path"), *(
-                    narration.get(key) for key in ("source_audio_path", "audio_path", "candidate_path", "preview_path", "building_preview_path")
-                )]
+                held = [
+                    record.get("material_path"),
+                    *(
+                        narration.get(key)
+                        for key in (
+                            "source_audio_path",
+                            "audio_path",
+                            "candidate_path",
+                            "preview_path",
+                            "building_preview_path",
+                        )
+                    ),
+                ]
                 if any(value and str(Path(value).resolve()) == target for value in held):
                     return True
         return any(

@@ -105,5 +105,5 @@ export function formatCaptureTime(seconds) {
 }
 
 export function captureStatus(status) {
-  return { ready: '已生成', generating: '生成中', pending: '等待生成', failed: '生成失败', missing: '文件已移走', marker: '瞬时边界' }[status] || '等待生成'
+  return { ready: '已生成', virtual: '原片区间', generating: '生成中', pending: '等待生成', failed: '生成失败', missing: '文件已移走', marker: '瞬时边界' }[status] || '等待生成'
 }

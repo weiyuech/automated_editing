@@ -1011,6 +1011,8 @@ class TTSGenerateRequest(BaseModel):
 
 class VoiceoverDraftRequest(BaseModel):
     text: str = Field(default="", max_length=8000)
+    instructions: str = Field(default="", max_length=2000)
+    system_prompt: str | None = Field(default=None, min_length=1, max_length=12000)
     target_seconds: float | None = Field(default=None, ge=1, le=600)
 
 

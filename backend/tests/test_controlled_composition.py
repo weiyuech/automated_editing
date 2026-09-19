@@ -144,7 +144,7 @@ async def test_real_preview_keeps_roots_nested_and_partial_root_is_one_input(stu
     root = studio.media.import_path(str(path))
     blue = studio.media.import_path(str(video(tmp_path / "blue.mp4", "blue", 0.5)))
     studio.media.list_items()
-    group = await studio.media.captures.prepare("capture")
+    group = await studio.media.captures.ensure_timeline("capture")
     studio.media.list_items()
     dwell = next(n for n in group["segments"] if n["kind"] == "dwell")
     choice = CaptureSelection(
@@ -158,7 +158,9 @@ async def test_real_preview_keeps_roots_nested_and_partial_root_is_one_input(stu
     )
     assert record["duration"] == pytest.approx(1.5)
     assert record["measured_duration"] == pytest.approx(1.5, abs=1 / 30)
-    assert len(record["timeline"]["clips"]) == 2
+    assert len(record["timeline"]["clips"]) == 3  # two source intervals, one blue interval
+    assert len({c["media_id"] for c in record["timeline"]["clips"]}) == 2
+    assert not list(studio.media.captures.directory.rglob("*.mp4"))  # no intermediate encoding
     assert len(record["tree"]) == 2
     assert len(record["tree"][0]["children"]) == 1
     assert len(record["tree"][0]["children"][0]["children"]) == 2
@@ -301,6 +303,59 @@ async def saved_material(studio, tmp_path, duration=1):
 
 
 @pytest.mark.asyncio
+async def test_cross_recording_provenance_prompt_and_tts_survive_recombining(studio, tmp_path):
+    from automated_video_editing_backend.core.composition import NarrationAllocateRequest
+    from automated_video_editing_backend.services.narration_context import narration_context
+
+    first = studio.media.import_path(str(video(tmp_path / "first.mp4", "red", 1)))
+    second = studio.media.import_path(str(video(tmp_path / "second.mp4", "blue", 1)))
+    record = await ready(
+        studio, CompositionRequest(purpose="library", media_ids=[first.id, second.id])
+    )
+    material = await studio.save_material(record["id"], record["signature"])
+    record = await ready(studio, CompositionRequest(purpose="library", media_ids=[material.id]))
+    material = await studio.save_material(record["id"], record["signature"])
+    assert len(record["tree"]) == 1
+    assert narration_context(material.metadata)["mode"] == "multiple_recordings"
+    assert len(material.metadata["source_recording_ids"]) == 2
+
+    class DraftLLM(FakeLLM):
+        async def _chat(self, cfg, **kwargs):
+            assert kwargs["system"] == expected_prompt["system"]
+            assert kwargs["user"] == expected_prompt["user"]
+            assert set(json.loads(kwargs["user"])) == {"文案", "本次补充要求", "组合总时长（秒）"}
+            return "整篇旁白。"
+
+    class ForbiddenEmbedder:
+        def similarity(self, *args, **kwargs):
+            raise AssertionError("跨录制不能调用 BAAI")
+
+    directory = tmp_path / "data/tts"
+    directory.mkdir(exist_ok=True)
+    tts = FakeTTS(directory, studio.media, [0.6])
+    service = MappedNarrationService(studio, DraftLLM(), tts, embedder=ForbiddenEmbedder())
+    request = NarrationAllocateRequest(
+        text="原始文案", instructions="自然", system_prompt="只返回正文"
+    )
+    expected_prompt = service.prompt(record["id"], request)
+    draft = await service.allocate(record["id"], request)
+    assert draft["sections"] == []
+    await service.start(
+        record["id"],
+        MappedNarrationRequest(
+            text=draft["text"], sections=[{"node_id": "obsolete", "text": "旧段落"}]
+        ),
+    )
+    await service.tasks[record["id"]]
+    state = record["narration"]
+    assert state["status"] == "ready", state["error"]
+    assert state["sections"] == state["windows"] == state["mappings"] == []
+    assert state["semantic_evidence"] == "not_applicable"
+    assert tts.calls == ["整篇旁白。"]
+    assert studio.material(record["id"])[1].metadata["bound_voice_id"] == state["media_id"]
+
+
+@pytest.mark.asyncio
 async def test_one_complete_synthesis_binds_saved_video_and_follows_pool(studio, tmp_path):
     from automated_video_editing_backend.core.composition import StudioPreviewRequest
 
@@ -316,10 +371,8 @@ async def test_one_complete_synthesis_binds_saved_video_and_follows_pool(studio,
     await service.start(record["id"], request)
     await service.tasks[record["id"]]
     state = record["narration"]
-    assert state["status"] == "pending_review", state["error"]
-    assert not studio.material(record["id"])[1].metadata.get("bound_voice_id")
-    assert studio.media.media_pool()["voiceover_media_ids"] == []
-    service.confirm(record["id"], state["attempt_id"], state["review_id"])
+    assert state["status"] == "ready", state["error"]
+    assert studio.material(record["id"])[1].metadata.get("bound_voice_id") == state["media_id"]
     assert state["status"] == "ready"
     assert tts.calls == [request.text]
     assert studio.renderer.probe_duration(state["audio_path"]) == pytest.approx(0.6, abs=0.002)
@@ -381,7 +434,6 @@ async def test_overshoot_retains_audio_without_silent_retry_or_replacing_binding
     await service.start(record["id"], req)
     await service.tasks[record["id"]]
     state = record["narration"]
-    service.confirm(record["id"], state["attempt_id"], state["review_id"])
     previous = read_manifest(material.path)["narration_binding_id"]
     assert previous
     await service.start(record["id"], req)
@@ -606,7 +658,6 @@ async def test_binding_survives_video_and_voice_rename_and_nested_notes(studio, 
     await service.start(record["id"], MappedNarrationRequest(text="完整旁白"))
     await service.tasks[record["id"]]
     state = record["narration"]
-    service.confirm(record["id"], state["attempt_id"], state["review_id"])
     voice_id = state["media_id"]
     old_path = material.path
     renamer = MediaRenameService(
@@ -664,8 +715,9 @@ async def test_whole_draft_sees_transit_notes_and_orders_text_without_synthesizi
     class DraftLLM(FakeLLM):
         async def _chat(self, cfg, **kwargs):
             payload = json.loads(kwargs["user"])
-            assert payload["画面与备注"][0]["notes"] == ["入口是A点"]
-            assert payload["画面与备注"][1]["kind"] == "transit"
+            assert payload["拍摄备注原文"] == "入口是A点"
+            assert "notes" not in payload["画面时间表"][0]
+            assert payload["画面时间表"][1]["kind"] == "transit"
             assert "唯一事实来源" in kwargs["system"]
             return json.dumps(
                 {
@@ -701,8 +753,7 @@ async def test_intro_offsets_one_voice_and_its_exact_subtitles_together(studio, 
     service = MappedNarrationService(studio, FakeLLM(), tts)
     await service.start(record["id"], MappedNarrationRequest(text="你好"))
     await service.tasks[record["id"]]
-    state = record["narration"]
-    service.confirm(record["id"], state["attempt_id"], state["review_id"])
+    assert record["narration"]["status"] == "ready"
     effect = studio.media.register_generated_path(
         video(tmp_path / "data/intro.mp4", "blue", 0.5),
         kind="video",
@@ -724,7 +775,7 @@ async def test_intro_offsets_one_voice_and_its_exact_subtitles_together(studio, 
 
 
 @pytest.mark.asyncio
-async def test_adjust_reuses_one_synthesis_and_stale_review_cannot_commit(studio, tmp_path):
+async def test_adjust_reuses_synthesis_commits_new_version_and_survives_restart(studio, tmp_path):
     from automated_video_editing_backend.core.composition import NarrationAdjustRequest
     from automated_video_editing_backend.services.composition_assets import read_manifest
 
@@ -733,36 +784,45 @@ async def test_adjust_reuses_one_synthesis_and_stale_review_cannot_commit(studio
     service = MappedNarrationService(studio, FakeLLM(), tts)
     await service.start(record["id"], MappedNarrationRequest(text="完整旁白"))
     await service.tasks[record["id"]]
-    state = record["narration"]
-    assert state["status"] == "pending_review", state.get("error")
-    assert state["actual_seconds"] == pytest.approx(2, abs=0.002)
-    assert state["playback_blocks"][0]["rate"] == pytest.approx(1.05)
-    assert not read_manifest(material.path).get("narration_binding_id")
-    assert studio.renderer.probe_duration(state["preview_path"]) == pytest.approx(2, abs=0.05)
-    previous_review = state["review_id"]
+    old = record["narration"]
+    assert old["status"] == "ready", old.get("error")
+    assert old["actual_seconds"] == pytest.approx(2, abs=0.002)
+    assert old["playback_blocks"][0]["rate"] == pytest.approx(1.05)
+    assert not old.get("preview_path")
+    assert read_manifest(material.path)["narration_binding_id"] == old["attempt_id"]
+    original_bytes = Path(old["audio_path"]).read_bytes()
     await service.adjust(
-        record["id"], NarrationAdjustRequest(attempt_id=state["attempt_id"], playback_rate=1.1)
+        record["id"], NarrationAdjustRequest(attempt_id=old["attempt_id"], playback_rate=1.1)
     )
     await service.tasks[record["id"]]
+    state = record["narration"]
+    assert state["status"] == "ready", state.get("error")
     assert len(tts.calls) == 1
+    assert state["attempt_id"] != old["attempt_id"]
     assert state["actual_seconds"] == pytest.approx(2.1 / 1.1, abs=0.002)
-    with pytest.raises(ValueError, match="当前版本"):
-        service.confirm(record["id"], state["attempt_id"], previous_review)
-    # A pending review and its private input survive a backend restart and safe cleanup.
-    assert studio.is_path_in_use(state["source_audio_path"])
-    assert studio.is_path_in_use(state["audio_path"])
-    restored = CompositionService(studio.jobs, directory=studio.directory)
-    reviewer = MappedNarrationService(restored, FakeLLM(), tts)
-    reviewer.confirm(record["id"], state["attempt_id"], state["review_id"])
+    assert Path(old["audio_path"]).read_bytes() == original_bytes
     assert read_manifest(material.path)["narration_binding_id"] == state["attempt_id"]
-    with pytest.raises(ValueError, match="未确认"):
-        await reviewer.adjust(record["id"], NarrationAdjustRequest(attempt_id=state["attempt_id"]))
+    with pytest.raises(ValueError, match="已更新"):
+        await service.adjust(record["id"], NarrationAdjustRequest(attempt_id=old["attempt_id"]))
+    assert studio.is_path_in_use(state["source_audio_path"])
+    restored = CompositionService(studio.jobs, directory=studio.directory)
+    assert restored.is_path_in_use(state["source_audio_path"])
+    editor = MappedNarrationService(restored, FakeLLM(), tts)
+    # An unsuccessful adjustment never overwrites the audio already used by editing.
+    await editor.adjust(
+        record["id"],
+        NarrationAdjustRequest(attempt_id=state["attempt_id"], playback_rate=0.9, auto_tempo=False),
+    )
+    await editor.tasks[record["id"]]
+    assert restored.get(record["id"])["narration"]["status"] == "needs_revision"
+    assert read_manifest(material.path)["narration_binding_id"] == state["attempt_id"]
+    assert len(tts.calls) == 1
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("tamper_metadata", [False, True])
-async def test_new_candidate_and_tampered_audio_preserve_confirmed_binding(
-    studio, tmp_path, tamper_metadata
+async def test_publish_rejects_tampered_candidate_and_preserves_binding(
+    studio, tmp_path, tamper_metadata, monkeypatch
 ):
     from automated_video_editing_backend.services.composition_assets import read_manifest
 
@@ -772,20 +832,25 @@ async def test_new_candidate_and_tampered_audio_preserve_confirmed_binding(
     await service.start(record["id"], MappedNarrationRequest(text="第一版"))
     await service.tasks[record["id"]]
     old = record["narration"]
-    service.confirm(record["id"], old["attempt_id"], old["review_id"])
+    assert old["status"] == "ready"
+    original = Path(old["audio_path"]).read_bytes()
+    publish = service._publish
+
+    def tamper(record, item, state):
+        changed = Path(state["audio_path"])
+        if tamper_metadata:
+            changed = changed.with_suffix(".json")
+        with changed.open("ab") as handle:
+            handle.write(b"changed")
+        return publish(record, item, state)
+
+    monkeypatch.setattr(service, "_publish", tamper)
     await service.start(record["id"], MappedNarrationRequest(text="第二版"))
     await service.tasks[record["id"]]
-    new = record["narration"]
-    assert new["status"] == "pending_review"
+    assert record["narration"]["status"] == "failed"
+    assert "已改变" in record["narration"]["error"]
     assert read_manifest(material.path)["narration_binding_id"] == old["attempt_id"]
-    changed = (
-        Path(new["audio_path"]).with_suffix(".json") if tamper_metadata else Path(new["audio_path"])
-    )
-    with changed.open("ab") as handle:
-        handle.write(b"changed")
-    with pytest.raises(ValueError, match="已改变"):
-        service.confirm(record["id"], new["attempt_id"], new["review_id"])
-    assert read_manifest(material.path)["narration_binding_id"] == old["attempt_id"]
+    assert Path(old["audio_path"]).read_bytes() == original
 
 
 @pytest.mark.asyncio
@@ -828,12 +893,12 @@ async def test_local_audio_waits_for_next_point_and_subtitle_clock_follows(studi
     )
     await service.tasks[record["id"]]
     state = record["narration"]
-    assert state["status"] == "pending_review", state.get("error")
+    assert state["status"] == "ready", state.get("error")
     assert state["local_alignment"]
     assert state["checks"][1]["actual_start"] == pytest.approx(2.1)
-    words = json.loads(
-        Path(state["audio_path"]).with_suffix(".json").read_text(encoding="utf-8")
-    )["words"]
+    words = json.loads(Path(state["audio_path"]).with_suffix(".json").read_text(encoding="utf-8"))[
+        "words"
+    ]
     assert words[1]["start_time"] == 2100
     # The rendered audio really contains silence before B, not only a changed metadata clock.
     samples = subprocess.check_output(
@@ -857,7 +922,6 @@ async def test_local_audio_waits_for_next_point_and_subtitle_clock_follows(studi
         ]
     )
     assert samples and set(samples) == {0}
-    service.confirm(record["id"], state["attempt_id"], state["review_id"])
     created = await studio.studio_previews(StudioPreviewRequest(media_ids=[material.id]))
     await studio.tasks[created[0]["id"]]
     final = studio.get(created[0]["id"])
@@ -867,9 +931,7 @@ async def test_local_audio_waits_for_next_point_and_subtitle_clock_follows(studi
 
 
 @pytest.mark.asyncio
-async def test_mp3_provider_produces_only_one_selectable_candidate_after_confirmation(
-    studio, tmp_path
-):
+async def test_mp3_provider_auto_binds_one_selectable_adjusted_voice(studio, tmp_path):
     record, material = await saved_material(studio, tmp_path, 2)
 
     class Mp3TTS(FakeTTS):
@@ -892,7 +954,7 @@ async def test_mp3_provider_produces_only_one_selectable_candidate_after_confirm
     await service.start(record["id"], MappedNarrationRequest(text="只有一条完整旁白"))
     await service.tasks[record["id"]]
     state = record["narration"]
-    assert state["status"] == "pending_review", state.get("error")
+    assert state["status"] == "ready", state.get("error")
     voices = [v for v in studio.media.list_items() if v.metadata.get("role") == "tts_voice"]
     assert len(voices) == 1
     assert Path(voices[0].path).suffix == ".wav"
@@ -900,7 +962,135 @@ async def test_mp3_provider_produces_only_one_selectable_candidate_after_confirm
     studio.media.update_media_pool(
         {"source_media_ids": [material.id], "voiceover_media_ids": [voices[0].id]}
     )
-    assert studio.media.media_pool()["voiceover_media_ids"] == []
-    service.confirm(record["id"], state["attempt_id"], state["review_id"])
     assert studio.media.media_pool()["voiceover_media_ids"] == [voices[0].id]
     assert len(tts.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_missing_notes_require_instructions_only_for_rewriting(studio, tmp_path):
+    from automated_video_editing_backend.core.composition import NarrationAllocateRequest
+
+    record, _ = await saved_material(studio, tmp_path, 1)
+
+    class NoLLM(FakeLLM):
+        async def _chat(self, *args, **kwargs):
+            raise AssertionError(
+                "Missing instructions must be rejected before calling the provider"
+            )
+
+    class NoEmbedding:
+        def similarity(self, *args, **kwargs):
+            raise AssertionError("Direct narration should not infer point mappings")
+
+    tts = FakeTTS(tmp_path / "data/tts", studio.media, [0.4])
+    service = MappedNarrationService(studio, NoLLM(), tts, embedder=NoEmbedding())
+    with pytest.raises(ValueError, match="本次补充要求"):
+        await service.allocate(
+            record["id"],
+            NarrationAllocateRequest(text="完整正文", system_prompt="自定义规则不能绕过输入要求"),
+        )
+    await service.start(
+        record["id"], MappedNarrationRequest(text="完整正文", direct_narration=True)
+    )
+    await service.tasks[record["id"]]
+    state = record["narration"]
+    assert state["status"] == "ready", state.get("error")
+    assert state["semantic_evidence"] == "not_applicable"
+    assert state["mappings"] == []
+    assert tts.calls == ["完整正文"]
+
+
+@pytest.mark.asyncio
+async def test_speed_adjustment_retimes_audio_and_workbench_subtitles_together(studio, tmp_path):
+    from automated_video_editing_backend.core.composition import (
+        NarrationAdjustRequest,
+        StudioPreviewRequest,
+    )
+
+    record, material = await saved_material(studio, tmp_path, 2)
+
+    class ClockTTS(FakeTTS):
+        async def synthesize(self, request, text):
+            result = await super().synthesize(request, text)
+            result.asset.timing_quality = "exact"
+            result.words = [{"text": "你好", "start_time": 220, "end_time": 1100}]
+            return result
+
+    tts = ClockTTS(tmp_path / "data/tts", studio.media, [1.2])
+    service = MappedNarrationService(studio, FakeLLM(), tts)
+    await service.start(record["id"], MappedNarrationRequest(text="你好", direct_narration=True))
+    await service.tasks[record["id"]]
+    await service.adjust(
+        record["id"],
+        NarrationAdjustRequest(
+            attempt_id=record["narration"]["attempt_id"], playback_rate=1.1, auto_tempo=False
+        ),
+    )
+    await service.tasks[record["id"]]
+    state = record["narration"]
+    assert state["status"] == "ready", state.get("error")
+    assert state["actual_seconds"] == pytest.approx(1.2 / 1.1, abs=0.002)
+    voice = json.loads(Path(state["audio_path"]).with_suffix(".json").read_text(encoding="utf-8"))
+    assert voice["words"] == [{"text": "你好", "start_time": 200, "end_time": 1000}]
+    previews = await studio.studio_previews(StudioPreviewRequest(media_ids=[material.id]))
+    await studio.tasks[previews[0]["id"]]
+    timeline = studio.get(previews[0]["id"])["timeline"]
+    assert timeline["voiceover_path"] == state["audio_path"]
+    assert timeline["subtitles"]["cues"][0]["start"] == pytest.approx(0.2)
+    assert timeline["subtitles"]["cues"][0]["end"] == pytest.approx(1)
+    assert len(tts.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_preview_progress_and_cancellation_are_separate_from_export_queue(
+    studio, tmp_path, monkeypatch
+):
+    source = studio.media.import_path(str(video(tmp_path / "source.mp4", "blue")))
+    reached = asyncio.Event()
+    reaped = asyncio.Event()
+
+    async def render(timeline, progress=None):
+        try:
+            progress(
+                {
+                    "stage": "encoding",
+                    "encoder": "h264_nvenc",
+                    "processed_seconds": 0.5,
+                    "fraction": 0.25,
+                }
+            )
+            reached.set()
+            await asyncio.Event().wait()
+        finally:
+            reaped.set()
+
+    monkeypatch.setattr(studio.renderer, "render", render)
+    response = await studio.create(CompositionRequest(media_ids=[source.id]))
+    assert response["status"] == "queued"
+    assert studio.jobs.list_jobs() == []
+    await asyncio.wait_for(reached.wait(), timeout=3)
+    progress = studio.public(studio.get(response["id"]))
+    assert progress["stage"] == "encoding"
+    assert progress["encoder"] == "h264_nvenc"
+    assert progress["processed_seconds"] == 0.5
+    assert progress["elapsed_seconds"] >= 0
+    assert studio.is_path_in_use(source.path)
+    result = await studio.cancel(response["id"])
+    assert result["status"] == "cancelled"
+    assert reaped.is_set()
+    assert not studio.tasks
+    assert not studio.is_path_in_use(source.path)
+    assert studio.jobs.list_jobs() == []
+    assert (await studio.cancel(response["id"]))["status"] == "cancelled"
+    restored = CompositionService(studio.jobs, studio.directory)
+    assert restored.get(response["id"])["status"] == "cancelled"
+
+
+@pytest.mark.asyncio
+async def test_queued_preview_can_cancel_before_builder_starts(studio, tmp_path):
+    source = studio.media.import_path(str(video(tmp_path / "source.mp4", "blue")))
+    response = await studio.create(CompositionRequest(media_ids=[source.id]))
+    result = await studio.cancel(response["id"])
+    assert result["status"] == "cancelled"
+    assert not studio.tasks
+    assert studio.jobs.list_jobs() == []
