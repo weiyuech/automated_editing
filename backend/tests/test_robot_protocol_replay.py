@@ -20,6 +20,8 @@ from automated_video_editing_backend.core.models import (
     CameraworkConfig,
     CruisePoint,
     CruiseRequest,
+    CruiseRun,
+    CruiseSegment,
     GimbalMoveRequest,
     MediaItem,
     RobotGoalCommand,
@@ -27,6 +29,7 @@ from automated_video_editing_backend.core.models import (
 from automated_video_editing_backend.services import cruise as cruise_module
 from automated_video_editing_backend.services import robot as robot_module
 from automated_video_editing_backend.services.capture import CaptureService
+from automated_video_editing_backend.services.camera_program import camera_program
 from automated_video_editing_backend.services.cruise import CruiseService
 from automated_video_editing_backend.services.robot import HardwareRobotAdapter, RobotService
 
@@ -455,6 +458,173 @@ async def test_late_old_gimbal_ok_cannot_release_a_newer_command(monkeypatch):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("mode", [4, 8])
+async def test_fixed_program_continues_after_pose_arrival_with_ambiguous_ok(
+    tmp_path, monkeypatch, mode
+):
+    """Replay the 09-19 failure through both cruise and the real hardware gate."""
+    adapter = _connected_adapter()
+    adapter._gimbal_terminal_replies_trusted = False
+    sent = []
+    replies = []
+    monkeypatch.setattr(cruise_module, "_CW_POSE_POLL_SECONDS", 0.001)
+    monkeypatch.setattr(robot_module, "_GIMBAL_PREVIOUS_COMMAND_WAIT_SECONDS", 0.01)
+    monkeypatch.setattr(robot_module, "_gimbal_command_budget_seconds", lambda _: 120)
+
+    async def pose(yaw, pitch, zoom=1):
+        await adapter._handle_message(json.dumps({"gimbal": {"yaw": yaw, "pitch": pitch, "zoom": zoom}}))
+
+    async def feedback(command):
+        await asyncio.sleep(0.005)
+        await adapter._handle_message(json.dumps({"robot_gimbal_control": {"status": "ok"}}))
+        assert not adapter._gimbal_ready.is_set()
+        # Actual completion is much faster than the conservative travel estimate.
+        yaw = command["yaw_end"]
+        pitch = command["pitch_end"]
+        for _ in range(3):
+            await pose(yaw - 1 if yaw >= 0 else yaw + 1, pitch - 1 if pitch >= 0 else pitch + 1, command["zoom_end"])
+            await asyncio.sleep(0.005)
+
+    class Socket:
+        async def send(self, message):
+            command = json.loads(message)["gimbal_control"]
+            sent.append((command["yaw_end"], command["pitch_end"]))
+            replies.append(asyncio.create_task(feedback(command)))
+
+    adapter._socket = Socket()
+    await pose(0, 0)
+    events = EventHub()
+    service = CruiseService(
+        events, RobotService(events, adapter=adapter),
+        CaptureService(events, path=tmp_path / "capture.json"),
+    )
+    config = CameraworkConfig(point_mode=mode)
+    segment = CruiseSegment(index=0, path_name="route", goal_id=1)
+    try:
+        await asyncio.wait_for(
+            service._run_camera_program(CruiseRun(segments=[segment]), segment, config, None),
+            2,
+        )
+    finally:
+        await asyncio.gather(*replies)
+    pieces = camera_program(config)
+    assert sent == [target for piece in pieces for target in piece.poses[1:]]
+    assert len(segment.shots) == (8 if mode == 4 else 12)
+    assert all(shot["status"] == "complete" for shot in segment.shots)
+
+
+@pytest.mark.asyncio
+async def test_fixed_pose_gate_requires_fresh_both_axes_and_ignores_late_ok(monkeypatch):
+    adapter = _connected_adapter()
+    adapter._gimbal_terminal_replies_trusted = False
+    monkeypatch.setattr(robot_module, "_gimbal_command_budget_seconds", lambda _: 120)
+
+    class Socket:
+        async def send(self, message):
+            pass
+
+    adapter._socket = Socket()
+
+    async def pose(**axes):
+        await adapter._handle_message(json.dumps({"gimbal": axes}))
+
+    # A partial sample from before the command must not contribute to arrival.
+    await pose(yaw=89)
+    await adapter.set_gimbal(_gimbal_move(90), context="cruise_fixed_piece")
+    await pose(pitch=0)
+    assert adapter._gimbal_pose_samples == 0
+    await pose(yaw=89)
+    assert adapter._gimbal_pose_samples == 1
+    await pose(yaw=89)
+    assert not adapter._gimbal_ready.is_set()
+    await pose(pitch=5.01)
+    assert adapter._gimbal_pose_samples == 0
+    await pose(yaw=85, pitch=5)
+    assert not adapter._gimbal_ready.is_set()
+    await pose(yaw=89.3, pitch=0.1)
+    assert adapter._gimbal_ready.is_set()
+
+    await adapter.set_gimbal(_gimbal_move(-90), context="cruise_fixed_piece")
+    await adapter._handle_message(json.dumps({"robot_gimbal_control": {"status": "ok"}}))
+    await pose(yaw=89.3, pitch=0.1)
+    await pose(yaw=89.3, pitch=0.1)
+    assert not adapter._gimbal_ready.is_set()
+    await pose(yaw=-88, pitch=0)
+    await pose(yaw=-89, pitch=0)
+    assert adapter._gimbal_ready.is_set()
+    adapter._clear_heartbeat_diagnostics()
+    assert adapter._gimbal_pose_target is None
+    assert adapter._gimbal_pose_samples == 0
+
+
+@pytest.mark.asyncio
+async def test_zoom_pieces_wait_for_actual_zoom_and_restore_custom_base(tmp_path, monkeypatch):
+    adapter = _connected_adapter()
+    adapter._gimbal_terminal_replies_trusted = False
+    commands = asyncio.Queue()
+
+    class Socket:
+        async def send(self, message):
+            await commands.put(json.loads(message)["gimbal_control"])
+
+    adapter._socket = Socket()
+    events = EventHub()
+    service = CruiseService(events, RobotService(events, adapter=adapter),
+                            CaptureService(events, path=tmp_path / "capture.json"))
+    monkeypatch.setattr(cruise_module, "_CW_POSE_POLL_SECONDS", 0.001)
+    config = CameraworkConfig(anchor_zoom=1.2, zoom_target=1.5)
+
+    async def sample(zoom=None):
+        gimbal = {"yaw": 0, "pitch": 0}
+        if zoom is not None:
+            gimbal["zoom"] = zoom
+        await adapter._handle_message(json.dumps({"gimbal": gimbal}))
+        await asyncio.sleep(0.005)
+
+    await sample(1.2)
+    service._cw_zoom = 1.2
+    for start, end in [(1.2, 1.5), (1.5, 1.2)]:
+        move = asyncio.create_task(service._move_to_pose((0, 0), config, target_zoom=end))
+        try:
+            command = await asyncio.wait_for(commands.get(), 0.5)
+            assert (command["zoom_start"], command["zoom_end"]) == (start, end)
+            await sample()
+            await sample()
+            assert not move.done() and not adapter._gimbal_ready.is_set()
+            await sample(start)
+            await sample(start)
+            assert not move.done() and not adapter._gimbal_ready.is_set()
+            await sample(end)
+            assert not move.done()
+            await sample(end)
+            await asyncio.wait_for(move, 0.5)
+            assert adapter._gimbal_ready.is_set()
+            assert service._cw_zoom == end
+        finally:
+            if not move.done():
+                move.cancel()
+                with suppress(asyncio.CancelledError):
+                    await move
+
+
+@pytest.mark.asyncio
+async def test_position_feedback_does_not_complete_a_zoom_change():
+    adapter = _connected_adapter()
+    adapter._gimbal_terminal_replies_trusted = False
+
+    class Socket:
+        async def send(self, message):
+            pass
+
+    adapter._socket = Socket()
+    move = _gimbal_move(20).model_copy(update={"zoom_end": 2})
+    await adapter.set_gimbal(move, context="cruise_fixed_piece")
+    for _ in range(2):
+        await adapter._handle_message(json.dumps({"gimbal": {"yaw": 20, "pitch": 0}}))
+    assert not adapter._gimbal_ready.is_set()
+
+
+@pytest.mark.asyncio
 async def test_cancelled_gimbal_while_queued_does_not_leave_a_phantom_command():
     """Cancellation before the socket-write boundary must release camera ownership."""
 
@@ -566,10 +736,10 @@ async def test_real_websocket_cruise_times_out_bare_done_but_stops_and_saves_onc
             async with send_lock:
                 await connection.send(json.dumps(payload))
 
-        async def send_pose(yaw: float, pitch: float) -> None:
-            await send({"gimbal": {"yaw": yaw, "pitch": pitch, "mode": 1}})
+        async def send_pose(yaw: float, pitch: float, zoom: float = 1) -> None:
+            await send({"gimbal": {"yaw": yaw, "pitch": pitch, "zoom": zoom, "mode": 1}})
 
-        async def finish_gimbal(yaw: float, pitch: float) -> None:
+        async def finish_gimbal(yaw: float, pitch: float, zoom: float) -> None:
             nonlocal gimbal_busy
             await asyncio.sleep(0.01)
             await send({"robot_gimbal_control": {"status": "ok"}})
@@ -578,9 +748,9 @@ async def test_real_websocket_cruise_times_out_bare_done_but_stops_and_saves_onc
             # Two separately received samples exercise the same physical-pose confirmation used
             # in production.  They intentionally arrive after the command write boundary.
             await asyncio.sleep(0.008)
-            await send_pose(yaw, pitch)
+            await send_pose(yaw, pitch, zoom)
             await asyncio.sleep(0.008)
-            await send_pose(yaw, pitch)
+            await send_pose(yaw, pitch, zoom)
 
         async def finish_goal(goal_id: int) -> None:
             nonlocal bare_done_count
@@ -696,7 +866,7 @@ async def test_real_websocket_cruise_times_out_bare_done_but_stops_and_saves_onc
                     await send({"robot_gimbal_control": {"status": "busy"}})
                     gimbal_replies.append("busy")
                     spawn_reply(
-                        finish_gimbal(float(target["yaw_end"]), float(target["pitch_end"]))
+                        finish_gimbal(float(target["yaw_end"]), float(target["pitch_end"]), float(target["zoom_end"]))
                     )
                 elif payload.get("video_record", {}).get("stop") == 0:
                     stop_followed_final_bare_done = final_bare_done_sent.is_set()

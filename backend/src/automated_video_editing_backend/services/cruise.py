@@ -23,12 +23,14 @@ from automated_video_editing_backend.core.models import (
 from automated_video_editing_backend.services.capture import CaptureService
 from automated_video_editing_backend.services.robot import RobotCommandNotSentError, RobotService
 
-from automated_video_editing_backend.services.camera_program import camera_program
+from automated_video_editing_backend.services.camera_program import (
+    POSE_STABLE_SAMPLES as _CW_POSE_STABLE_SAMPLES,
+    POSE_TOLERANCE_DEG as _CW_POSE_TOLERANCE_DEG,
+    ZOOM_TOLERANCE,
+    camera_program,
+)
 
-# Per-axis arrival tolerance for every pose; commanded targets remain exact.
-_CW_POSE_TOLERANCE_DEG = 2.0
 _CW_POSE_POLL_SECONDS = 0.2
-_CW_POSE_STABLE_SAMPLES = 2
 _ARRIVAL_TIMEOUT_SECONDS = 60.0
 
 
@@ -339,8 +341,8 @@ class CruiseService:
         self._telemetry = []
         try:
             # Establish the operator's intended resting composition before footage or base
-            # movement begins. Zoom has no heartbeat feedback, so every run also resets our
-            # command-side tracking here.
+            # movement begins. Prefer physical zoom feedback; retain a starting default
+            # only for old adapters until a zoom operation requires real feedback.
             if camerawork is not None:
                 self._cw_zoom = 1.0
                 await self._move_to_pose((0, 0), camerawork)
@@ -542,13 +544,30 @@ class CruiseService:
         reader = getattr(self.robot, "heartbeat_revision", None)
         return reader() if callable(reader) else None
 
-    async def _move_to_pose(self, target: tuple[float, float], config: CameraworkConfig) -> None:
+    def _heartbeat_zoom(self) -> float | None:
+        reader = getattr(self.robot, "heartbeat_zoom", None)
+        return reader() if callable(reader) else None
+
+    def _zoom_revision(self) -> int:
+        reader = getattr(self.robot, "heartbeat_zoom_revision", None)
+        return reader() if callable(reader) else 0
+
+    async def _move_to_pose(
+        self, target: tuple[float, float], config: CameraworkConfig,
+        *, target_zoom: float | None = None,
+    ) -> None:
         """One command, then fresh physical confirmation. A timeout never means arrival."""
         if self._cancel.is_set():
             raise asyncio.CancelledError
         yaw, pitch = self.robot.heartbeat_yaw(), self._heartbeat_pitch()
         if yaw is None or pitch is None:
             raise ValueError("缺少云台角度反馈，已停止后续导航；请检查机器人心跳")
+        desired_zoom = config.anchor_zoom if target_zoom is None else target_zoom
+        zoom = self._heartbeat_zoom()
+        start_zoom = self._cw_zoom if zoom is None else zoom
+        check_zoom = target_zoom is not None or abs(start_zoom - desired_zoom) > ZOOM_TOLERANCE
+        if check_zoom and zoom is None:
+            raise ValueError("缺少变焦倍率反馈，已停止后续镜头和导航；请检查机器人心跳 zoom")
         speed = config.speed_max
         await asyncio.wait_for(
             self.robot.set_gimbal(
@@ -559,26 +578,34 @@ class CruiseService:
                     pitch_start=pitch,
                     pitch_end=target[1],
                     pitch_speed=speed,
-                    zoom_start=self._cw_zoom,
-                    zoom_end=config.anchor_zoom,
+                    zoom_start=start_zoom,
+                    zoom_end=desired_zoom,
                 ),
-                context="cruise_fixed_piece",
+                context="cruise_fixed_zoom" if check_zoom else "cruise_fixed_piece",
             ),
             timeout=10,
         )
         revision = self._heartbeat_revision()
-        self._cw_zoom = config.anchor_zoom
+        zoom_revision = self._zoom_revision()
         budget = max(abs(target[0] - yaw), abs(target[1] - pitch)) / speed + 8.0
-        reached, _ = await self._await_camerawork_pose(*target, budget, after_revision=revision)
+        if check_zoom:
+            budget = max(budget, 15.0)
+        reached, _ = await self._await_camerawork_pose(
+            *target, budget, after_revision=revision,
+            target_zoom=desired_zoom if check_zoom else None,
+            after_zoom_revision=zoom_revision,
+        )
         if self._cancel.is_set():
             raise asyncio.CancelledError
         if not reached:
-            raise ValueError(f"云台未确认到达 ({target[0]}, {target[1]})；已停止后续镜头和导航")
+            detail = f"，倍率 {desired_zoom:g}×" if check_zoom else ""
+            raise ValueError(f"云台未确认到达 ({target[0]}, {target[1]}){detail}；已停止后续镜头和导航")
+        self._cw_zoom = desired_zoom
 
     async def _run_camera_program(self, run, segment, config, selected) -> None:
         pieces = camera_program(config, config.piece_ids if selected is None else selected)
 
-        async def record_piece(key, label, targets, kind):
+        async def record_piece(key, label, targets, kind, zooms=None):
             shot = {
                 "id": key,
                 "label": label,
@@ -588,11 +615,16 @@ class CruiseService:
                 "status": "running",
                 "boundary_source": "command_to_pose_feedback",
             }
+            if zooms is not None:
+                shot.update(zoom_start=zooms[0], zoom_end=zooms[1])
             segment.shots.append(shot)
             await self._publish_segment("CRUISE_SHOT_STARTED", run, segment)
             try:
                 for target in targets:
-                    await self._move_to_pose(target, config)
+                    if zooms is None:
+                        await self._move_to_pose(target, config)
+                    else:
+                        await self._move_to_pose(target, config, target_zoom=zooms[1])
                 shot["status"] = "complete"
             finally:
                 shot["end"] = self._elapsed()
@@ -606,14 +638,20 @@ class CruiseService:
                 raise asyncio.CancelledError
             # Even an unchanged intended pose may have drifted during chassis navigation.
             observed = (self.robot.heartbeat_yaw(), self._heartbeat_pitch())
-            if previous != piece.poses[0] or any(
+            zoom_start = config.anchor_zoom if piece.zooms is None else piece.zooms[0]
+            observed_zoom = self._heartbeat_zoom()
+            zoom_needs_preparation = (
+                observed_zoom is not None and abs(observed_zoom - zoom_start) > ZOOM_TOLERANCE
+            )
+            if zoom_needs_preparation or previous != piece.poses[0] or any(
                 value is None or abs(value - desired) > _CW_POSE_TOLERANCE_DEG
                 for value, desired in zip(observed, piece.poses[0])
             ):
                 await record_piece(
-                    f"prepare-{piece.id}", "镜头准备", [piece.poses[0]], "preparation"
+                    f"prepare-{piece.id}", "镜头准备", [piece.poses[0]], "preparation",
+                    (self._cw_zoom, zoom_start) if piece.zooms is not None or zoom_needs_preparation else None,
                 )
-            await record_piece(piece.id, piece.label, piece.poses[1:], "shot")
+            await record_piece(piece.id, piece.label, piece.poses[1:], "shot", piece.zooms)
             previous = piece.poses[-1]
         if previous != (0, 0):
             await record_piece("return-origin", "回原点准备", [(0, 0)], "preparation")
@@ -624,12 +662,15 @@ class CruiseService:
         target_pitch: float,
         budget: float,
         after_revision: int | None = None,
+        target_zoom: float | None = None,
+        after_zoom_revision: int = 0,
     ) -> tuple[bool, bool]:
         """Require two distinct, post-command physical samples; expiry is never success."""
         deadline = time.monotonic() + max(0.0, budget)
         stable = 0
         observed = False
         last_revision = after_revision
+        last_zoom_revision = after_zoom_revision
         while time.monotonic() < deadline:
             if self._cancel.is_set():
                 return False, observed
@@ -643,9 +684,19 @@ class CruiseService:
             if fresh and yaw is not None and pitch is not None:
                 observed = True
                 last_revision = revision
+                zoom_matches = True
+                if target_zoom is not None:
+                    zoom_revision = self._zoom_revision()
+                    zoom = self._heartbeat_zoom()
+                    zoom_matches = (
+                        zoom_revision > last_zoom_revision and zoom is not None
+                        and abs(zoom - target_zoom) <= ZOOM_TOLERANCE
+                    )
+                    last_zoom_revision = zoom_revision
                 if (
                     abs(yaw - target_yaw) <= _CW_POSE_TOLERANCE_DEG
                     and abs(pitch - target_pitch) <= _CW_POSE_TOLERANCE_DEG
+                    and zoom_matches
                 ):
                     stable += 1
                     if stable >= _CW_POSE_STABLE_SAMPLES:

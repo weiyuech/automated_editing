@@ -192,10 +192,11 @@
                 <strong>固定运镜（巡游）</strong>
                 <p class="form-hint">按用户范围的四边与四角执行镜头，顺序固定。</p>
               </div>
-              <p class="form-hint">原点固定为 (0, 0)。完成本点所有勾选镜头后，底盘才前往下一点。</p>
+              <p class="form-hint">原点固定为 (0, 0)。到点后先拍两段倍率往返，其余镜头使用基础倍率；全部完成后再前往下一点。</p>
               <div class="gimbal-axis"><span class="axis-name">模式</span>
-                <select v-model.number="cameraworkForm.point_mode" class="field" @change="cameraworkForm.piece_ids = null; markCameraworkDirty()"><option :value="4">4 点 · 6 段</option><option :value="8">8 点 · 10 段</option></select>
-                <label><small>固定变焦倍率</small><input v-model.number="cameraworkForm.anchor_zoom" class="field" type="number" min="1" max="3.5" step="0.1" @input="markCameraworkDirty" /></label>
+                <select v-model.number="cameraworkForm.point_mode" class="field" @change="cameraworkForm.piece_ids = null; markCameraworkDirty()"><option :value="4">4 点 · 8 段</option><option :value="8">8 点 · 12 段</option></select>
+                <label><small>基础倍率</small><input v-model.number="cameraworkForm.anchor_zoom" class="field" type="number" min="1" max="3.5" step="0.1" @input="markCameraworkDirty" /></label>
+                <label><small>缩放倍率</small><input v-model.number="cameraworkForm.zoom_target" class="field" type="number" min="1" max="3.5" step="0.1" @input="markCameraworkDirty" /></label>
               </div>
               <CameraProgramPicker :mode="cameraworkForm.point_mode" v-model="cameraworkForm.piece_ids" @update:model-value="markCameraworkDirty" />
               <div class="gimbal-axis">

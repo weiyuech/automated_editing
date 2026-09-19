@@ -6,12 +6,20 @@ from dataclasses import dataclass
 from typing import Protocol
 
 
+# Shared by cruise arrival checks and the hardware command gate.
+POSE_TOLERANCE_DEG = 5.0
+POSE_STABLE_SAMPLES = 2
+ZOOM_TOLERANCE = 0.05
+
+
 class Bounds(Protocol):
     yaw_min: int
     yaw_max: int
     pitch_min: int
     pitch_max: int
     point_mode: int
+    anchor_zoom: float
+    zoom_target: float
 
 
 @dataclass(frozen=True)
@@ -19,6 +27,7 @@ class CameraPiece:
     id: str
     label: str
     poses: tuple[tuple[float, float], ...]
+    zooms: tuple[float, float] | None = None
 
 
 def camera_program(config: Bounds, selected: list[str] | None = None) -> list[CameraPiece]:
@@ -26,6 +35,10 @@ def camera_program(config: Bounds, selected: list[str] | None = None) -> list[Ca
     left, right = (config.yaw_max, 0), (config.yaw_min, 0)
     up, down = (0, config.pitch_min), (0, config.pitch_max)
     pieces = [
+        CameraPiece("zoom-outbound", "基础倍率 → 缩放倍率", (origin, origin),
+                    (config.anchor_zoom, config.zoom_target)),
+        CameraPiece("zoom-return", "缩放倍率 → 基础倍率", (origin, origin),
+                    (config.zoom_target, config.anchor_zoom)),
         CameraPiece("origin-left", "原点 → 左", (origin, left)),
         CameraPiece("left-right", "左 → 右", (left, right)),
         CameraPiece("right-origin", "右 → 原点", (right, origin)),
@@ -45,4 +58,4 @@ def camera_program(config: Bounds, selected: list[str] | None = None) -> list[Ca
         return pieces
     if len(selected) != len(set(selected)) or set(selected) - {piece.id for piece in pieces}:
         raise ValueError("镜头选择不属于当前 4 / 8 点模式，请重新选择")
-    return [piece for piece in pieces if piece.id in selected]
+    return [piece for piece in pieces if piece.zooms is not None or piece.id in selected]

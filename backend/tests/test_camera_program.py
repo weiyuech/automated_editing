@@ -18,7 +18,9 @@ from automated_video_editing_backend.services.cruise import CruiseService
 def test_exact_cardinal_and_corner_program_uses_asymmetric_operator_bounds():
     config = CameraworkConfig(yaw_min=-20, yaw_max=50, pitch_min=-10, pitch_max=5, point_mode=8)
     pieces = camera_program(config)
-    assert [p.poses for p in pieces[:6]] == [
+    assert [p.zooms for p in pieces[:2]] == [(1, 2), (2, 1)]
+    assert all(p.poses == ((0, 0), (0, 0)) for p in pieces[:2])
+    assert [p.poses for p in pieces[2:8]] == [
         ((0, 0), (50, 0)),
         ((50, 0), (-20, 0)),
         ((-20, 0), (0, 0)),
@@ -26,19 +28,30 @@ def test_exact_cardinal_and_corner_program_uses_asymmetric_operator_bounds():
         ((0, -10), (0, 5)),
         ((0, 5), (0, 0)),
     ]
-    assert [p.poses for p in pieces[6:]] == [
+    assert [p.poses for p in pieces[8:]] == [
         ((0, 0), (50, -10), (0, 0)),
         ((0, 0), (-20, -10), (0, 0)),
         ((0, 0), (-20, 5), (0, 0)),
         ((0, 0), (50, 5), (0, 0)),
     ]
     assert [p.id for p in camera_program(config, ["lower-left", "origin-left"])] == [
-        "origin-left",
+        "zoom-outbound", "zoom-return", "origin-left",
         "lower-left",
     ]
-    assert camera_program(config, []) == []
+    assert [p.id for p in camera_program(config, [])] == ["zoom-outbound", "zoom-return"]
     with pytest.raises(ValueError):
         camera_program(CameraworkConfig(point_mode=4), ["lower-left"])
+
+
+def test_custom_zoom_profile_round_trip_and_limits():
+    config = CameraworkConfig(anchor_zoom=1.2, zoom_target=1.5, point_mode=8)
+    loaded = CameraworkConfig.model_validate_json(config.model_dump_json())
+    pieces = camera_program(loaded, [])
+    assert [p.zooms for p in pieces] == [(1.2, 1.5), (1.5, 1.2)]
+    assert CameraworkConfig(anchor_zoom=2).zoom_target == 1
+    for invalid in (0.9, 3.6, 1.2):
+        with pytest.raises(ValueError):
+            CameraworkConfig(anchor_zoom=1.2, zoom_target=invalid)
 
 
 class Robot:
@@ -87,9 +100,9 @@ async def test_next_chassis_goal_waits_for_entire_selected_camera_program(tmp_pa
     entered, release = asyncio.Event(), asyncio.Event()
     calls = []
 
-    async def move(target, config):
+    async def move(target, config, *, target_zoom=None):
         calls.append((robot.goals[:], target))
-        if target == (60, 0):
+        if target_zoom == config.zoom_target and robot.goals == [1]:
             entered.set()
             await release.wait()
         robot.pose = target
@@ -103,7 +116,7 @@ async def test_next_chassis_goal_waits_for_entire_selected_camera_program(tmp_pa
     await asyncio.wait_for(task, 1)
     assert robot.goals == [1, 2]
     assert [s["id"] for s in run.segments[0].shots] == [
-        "origin-left",
+        "zoom-outbound", "zoom-return", "origin-left",
         "prepare-right-origin",
         "right-origin",
     ]
@@ -129,7 +142,7 @@ async def test_unconfirmed_shot_blocks_next_navigation_and_still_finalizes_sessi
         segments=[CruiseSegment(index=i, path_name="r", goal_id=i + 1) for i in range(2)]
     )
 
-    async def fail(target, config):
+    async def fail(target, config, *, target_zoom=None):
         if target != (0, 0):
             raise ValueError("缺少到位反馈")
 
@@ -137,7 +150,7 @@ async def test_unconfirmed_shot_blocks_next_navigation_and_still_finalizes_sessi
     await cruise._execute(request, run, CameraworkConfig(configured=True))
     assert robot.goals == [1]
     assert run.status == "failed"
-    assert run.segments[0].shots[0]["status"] == "incomplete"
+    assert run.segments[0].shots[2]["status"] == "incomplete"
     assert capture.active_session() is None
 
 
@@ -166,18 +179,18 @@ async def test_cached_pose_and_elapsed_time_cannot_confirm_a_move(tmp_path, monk
 @pytest.mark.parametrize(
     "target,pose,expected",
     [
-        ((0, 0), (2, -2), True),
-        ((0, 0), (-2, 2), True),
-        ((0, 0), (2.01, 0), False),
-        ((0, 0), (0, -2.01), False),
-        ((50, -10), (48, -8), True),
-        ((50, -10), (47.99, -10), False),
-        ((50, -10), (50, -12.01), False),
-        ((50, 0), (48, 2), True),
-        ((50, 0), (50, 2.01), False),
+        ((0, 0), (5, -5), True),
+        ((0, 0), (-5, 5), True),
+        ((0, 0), (5.01, 0), False),
+        ((0, 0), (0, -5.01), False),
+        ((50, -10), (45, -5), True),
+        ((50, -10), (44.99, -10), False),
+        ((50, -10), (50, -15.01), False),
+        ((50, 0), (45, 5), True),
+        ((50, 0), (50, 5.01), False),
     ],
 )
-async def test_all_targets_allow_two_degrees_per_axis(
+async def test_all_targets_allow_five_degrees_per_axis(
     tmp_path, monkeypatch, target, pose, expected
 ):
     robot = Robot()
@@ -207,7 +220,7 @@ async def test_full_program_keeps_order_without_extra_preparation_within_pose_gr
     tmp_path, monkeypatch, mode
 ):
     robot = Robot()
-    robot.pose = (2, -2)
+    robot.pose = (5, -5)
     service = CruiseService(
         EventHub(), robot, CaptureService(EventHub(), path=tmp_path / "capture.json")
     )
@@ -218,14 +231,14 @@ async def test_full_program_keeps_order_without_extra_preparation_within_pose_gr
     run = CruiseRun(segments=[segment])
     targets = []
 
-    async def move(target, config):
+    async def move(target, config, *, target_zoom=None):
         targets.append(target)
-        robot.pose = (target[0] - 2, target[1] + 2)
+        robot.pose = (target[0] - 5, target[1] + 5)
 
     monkeypatch.setattr(service, "_move_to_pose", move)
     await service._run_camera_program(run, segment, config, None)
     pieces = camera_program(config)
-    assert len(segment.shots) == (6 if mode == 4 else 10)
+    assert len(segment.shots) == (8 if mode == 4 else 12)
     assert [shot["id"] for shot in segment.shots] == [piece.id for piece in pieces]
     assert targets == [target for piece in pieces for target in piece.poses[1:]]
     assert all(shot["status"] == "complete" for shot in segment.shots)
@@ -246,7 +259,7 @@ async def test_cancel_during_piece_never_dispatches_the_next_goal(tmp_path, monk
         segments=[CruiseSegment(index=i, path_name="r", goal_id=i + 1) for i in range(2)]
     )
 
-    async def cancel_at_shot(target, config):
+    async def cancel_at_shot(target, config, *, target_zoom=None):
         if target != (0, 0):
             service._cancel.set()
             raise asyncio.CancelledError

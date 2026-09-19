@@ -34,6 +34,11 @@ from automated_video_editing_backend.services.media_download import (
     exception_detail,
     retry_camera_media_download,
 )
+from automated_video_editing_backend.services.camera_program import (
+    POSE_STABLE_SAMPLES,
+    POSE_TOLERANCE_DEG,
+    ZOOM_TOLERANCE,
+)
 
 if TYPE_CHECKING:
     from automated_video_editing_backend.core.models import MediaItem
@@ -158,6 +163,9 @@ class HardwareRobotAdapter(RobotAdapter):
         self._gimbal_inflight = False
         self._gimbal_release_deadline = 0.0
         self._gimbal_terminal_replies_trusted = True
+        self._gimbal_pose_target: tuple[float, float, float | None] | None = None
+        self._gimbal_pose_samples = 0
+        self._gimbal_pose_zoom_revision = 0
         # Recording acknowledgements have no request id. Serialize the whole request -> state
         # commit boundary so a later opposite command cannot start while the prior caller is
         # still applying its accepted reply.
@@ -184,6 +192,8 @@ class HardwareRobotAdapter(RobotAdapter):
         self._arrival_result: str | None = None
         self._heartbeat_yaw: float | None = None
         self._heartbeat_pitch: float | None = None
+        self._heartbeat_zoom: float | None = None
+        self._heartbeat_zoom_revision = 0
         self._heartbeat_revision: int | None = None
         self._heartbeat_yaw_pending = False
         self._heartbeat_pitch_pending = False
@@ -583,6 +593,12 @@ class HardwareRobotAdapter(RobotAdapter):
     def heartbeat_revision(self) -> int | None:
         """Monotonic revision, or None until both axes form one logical pose sample."""
         return self._heartbeat_revision
+
+    def heartbeat_zoom(self) -> float | None:
+        return self._heartbeat_zoom
+
+    def heartbeat_zoom_revision(self) -> int:
+        return self._heartbeat_zoom_revision
 
     def complete_map_heartbeat(self) -> RobotHeartbeatDiagnostic | None:
         """Newest coherent map-readiness report from one raw hardware frame."""
@@ -1328,6 +1344,7 @@ class HardwareRobotAdapter(RobotAdapter):
                     base_motion_intent = "moving"
                 elif normalized_context in {
                     "cruise_fixed_piece",
+                    "cruise_fixed_zoom",
                     "cruise_stationary_camerawork",
                     "cruise_stationary_anchor",
                     "cruise_stationary_zoom",
@@ -1378,6 +1395,8 @@ class HardwareRobotAdapter(RobotAdapter):
             self._gimbal_ready.clear()
             self._gimbal_inflight = True
             self._gimbal_release_deadline = 0.0
+            self._gimbal_pose_target = None
+            self._gimbal_pose_samples = 0
             write_started = False
 
             def mark_write_started() -> None:
@@ -1392,6 +1411,19 @@ class HardwareRobotAdapter(RobotAdapter):
                 # only when this command reaches the actual socket write boundary.
                 self._gimbal_release_deadline = (
                     time.monotonic() + _gimbal_command_budget_seconds(payload)
+                )
+                # Arm only at the socket-write boundary, after reconnect/queue waits.
+                # Zoom changes also require fresh zoom feedback; position alone is insufficient.
+                command = payload["gimbal_control"]
+                self._gimbal_pose_samples = 0
+                self._gimbal_pose_zoom_revision = self._heartbeat_zoom_revision
+                self._gimbal_pose_target = (
+                    (command["yaw_end"], command["pitch_end"],
+                     command["zoom_end"] if context == "cruise_fixed_zoom"
+                     or command.get("zoom_start") != command.get("zoom_end") else None)
+                    if context in {"cruise_fixed_piece", "cruise_fixed_zoom"}
+                    and command.get("mode") == 1
+                    else None
                 )
 
             try:
@@ -1408,8 +1440,48 @@ class HardwareRobotAdapter(RobotAdapter):
                     # could release.
                     self._gimbal_inflight = False
                     self._gimbal_release_deadline = 0.0
+                    self._gimbal_pose_target = None
+                    self._gimbal_pose_samples = 0
                     self._gimbal_ready.set()
                 raise
+
+    def _observe_gimbal_pose_completion(self) -> None:
+        """Release only the written fixed leg, using fresh complete heartbeat samples."""
+        target = self._gimbal_pose_target
+        if not self._gimbal_inflight or target is None:
+            return
+        if not all(
+            value is not None and abs(value - desired) <= POSE_TOLERANCE_DEG
+            for value, desired in zip((self._heartbeat_yaw, self._heartbeat_pitch), target[:2])
+        ):
+            self._gimbal_pose_samples = 0
+            return
+        if target[2] is not None:
+            if self._heartbeat_zoom_revision <= self._gimbal_pose_zoom_revision:
+                return
+            self._gimbal_pose_zoom_revision = self._heartbeat_zoom_revision
+            if self._heartbeat_zoom is None or not abs(self._heartbeat_zoom - target[2]) <= ZOOM_TOLERANCE:
+                self._gimbal_pose_samples = 0
+                return
+        self._gimbal_pose_samples += 1
+        if self._gimbal_pose_samples < POSE_STABLE_SAMPLES:
+            return
+        # The id-less OK may still arrive later. Never let it release the next leg;
+        # that leg can establish its own completion from its own physical samples.
+        self._gimbal_terminal_replies_trusted = False
+        self._gimbal_inflight = False
+        self._gimbal_release_deadline = 0.0
+        self._gimbal_pose_target = None
+        self._gimbal_ready.set()
+        log_event(
+            "info", "robot.gimbal.pose_confirmed",
+            target_yaw=target[0], target_pitch=target[1],
+            yaw=self._heartbeat_yaw, pitch=self._heartbeat_pitch,
+            target_zoom=target[2], zoom=self._heartbeat_zoom,
+            tolerance_degrees=POSE_TOLERANCE_DEG,
+            samples=self._gimbal_pose_samples,
+            connection_epoch=self._connection_epoch,
+        )
 
     async def _wait_for_gimbal_slot(self) -> None:
         if self._gimbal_ready.is_set():
@@ -1614,9 +1686,9 @@ class HardwareRobotAdapter(RobotAdapter):
                     self._gimbal_release_deadline = 0.0
                     self._gimbal_ready.set()
                 else:
-                    # Once a command completed only by estimate, an id-less terminal reply may
-                    # belong to that older command. Keep later commands on their physical travel
-                    # budgets until reconnect restores an unambiguous reply stream.
+                    # After completion by estimate or pose, an id-less terminal reply may
+                    # belong to that older command. Fixed legs can independently release their
+                    # gate from fresh pose feedback; other commands retain the travel budget.
                     log_event(
                         "warning",
                         "robot.gimbal.reply_ignored",
@@ -2128,6 +2200,11 @@ class HardwareRobotAdapter(RobotAdapter):
                     and accepted_heartbeat_state_known
                     and self._recording_reply_recovery is None
                 )
+            if "zoom" in gimbal:
+                zoom = _maybe_float(gimbal.get("zoom"))
+                if zoom is not None:
+                    self._heartbeat_zoom = zoom
+                    self._heartbeat_zoom_revision += 1
             if "yaw" in gimbal:
                 yaw = _maybe_float(gimbal.get("yaw"))
                 if yaw is not None:
@@ -2146,6 +2223,7 @@ class HardwareRobotAdapter(RobotAdapter):
                 self._heartbeat_revision = (self._heartbeat_revision or 0) + 1
                 self._heartbeat_yaw_pending = False
                 self._heartbeat_pitch_pending = False
+                self._observe_gimbal_pose_completion()
             if self._heartbeat_yaw is not None:
                 self.state.camera_angle = self._heartbeat_yaw
 
@@ -2260,6 +2338,8 @@ class HardwareRobotAdapter(RobotAdapter):
         """Invalidate comparisons whenever a hardware connection is replaced."""
         self._heartbeat_yaw = None
         self._heartbeat_pitch = None
+        self._heartbeat_zoom = None
+        self._heartbeat_zoom_revision = 0
         self._heartbeat_revision = None
         self._heartbeat_yaw_pending = False
         self._heartbeat_pitch_pending = False
@@ -2267,6 +2347,9 @@ class HardwareRobotAdapter(RobotAdapter):
         self._gimbal_inflight = False
         self._gimbal_release_deadline = 0.0
         self._gimbal_terminal_replies_trusted = True
+        self._gimbal_pose_target = None
+        self._gimbal_pose_samples = 0
+        self._gimbal_pose_zoom_revision = 0
         self._gimbal_ready.set()
         self._recording_heartbeat_guard = None
         self._reset_recording_heartbeat_conflict()
@@ -2848,6 +2931,14 @@ class RobotService:
     def heartbeat_pitch(self) -> float | None:
         reader = getattr(self.adapter, "heartbeat_pitch", None)
         return reader() if callable(reader) else None
+
+    def heartbeat_zoom(self) -> float | None:
+        reader = getattr(self.adapter, "heartbeat_zoom", None)
+        return reader() if callable(reader) else None
+
+    def heartbeat_zoom_revision(self) -> int:
+        reader = getattr(self.adapter, "heartbeat_zoom_revision", None)
+        return reader() if callable(reader) else 0
 
     def heartbeat_revision(self) -> int | None:
         reader = getattr(self.adapter, "heartbeat_revision", None)

@@ -40,7 +40,7 @@ wheels = [
 
 [[package]]
 name = "automated-video-editing-backend"
-version = "0.1.10"
+version = "0.1.11"
 source = { editable = "." }
 dependencies = [
     { name = "fastapi" },

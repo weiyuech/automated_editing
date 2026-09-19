@@ -14,3 +14,12 @@ test('four edges require bounds on both sides of physical zero', () => {
   assert.match(cameraworkProfileWarning(normalizeCameraworkProfile({yaw_min:5})),/原点两侧/)
   assert.match(cameraworkProfileWarning(normalizeCameraworkProfile({pitch_max:0})),/原点两侧/)
 })
+test('base and zoom magnifications are separate, editable and range checked', () => {
+  const profile = normalizeCameraworkProfile({anchor_zoom:1.2, zoom_target:1.5})
+  assert.equal(profile.anchor_zoom,1.2)
+  assert.equal(profile.zoom_target,1.5)
+  assert.equal(cameraworkProfileWarning(profile),'')
+  assert.equal(normalizeCameraworkProfile({anchor_zoom:2}).zoom_target,1)
+  assert.match(cameraworkProfileWarning({...profile,zoom_target:1.2}),/不同/)
+  assert.match(cameraworkProfileWarning({...profile,zoom_target:3.6}),/缩放倍率/)
+})

@@ -6,8 +6,8 @@ const appSource = readFileSync(new URL('../src/renderer/src/App.vue', import.met
 
 test('cruise UI exposes fixed 4/8 modes and per-point piece choices', () => {
   assert.match(appSource, /固定运镜（使用「镜头设置」中的配置）/)
-  assert.match(appSource, /4 点 · 6 段/)
-  assert.match(appSource, /8 点 · 10 段/)
+  assert.match(appSource, /4 点 · 8 段/)
+  assert.match(appSource, /8 点 · 12 段/)
   assert.match(appSource, /piece_ids: point.piece_ids/)
   assert.doesNotMatch(appSource, /每次回到锚点后停留（秒）/)
 })

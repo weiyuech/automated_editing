@@ -170,6 +170,7 @@ class CameraworkProfile(BaseModel):
     anchor_yaw: Literal[0] = 0
     anchor_pitch: Literal[0] = 0
     anchor_zoom: float = Field(default=1.0, ge=1.0, le=3.5)
+    zoom_target: float = Field(default=2.0, ge=1.0, le=3.5)
     yaw_min: int = Field(default=-60, ge=-90, le=90)
     yaw_max: int = Field(default=60, ge=-90, le=90)
     pitch_min: int = Field(default=-15, ge=-60, le=15)
@@ -178,18 +179,23 @@ class CameraworkProfile(BaseModel):
     speed_max: int = Field(default=5, ge=2, le=5)
 
     point_mode: Literal[4, 8] = 4
-    piece_ids: list[str] | None = Field(default=None, max_length=10)
+    piece_ids: list[str] | None = Field(default=None, max_length=12)
 
     @model_validator(mode="before")
     @classmethod
     def fixed_origin(cls, value: Any) -> Any:
         # Old profiles remain loadable; their anchor can never move the new origin.
         if isinstance(value, Mapping):
-            return {**value, "anchor_yaw": 0, "anchor_pitch": 0}
+            return {
+                "zoom_target": 1.0 if value.get("anchor_zoom") == 2 else 2.0,
+                **value, "anchor_yaw": 0, "anchor_pitch": 0,
+            }
         return value
 
     @model_validator(mode="after")
     def validate_ranges_and_anchor(self) -> CameraworkProfile:
+        if self.zoom_target == self.anchor_zoom:
+            raise ValueError("缩放倍率需与基础倍率不同")
         ranges = (
             ("yaw", self.yaw_min, self.yaw_max, self.anchor_yaw),
             ("pitch", self.pitch_min, self.pitch_max, self.anchor_pitch),
@@ -255,8 +261,8 @@ class CaptureSession(BaseModel):
 
 
 class CruisePoint(BaseModel):
-    # None inherits the saved program; [] deliberately records no camera sweep here.
-    piece_ids: list[str] | None = Field(default=None, max_length=10)
+    # None inherits the saved program; [] keeps only the two mandatory zoom pieces.
+    piece_ids: list[str] | None = Field(default=None, max_length=12)
     path_name: str = Field(min_length=1, max_length=200)
     goal_id: int = Field(ge=0)
     # Legacy route compatibility only. CruiseService deliberately ignores this value: product
