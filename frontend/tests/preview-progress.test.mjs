@@ -13,7 +13,7 @@ function deferred() {
 }
 function harness(name, api) {
   const source = readFileSync(new URL(`../src/renderer/src/components/${name}.vue`, import.meta.url), 'utf8')
-  const script = compileScript(parse(source).descriptor, { id: 'preview-races' }).content
+  const script = compileScript(parse(source.replace(/\r?\n/g, '\r\n')).descriptor, { id: 'preview-races' }).content.replace(/\r\n/g, '\n')
     .replace(/^import[\s\S]*?from ['"][^'"]+['"]\n/gm, '').replace('export default', 'return')
   const scope = effectScope(), cleanup = [], events = []
   const deps = { computed, ref, watch, isPreviewPending, captureGroup, fullCaptureSelection, formatCaptureTime,

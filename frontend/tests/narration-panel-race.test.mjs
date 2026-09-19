@@ -9,7 +9,7 @@ import { useAutomaticRewrite } from '../src/renderer/src/use-automatic-rewrite.j
 // Exercise the real component's asynchronous setup logic without a browser or
 // paid services. Vue's SFC compiler exposes the same setup used by production.
 const source = readFileSync(new URL('../src/renderer/src/components/NarrationPanel.vue', import.meta.url), 'utf8')
-const script = compileScript(parse(source).descriptor, { id: 'narration-races' }).content
+const script = compileScript(parse(source.replace(/\r?\n/g, '\r\n')).descriptor, { id: 'narration-races' }).content.replace(/\r\n/g, '\n')
   .replace(/^import .*\n/gm, '').replace('export default', 'return')
 function deferred() {
   let resolve
