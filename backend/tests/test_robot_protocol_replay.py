@@ -430,6 +430,12 @@ async def test_missing_gimbal_terminal_reply_recovers_only_after_motion_budget(
 async def test_late_old_gimbal_ok_cannot_release_a_newer_command(monkeypatch):
     """After estimated recovery, id-less replies stay ambiguous until reconnect."""
 
+    from types import SimpleNamespace
+
+    # Advance the robot clock explicitly: Windows scheduling can consume an entire
+    # short travel budget while asyncio is waiting for the gate timeout.
+    now = 100.0
+    monkeypatch.setattr(robot_module, "time", SimpleNamespace(monotonic=lambda: now))
     adapter = _connected_adapter()
     sent: list[dict] = []
 
@@ -442,7 +448,7 @@ async def test_late_old_gimbal_ok_cannot_release_a_newer_command(monkeypatch):
     monkeypatch.setattr(robot_module, "_gimbal_command_budget_seconds", lambda _payload: 0.03)
 
     await adapter.set_gimbal(_gimbal_move(20))
-    await asyncio.sleep(0.04)
+    now += 0.04
     await adapter.set_gimbal(_gimbal_move(-20))
 
     # This could be A's very late OK or B's immediate OK; the protocol carries no id. It must
@@ -452,7 +458,7 @@ async def test_late_old_gimbal_ok_cannot_release_a_newer_command(monkeypatch):
         await adapter.set_gimbal(_gimbal_move(35))
     assert [payload["gimbal_control"]["yaw_end"] for payload in sent] == [20, -20]
 
-    await asyncio.sleep(0.04)
+    now += 0.04
     await adapter.set_gimbal(_gimbal_move(35))
     assert [payload["gimbal_control"]["yaw_end"] for payload in sent] == [20, -20, 35]
 
