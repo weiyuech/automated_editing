@@ -2,22 +2,18 @@
 
 import json
 
-MAPPED_NARRATION_SYSTEM_PROMPT = """为已确定顺序和时长的组合视频编写一篇连贯的中文旁白。
-用户文案是唯一事实来源；补充要求控制重点、表达和留白。拍摄备注用于理解点位与拍摄意图，不把拍摄指令读出口，也不新增事实。
-整段备注只提供一次。结合真实画面 ID、点位名称和上下文，理解哪些内容属于哪个点位；不按逗号机械拆分，不对应每个云台小镜头。无把握的归属放入 general_notes，不猜测。
-只讲当前组合中出现的内容，遵循时间表顺序；按各点位可用时长决定详略，移动画面可衔接或留白，不重复开场、不为凑时长扩写。
-没有拍摄备注时，根据用户文案、补充要求和时间表安排内容，不假装知道未描述的画面。时长供控制篇幅，最终以语音实测为准。
-若提供实测反馈，针对超时或提前讲到下一点精简调整。
-仅返回 JSON：{"note_assignments":[{"node_id":"时间表中的id","text":"对应备注内容"}],"general_notes":["归属不确定或全局备注"],"sections":[{"node_id":"时间表中的id","text":"完整口播段落"}]}。
-每组中同一 id 最多一次。可省略无需口播的时间段；sections 按播放顺序连起来应是一篇通顺完整旁白，不分别合成录音。"""
+from automated_video_editing_backend.services.narration_styles import style_context
 
-SIMPLE_COMPOSITION_SYSTEM_PROMPT = """根据用户提供的文案和补充要求，为当前组合视频润色一篇连贯自然的中文旁白。
+MAPPED_NARRATION_SYSTEM_PROMPT = """你是旁白编辑。原文给事实，整段拍摄备注和点位名称只帮助判断对应关系；你没有看过视频。
+把相关事实写到对应点位，每点一句或两句，整篇连贯。只保留此处相关信息，不将其他点位的信息移到这里。用原文的具体事实代替评价；不添加性能、感受或现场所见。
+每项 text 不超过该点的 max_chars（汉字、字母、数字计数）。短到放不下时只选一个完整事实，仍放不下就不写；不是每点都必须填满。数字和限定条件不能随意省掉。风格通过句式体现，不改变事实。
+不确定哪个点展示什么就不分配，写进 general_notes；不得把原文按顺序硬塞进未知点位。默认移动段不写。
+仅返回 JSON：{"sections":[{"node_id":"真实id","text":"正文"}],"general_notes":[]}。空段省略；id 不重复，按画面顺序。
+示例：原文“青禾杯容量300毫升。杯盖可拆洗。”，杯身点预算12字、杯盖点预算10字。可返回 {"sections":[{"node_id":"杯身点","text":"青禾杯容量300毫升。"},{"node_id":"杯盖点","text":"杯盖可拆洗。"}],"general_notes":[]}。示例产品不能出现在本稿。"""
 
-规则：
-- 以用户文案为事实依据，不新增事实。补充要求控制表达方式、重点和语气。
-- 根据提供的组合总时长控制篇幅；总时长是上限，允许留白，不为填满时间扩写。
-- 整篇衔接自然，不重复开场。
-- 只返回口播正文，不返回点位 ID、JSON、标题或解释。"""
+SIMPLE_COMPOSITION_SYSTEM_PROMPT = """你是中文口播编辑。只改写用户原文，不补充产品事实或评价。保留数字、名称和限制条件；不要从参数推断效果。写一篇适合朗读的短文，风格只改变句式。只返回正文。
+例：原文“杯盖可拆卸”，可改为“杯盖可以拆下来”；不可改成“杯盖水洗很方便”。
+这是一条组合视频，以给定总时长为上限，宁可简短；不推断点位对应。"""
 
 
 def mapped_narration_prompt(
@@ -29,6 +25,7 @@ def mapped_narration_prompt(
     instructions="",
     feedback=None,
     system_prompt=None,
+    narration_style=None,
 ):
     if system_prompt is not None and not system_prompt.strip():
         raise ValueError("自定义提示词不能为空，可恢复默认提示词")
@@ -41,10 +38,12 @@ def mapped_narration_prompt(
                 "组合时长": duration,
                 "拍摄备注原文": "\n".join(capture_notes or []),
                 "画面时间表": [
-                    {key: value for key, value in window.items() if key != "notes"}
+                    {**{key: value for key, value in window.items() if key != "notes"},
+                     "max_chars": max(0, int(window["duration"] * 3))}
                     for window in windows
                 ],
                 "上一版实测": feedback,
+                **style_context(narration_style),
             },
             ensure_ascii=False,
             indent=2,
@@ -63,6 +62,7 @@ def composition_prompt(context, request, *, feedback=None):
             instructions=request.instructions,
             system_prompt=request.system_prompt,
             feedback=feedback,
+            narration_style=request.narration_style,
         )
     else:
         if request.system_prompt is not None and not request.system_prompt.strip():
@@ -71,6 +71,7 @@ def composition_prompt(context, request, *, feedback=None):
             "文案": request.text,
             "本次补充要求": request.instructions.strip(),
             "组合总时长（秒）": context["duration_seconds"],
+            **style_context(request.narration_style),
         }
         if feedback:
             payload["上一版实测时长"] = {

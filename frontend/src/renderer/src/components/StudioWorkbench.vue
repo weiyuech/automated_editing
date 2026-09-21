@@ -170,12 +170,7 @@ onUnmounted(() => {
       </div>
     </div>
     <div class="workbench-scroll">
-      <div class="intro">
-        <strong>以您确认的画面为准</strong>
-        <p>
-          请从左侧选用视频，每条独立成片，保留完整画面与顺序。机器人录制或跨点位拼接，请先在媒体库确认并保存组合。
-        </p>
-      </div>
+      <p class="intro">请从左侧选用视频，每条独立成片。</p>
       <div v-for="item in sources" :key="item.id" class="input-row">
         <span>{{ name(item) }}</span
         ><small
@@ -238,9 +233,6 @@ onUnmounted(() => {
           </select></label
         >
       </div>
-      <p class="form-hint">
-        画面有多长，主体就有多长；片头、片尾另计。音乐从头播放，长于成片就截取，短于成片则后段留白。组合旁白从主体开始，字幕跟随旁白。
-      </p>
       <button
         class="primary preview-action"
         :disabled="busy || rendering || !sources.length"
@@ -322,7 +314,7 @@ onUnmounted(() => {
   border-radius: 10px;
   overflow: hidden;
   background: linear-gradient(120deg, #eee8ff77, #e8ebff66);
-  margin-bottom: 18px;
+  margin-bottom: 12px;
 }
 .automation-summary > div {
   padding: 10px 14px;
@@ -344,13 +336,10 @@ onUnmounted(() => {
   font-size: 14px;
 }
 .intro {
-  padding: 16px;
+  padding: 10px 14px;
   border: 1px solid var(--border);
   border-radius: 10px;
-  margin-bottom: 14px;
-}
-.intro strong {
-  font-size: 15px;
+  margin: 0;
 }
 p {
   font-size: 12px;
@@ -370,23 +359,23 @@ p {
 }
 .setting {
   display: block;
-  margin: 18px 0;
+  margin: 0;
   font-size: 13px;
 }
 .setting > span {
   display: block;
-  margin-bottom: 8px;
+  margin-bottom: 6px;
 }
 .settings {
   display: flex;
   flex-direction: column;
-  gap: 12px;
+  gap: 10px;
 }
 .subtitle-settings {
   display: grid;
   grid-template-columns: 1fr 1fr;
   gap: 12px;
-  margin: 16px 0;
+  margin: 0;
   font-size: 13px;
 }
 .subtitle-settings select {
@@ -394,7 +383,7 @@ p {
 }
 .preview-action {
   width: 100%;
-  margin: 10px 0;
+  margin: 4px 0;
 }
 .previews {
   border-top: 1px solid var(--border);

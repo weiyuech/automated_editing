@@ -34,7 +34,7 @@ from automated_video_editing_backend.services.media_download import (
     exception_detail,
     retry_camera_media_download,
 )
-from automated_video_editing_backend.services.camera_program import (
+from automated_video_editing_backend.core.gimbal_limits import (
     POSE_STABLE_SAMPLES,
     POSE_TOLERANCE_DEG,
     ZOOM_TOLERANCE,
@@ -53,6 +53,7 @@ _MAP_SWITCH_CONFIRM_POLL_SECONDS = 0.1
 _WEBSOCKET_SEND_TIMEOUT_SECONDS = 5.0
 _WEBSOCKET_CLOSE_AFTER_SEND_TIMEOUT_SECONDS = 2.0
 _GIMBAL_PREVIOUS_COMMAND_WAIT_SECONDS = 2.0
+_GIMBAL_RETRY_FEEDBACK_MAX_AGE_SECONDS = 3.0
 _GIMBAL_COMMAND_SETTLE_MARGIN_SECONDS = 1.0
 _GIMBAL_COMMAND_MAX_BUDGET_SECONDS = 120.0
 _RECORDING_TRANSITIONAL_HEARTBEAT_LIMIT = 2
@@ -166,6 +167,11 @@ class HardwareRobotAdapter(RobotAdapter):
         self._gimbal_pose_target: tuple[float, float, float | None] | None = None
         self._gimbal_pose_samples = 0
         self._gimbal_pose_zoom_revision = 0
+        self._gimbal_command_revision = 0
+        self._gimbal_terminal_status: str | None = None
+        self._gimbal_terminal_at = 0.0
+        self._heartbeat_pose_at = 0.0
+        self._heartbeat_zoom_at = 0.0
         # Recording acknowledgements have no request id. Serialize the whole request -> state
         # commit boundary so a later opposite command cannot start while the prior caller is
         # still applying its accepted reply.
@@ -803,20 +809,7 @@ class HardwareRobotAdapter(RobotAdapter):
         *,
         context: str = "manual",
     ) -> RobotState:
-        payload = {
-            "gimbal_control": {
-                "mode": 1,
-                "yaw_start": _gimbal_num(command.yaw_start),
-                "yaw_speed": _gimbal_num(command.yaw_speed),
-                "yaw_end": _gimbal_num(command.yaw_end),
-                "pitch_start": _gimbal_num(command.pitch_start),
-                "pitch_speed": _gimbal_num(command.pitch_speed),
-                "pitch_end": _gimbal_num(command.pitch_end),
-                "zoom_start": _gimbal_num(command.zoom_start),
-                "zoom_speed": 0,
-                "zoom_end": _gimbal_num(command.zoom_end),
-            }
-        }
+        payload = _gimbal_move_payload(command)
         await self._send_gimbal(payload, context=context)
         self.state.camera_angle = command.yaw_end
         self.state.yaw = command.yaw_end
@@ -825,6 +818,44 @@ class HardwareRobotAdapter(RobotAdapter):
         self._touch()
         await self._publish_state()
         return self.state
+
+    async def send_cruise_gimbal(
+        self, command: GimbalMoveRequest, *, context: str,
+        retry_owner: tuple[int, int] | None = None,
+        cancelled: Callable[[], bool] | None = None,
+    ) -> tuple[int, int]:
+        """Return the physical write's owner, not a later mutable state snapshot."""
+        payload = _gimbal_move_payload(command)
+        owner = await self._send_gimbal(
+            payload, context=context, retry_owner=retry_owner, cancelled=cancelled,
+        )
+        # Fixed programs report physical poses, not optimistic target endpoints.
+        self.state.last_command = "gimbal_control"
+        self._touch()
+        await self._publish_state()
+        return owner
+
+    def _check_gimbal_retry(self, owner: tuple[int, int], command: dict[str, Any]) -> None:
+        """Fail closed: elapsed travel time and stationary angles cannot prove idle."""
+        reason = None
+        if not self.state.connected or owner != (self._connection_epoch, self._gimbal_command_revision):
+            reason = "连接或云台指令已变化"
+        elif not self._gimbal_terminal_replies_trusted:
+            reason = "无法确认无编号回包属于当前指令"
+        elif self._gimbal_terminal_status != "ok":
+            reason = "上一条指令尚未明确完成，或机器人已拒绝指令"
+        elif (self._heartbeat_pose_at <= self._gimbal_terminal_at
+              or time.monotonic() - self._heartbeat_pose_at > _GIMBAL_RETRY_FEEDBACK_MAX_AGE_SECONDS):
+            reason = "缺少完成回包之后的新鲜角度反馈"
+        elif (self._heartbeat_zoom_at <= self._gimbal_terminal_at
+              or time.monotonic() - self._heartbeat_zoom_at > _GIMBAL_RETRY_FEEDBACK_MAX_AGE_SECONDS):
+            reason = "缺少完成回包之后的新鲜倍率反馈"
+        elif (abs(self._heartbeat_yaw - command["yaw_end"]) <= POSE_TOLERANCE_DEG
+              and abs(self._heartbeat_pitch - command["pitch_end"]) <= POSE_TOLERANCE_DEG
+              and abs(self._heartbeat_zoom - command["zoom_end"]) <= ZOOM_TOLERANCE):
+            reason = "已在容差内，但缺少连续到位反馈"
+        if reason:
+            raise ValueError(f"云台未确认到位，未补发：{reason}；已停止后续镜头和导航")
 
     def _reset_recording_heartbeat_conflict(self) -> None:
         self._recording_heartbeat_conflict_count = 0
@@ -1277,6 +1308,9 @@ class HardwareRobotAdapter(RobotAdapter):
                     self._recording_stop_required = True
             if on_write_started is not None:
                 on_write_started()
+            if goal_aligns_object:
+                self._gimbal_command_revision += 1
+                self._gimbal_terminal_status = None
             if is_goal_command:
                 self._capture_goal_written = True
                 self._capture_event("goal_write", self._pending_goal)
@@ -1388,20 +1422,49 @@ class HardwareRobotAdapter(RobotAdapter):
         self.state.connected = False
         self.state.connection_status = "reconnecting"
 
-    async def _send_gimbal(self, payload: dict[str, Any], *, context: str) -> None:
+    async def _send_gimbal(
+        self, payload: dict[str, Any], *, context: str,
+        retry_owner: tuple[int, int] | None = None,
+        cancelled: Callable[[], bool] | None = None,
+    ) -> tuple[int, int]:
         """Send one camera target only after the prior target is no longer reported busy."""
         async with self._gimbal_command_lock:
+            if cancelled is not None and cancelled():
+                raise asyncio.CancelledError
+            if retry_owner is not None:
+                self._check_gimbal_retry(retry_owner, payload["gimbal_control"])
             await self._wait_for_gimbal_slot()
-            self._gimbal_ready.clear()
-            self._gimbal_inflight = True
-            self._gimbal_release_deadline = 0.0
-            self._gimbal_pose_target = None
-            self._gimbal_pose_samples = 0
+            if retry_owner is None:
+                self._gimbal_ready.clear()
+                self._gimbal_inflight = True
+                self._gimbal_release_deadline = 0.0
+                self._gimbal_pose_target = None
+                self._gimbal_pose_samples = 0
             write_started = False
+            written_owner: tuple[int, int] | None = None
 
             def mark_write_started() -> None:
-                nonlocal write_started
+                nonlocal write_started, written_owner
+                if cancelled is not None and cancelled():
+                    raise asyncio.CancelledError
+                if retry_owner is not None:
+                    # Queue/reconnect waits can invalidate a previously safe retry. Check at
+                    # the socket boundary and use the newest actual start, never an old target.
+                    self._check_gimbal_retry(retry_owner, payload["gimbal_control"])
+                    command = payload["gimbal_control"]
+                    validated = GimbalMoveRequest(**{
+                        **{k: v for k, v in command.items() if k not in {"mode", "zoom_speed"}},
+                        "yaw_start": self._heartbeat_yaw,
+                        "pitch_start": self._heartbeat_pitch,
+                        "zoom_start": self._heartbeat_zoom,
+                    })
+                    for axis in ("yaw", "pitch", "zoom"):
+                        command[f"{axis}_start"] = _gimbal_num(getattr(validated, f"{axis}_start"))
                 write_started = True
+                self._gimbal_command_revision += 1
+                written_owner = (self._connection_epoch, self._gimbal_command_revision)
+                self._gimbal_terminal_status = None
+                self._gimbal_terminal_at = 0.0
                 # connect() may have replaced the socket and cleared all old physical ownership
                 # while this command was queued. Re-arm the gate at the new socket's exact write
                 # boundary so a following command cannot overtake it.
@@ -1432,8 +1495,10 @@ class HardwareRobotAdapter(RobotAdapter):
                     context=context,
                     on_write_started=mark_write_started,
                 )
+                assert written_owner is not None
+                return written_owner
             except (Exception, asyncio.CancelledError):
-                if not write_started or not self.state.connected:
+                if (not write_started and retry_owner is None) or not self.state.connected:
                     # Cancellation while reconnecting or queued behind another write is
                     # definitively pre-send; a send failure that retired its transport likewise
                     # cannot leave the next gimbal command behind a gate only that dead socket
@@ -1673,15 +1738,22 @@ class HardwareRobotAdapter(RobotAdapter):
             )
 
         gimbal_reply = payload.get("robot_gimbal_control")
+        if isinstance(gimbal_reply, dict):
+            gimbal_status = str(gimbal_reply.get("status") or "").strip().casefold()
+            if gimbal_status == "busy":
+                self._gimbal_terminal_status = "busy"
         if isinstance(gimbal_reply, dict) and self._gimbal_inflight:
             gimbal_status = str(gimbal_reply.get("status") or "").strip().casefold()
             if gimbal_status == "busy":
+                self._gimbal_terminal_status = "busy"
                 self._gimbal_ready.clear()
             elif gimbal_status:
                 # Both success and rejection are terminal for command serialization.  The reply
                 # is still logged above; freeing the gate prevents one failure from wedging all
                 # future camera control.
                 if self._gimbal_terminal_replies_trusted:
+                    self._gimbal_terminal_status = gimbal_status
+                    self._gimbal_terminal_at = time.monotonic()
                     self._gimbal_inflight = False
                     self._gimbal_release_deadline = 0.0
                     self._gimbal_ready.set()
@@ -2205,6 +2277,7 @@ class HardwareRobotAdapter(RobotAdapter):
                 if zoom is not None:
                     self._heartbeat_zoom = zoom
                     self._heartbeat_zoom_revision += 1
+                    self._heartbeat_zoom_at = time.monotonic()
             if "yaw" in gimbal:
                 yaw = _maybe_float(gimbal.get("yaw"))
                 if yaw is not None:
@@ -2221,6 +2294,7 @@ class HardwareRobotAdapter(RobotAdapter):
             # once both axes have been updated since the prior complete sample or command.
             if self._heartbeat_yaw_pending and self._heartbeat_pitch_pending:
                 self._heartbeat_revision = (self._heartbeat_revision or 0) + 1
+                self._heartbeat_pose_at = time.monotonic()
                 self._heartbeat_yaw_pending = False
                 self._heartbeat_pitch_pending = False
                 self._observe_gimbal_pose_completion()
@@ -2347,6 +2421,10 @@ class HardwareRobotAdapter(RobotAdapter):
         self._gimbal_inflight = False
         self._gimbal_release_deadline = 0.0
         self._gimbal_terminal_replies_trusted = True
+        self._gimbal_terminal_status = None
+        self._gimbal_terminal_at = 0.0
+        self._heartbeat_pose_at = 0.0
+        self._heartbeat_zoom_at = 0.0
         self._gimbal_pose_target = None
         self._gimbal_pose_samples = 0
         self._gimbal_pose_zoom_revision = 0
@@ -2998,6 +3076,24 @@ class RobotService:
         await self.events.publish("ROBOT_STATE", state.model_dump(mode="json"))
         return state
 
+    async def send_cruise_gimbal(
+        self, command: GimbalMoveRequest, *, context: str,
+        retry_owner: tuple[int, int] | None = None,
+        cancelled: Callable[[], bool] | None = None,
+    ) -> tuple[int, int] | None:
+        sender = getattr(self.adapter, "send_cruise_gimbal", None)
+        if sender is None:
+            if retry_owner is not None:
+                raise ValueError("当前机器人适配器无法安全补发云台指令")
+            await self.set_gimbal(command, context=context)
+            return None
+        owner = await sender(command, context=context, retry_owner=retry_owner, cancelled=cancelled)
+        log_event("info", "gimbal.moved", yaw_end=command.yaw_end,
+                  pitch_end=command.pitch_end, zoom_end=command.zoom_end,
+                  retry=retry_owner is not None, command_owner=owner)
+        await self.events.publish("ROBOT_STATE", self.adapter.state.model_dump(mode="json"))
+        return owner
+
     async def _clear_media_state(self) -> None:
         state = await self.adapter.status()
         state.media_url = None
@@ -3420,6 +3516,17 @@ def _load_websockets() -> Any:
 def _looks_like_image_url(url: str) -> bool:
     path = urlsplit(url).path.casefold()
     return path.endswith((".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif", ".tif", ".tiff"))
+
+
+def _gimbal_move_payload(command: GimbalMoveRequest) -> dict[str, Any]:
+    return {"gimbal_control": {
+        "mode": 1,
+        **{name: _gimbal_num(getattr(command, name)) for name in (
+            "yaw_start", "yaw_end", "yaw_speed", "pitch_start", "pitch_end",
+            "pitch_speed", "zoom_start", "zoom_end",
+        )},
+        "zoom_speed": 0,
+    }}
 
 
 async def _wait_for_reply(future: asyncio.Future[Any], timeout_s: float) -> Any:

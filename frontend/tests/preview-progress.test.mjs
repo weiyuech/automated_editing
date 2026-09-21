@@ -5,6 +5,7 @@ import { compileScript, parse } from 'vue/compiler-sfc'
 import { computed, effectScope, ref, watch } from 'vue'
 import { isPreviewPending, previewProgress, previewStageLabel, previewTime } from '../src/renderer/src/preview-progress.js'
 import { captureGroup, fullCaptureSelection, formatCaptureTime } from '../src/renderer/src/capture-group-policy.js'
+import { compositionLabel, savedCompositions } from '../src/renderer/src/composition-groups.js'
 
 function deferred() {
   let resolve
@@ -18,6 +19,7 @@ function harness(name, api) {
   const scope = effectScope(), cleanup = [], events = []
   const deps = { computed, ref, watch, isPreviewPending, captureGroup, fullCaptureSelection, formatCaptureTime,
     PreviewProgress: {}, SubtitleFontPicker: {}, CaptureGroupPicker: {}, CompositionTree: {},
+    ManualComposer: {}, CompositionGroups: {}, compositionLabel, savedCompositions,
     onMounted: () => {}, onUnmounted: fn => cleanup.push(fn), setTimeout: () => 0, clearTimeout: () => {} }
   const component = Function(...Object.keys(deps), script)(...Object.values(deps))
   const state = scope.run(() => component.setup({ api, active: true, sources: [{id:'video'}], voices: [], music: [], intro: [], outro: [] }, {
@@ -99,5 +101,36 @@ test('composer cancellation cannot be undone by a prior poll', async () => {
   await polling
   assert.equal(h.state.record.value.status, 'cancelled')
   assert.equal(h.state.records.value[0].status, 'cancelled')
+  h.close()
+})
+
+test('automatic cancellation cannot be undone by a slow earlier list response', async () => {
+  const old = deferred()
+  let lists = 0
+  const record = { ...preview('auto'), automatic: { batch_id: 'batch' } }
+  const cancelled = { ...record, status: 'cancelled' }
+  const h = harness('CompositionWorkspace', path => {
+    if (path === '/media') return Promise.resolve([])
+    if (path.endsWith('/cancel')) return Promise.resolve(cancelled)
+    return ++lists === 1 ? old.promise : Promise.resolve([cancelled])
+  })
+  h.state.records.value = [record]
+  const polling = h.state.poll()
+  await h.state.cancel(record)
+  old.resolve([record])
+  await polling
+  assert.equal(h.state.records.value[0].status, 'cancelled')
+  h.close()
+})
+
+test('automatic saved previews resolve renamed files by durable composition identity', () => {
+  const h = harness('CompositionWorkspace', async () => [])
+  h.state.records.value = [{ ...preview('auto', 'ready'), automatic: {}, material_path: '/old.mp4' }]
+  h.state.items.value = [{ id: 'rescanned', kind: 'video', path: '/new.mp4', metadata: { role: 'raw_video', composition_id: 'auto' } }]
+  h.state.previewId.value = 'auto'
+  assert.equal(h.state.preview.value.material_path, '/new.mp4')
+  h.state.items.value = []
+  assert.equal(h.state.automatic.value.length, 0)
+  assert.equal(h.state.preview.value, undefined)
   h.close()
 })

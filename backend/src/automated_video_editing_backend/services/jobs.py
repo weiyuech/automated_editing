@@ -64,13 +64,13 @@ class JobService:
         return {"mode": "controlled_concat", "beat_sync": False, "automatic_selection": False}
 
     async def create(self, request):
-        raise ValueError("请先生成拼接预览，再确认最终组合")
+        raise ValueError("请先生成剪辑预览，再确认最终组合")
 
     async def create_batch(self, request):
-        raise ValueError("自动批量选片已停用，请先生成拼接预览")
+        raise ValueError("自动批量选片已停用，请先生成剪辑预览")
 
     async def draft_timeline(self, request):
-        raise ValueError("请使用拼接预览入口，成片长度由所选画面决定")
+        raise ValueError("请使用剪辑预览入口，成片长度由所选画面决定")
 
     async def _announce(self, request: EditJobRequest, timeline=None) -> JobRecord:
         """Publish and queue a confirmed composition or a manually refined timeline."""
@@ -277,12 +277,12 @@ class JobService:
         try:
             job.status = JobStatus.RUNNING
             job.progress = 0.1
-            job.message = "准备已确认的拼接"
+            job.message = "准备已确认的组合"
             job.updated_at = utc_now()
             await self.events.publish("JOB_UPDATED", job.model_dump(mode="json"))
 
             if job.timeline is None:
-                raise ValueError("请先预览并确认拼接结果")
+                raise ValueError("请先预览并确认剪辑结果")
             timeline = job.timeline
             composition_id = timeline.planning_diagnostics.get("composition_id")
             if composition_id:

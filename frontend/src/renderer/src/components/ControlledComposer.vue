@@ -256,7 +256,7 @@ onUnmounted(() => {
       <div>
         <strong>组合与预览</strong>
         <p>
-          在录制树中选择画面，按原有顺序拼接。点位、镜头和点位之间的移动都可以选。
+          在录制树中选择画面，按原有顺序组合。点位、镜头和点位之间的移动都可以选。
         </p>
       </div>
       <button :disabled="busy" @click="safe(refresh)">刷新</button>

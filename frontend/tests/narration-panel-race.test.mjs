@@ -19,7 +19,7 @@ function deferred() {
 async function harness() {
   const scope = effectScope(), cleanup = []
   let handle = async () => ({ narration: null })
-  const deps = { computed, nextTick, ref, watch, narrationMediaName, compositionDuration, useAutomaticRewrite,
+  const deps = { NarrationStylePicker: {}, computed, nextTick, ref, watch, narrationMediaName, compositionDuration, useAutomaticRewrite,
     onMounted: () => {}, onUnmounted: fn => cleanup.push(fn), setTimeout: () => 0, clearTimeout: () => {} }
   const component = Function(...Object.keys(deps), script)(...Object.values(deps))
   const state = scope.run(() => component.setup({ api: (...args) => handle(...args), active: true }, { expose() {}, emit() {} }))
@@ -101,5 +101,44 @@ test('single-recording rewrite starts when mandatory instructions lose focus', a
   await nextTick(); await nextTick(); await nextTick()
   assert.equal(h.state.draft.value, '这里展示产品，随后介绍仓库。')
   assert.equal(h.state.busy.value, false)
+  h.close()
+})
+
+test('optional style layer preserves custom prompt and is absent when disabled', async () => {
+  const h = await harness()
+  h.state.customEnabled.value = true
+  h.state.customPrompt.value = '我的完整规则'
+  h.state.style.value = 'poetic'
+  assert.equal('narration_style' in h.state.promptRequest.value, false)
+  h.state.applyStyle.value = true
+  assert.equal('narration_style' in h.state.promptRequest.value, false)
+  h.state.useLlm.value = true
+  assert.equal(h.state.promptRequest.value.narration_style, 'poetic')
+  assert.equal(h.state.promptRequest.value.system_prompt, '我的完整规则')
+  h.state.applyStyle.value = false
+  assert.equal('narration_style' in h.state.promptRequest.value, false)
+  assert.equal(h.state.customPrompt.value, '我的完整规则')
+  assert.equal(h.state.style.value, 'poetic')
+  h.close()
+})
+
+test('synthesis records the draft style rather than an unrelated current selection', async () => {
+  const h = await harness()
+  h.state.source.value = '事实原文'
+  await nextTick()
+  h.state.useLlm.value = true
+  await nextTick()
+  h.state.draft.value = '审阅后的文案'
+  h.state.draftStyle.value = 'professional'
+  h.state.style.value = 'poetic'
+  await nextTick()
+  h.state.version.value = 'draft'
+  let body
+  h.setApi(async (path, options) => {
+    body = JSON.parse(options.body)
+    return { status: 'running' }
+  })
+  await h.state.generate()
+  assert.equal(body.narration_style, 'professional')
   h.close()
 })

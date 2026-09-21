@@ -459,13 +459,15 @@ async def test_late_old_gimbal_ok_cannot_release_a_newer_command(monkeypatch):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("mode", [4, 8])
+@pytest.mark.parametrize("overshoot", [False, True])
 async def test_fixed_program_continues_after_pose_arrival_with_ambiguous_ok(
-    tmp_path, monkeypatch, mode
+    tmp_path, monkeypatch, mode, overshoot
 ):
     """Replay the 09-19 failure through both cruise and the real hardware gate."""
     adapter = _connected_adapter()
     adapter._gimbal_terminal_replies_trusted = False
     sent = []
+    wire_starts = []
     replies = []
     monkeypatch.setattr(cruise_module, "_CW_POSE_POLL_SECONDS", 0.001)
     monkeypatch.setattr(robot_module, "_GIMBAL_PREVIOUS_COMMAND_WAIT_SECONDS", 0.01)
@@ -481,14 +483,21 @@ async def test_fixed_program_continues_after_pose_arrival_with_ambiguous_ok(
         # Actual completion is much faster than the conservative travel estimate.
         yaw = command["yaw_end"]
         pitch = command["pitch_end"]
+        if overshoot:
+            yaw += -1.2 if yaw < 0 else 1.2
+            pitch += -1.2 if pitch < 0 else 1.2
+        else:
+            yaw += 1 if yaw < 0 else -1
+            pitch += 1 if pitch < 0 else -1
         for _ in range(3):
-            await pose(yaw - 1 if yaw >= 0 else yaw + 1, pitch - 1 if pitch >= 0 else pitch + 1, command["zoom_end"])
+            await pose(yaw, pitch, command["zoom_end"])
             await asyncio.sleep(0.005)
 
     class Socket:
         async def send(self, message):
             command = json.loads(message)["gimbal_control"]
             sent.append((command["yaw_end"], command["pitch_end"]))
+            wire_starts.append((command["yaw_start"], command["pitch_start"]))
             replies.append(asyncio.create_task(feedback(command)))
 
     adapter._socket = Socket()
@@ -498,7 +507,7 @@ async def test_fixed_program_continues_after_pose_arrival_with_ambiguous_ok(
         events, RobotService(events, adapter=adapter),
         CaptureService(events, path=tmp_path / "capture.json"),
     )
-    config = CameraworkConfig(point_mode=mode)
+    config = CameraworkConfig(point_mode=mode, yaw_min=-90, yaw_max=90, pitch_min=-60, pitch_max=15)
     segment = CruiseSegment(index=0, path_name="route", goal_id=1)
     try:
         await asyncio.wait_for(
@@ -511,6 +520,11 @@ async def test_fixed_program_continues_after_pose_arrival_with_ambiguous_ok(
     assert sent == [target for piece in pieces for target in piece.poses[1:]]
     assert len(segment.shots) == (8 if mode == 4 else 12)
     assert all(shot["status"] == "complete" for shot in segment.shots)
+    if overshoot:
+        assert any(yaw == -91.2 for yaw, _ in wire_starts)
+        assert any(yaw == 91.2 for yaw, _ in wire_starts)
+        assert any(pitch == -61.2 for _, pitch in wire_starts)
+        assert any(pitch == 16.2 for _, pitch in wire_starts)
 
 
 @pytest.mark.asyncio
@@ -558,7 +572,10 @@ async def test_fixed_pose_gate_requires_fresh_both_axes_and_ignores_late_ok(monk
 
 
 @pytest.mark.asyncio
-async def test_zoom_pieces_wait_for_actual_zoom_and_restore_custom_base(tmp_path, monkeypatch):
+@pytest.mark.parametrize("base,target,actual_base,actual_target", [(1.2, 1.5, 1.2, 1.5), (1, 3.5, 0.99, 3.52)])
+async def test_zoom_pieces_wait_for_actual_zoom_and_restore_custom_base(
+    tmp_path, monkeypatch, base, target, actual_base, actual_target
+):
     adapter = _connected_adapter()
     adapter._gimbal_terminal_replies_trusted = False
     commands = asyncio.Queue()
@@ -572,7 +589,7 @@ async def test_zoom_pieces_wait_for_actual_zoom_and_restore_custom_base(tmp_path
     service = CruiseService(events, RobotService(events, adapter=adapter),
                             CaptureService(events, path=tmp_path / "capture.json"))
     monkeypatch.setattr(cruise_module, "_CW_POSE_POLL_SECONDS", 0.001)
-    config = CameraworkConfig(anchor_zoom=1.2, zoom_target=1.5)
+    config = CameraworkConfig(anchor_zoom=base, zoom_target=target)
 
     async def sample(zoom=None):
         gimbal = {"yaw": 0, "pitch": 0}
@@ -581,9 +598,9 @@ async def test_zoom_pieces_wait_for_actual_zoom_and_restore_custom_base(tmp_path
         await adapter._handle_message(json.dumps({"gimbal": gimbal}))
         await asyncio.sleep(0.005)
 
-    await sample(1.2)
-    service._cw_zoom = 1.2
-    for start, end in [(1.2, 1.5), (1.5, 1.2)]:
+    await sample(actual_base)
+    service._cw_zoom = base
+    for start, end, actual_end in [(actual_base, target, actual_target), (actual_target, base, actual_base)]:
         move = asyncio.create_task(service._move_to_pose((0, 0), config, target_zoom=end))
         try:
             command = await asyncio.wait_for(commands.get(), 0.5)
@@ -594,9 +611,9 @@ async def test_zoom_pieces_wait_for_actual_zoom_and_restore_custom_base(tmp_path
             await sample(start)
             await sample(start)
             assert not move.done() and not adapter._gimbal_ready.is_set()
-            await sample(end)
+            await sample(actual_end)
             assert not move.done()
-            await sample(end)
+            await sample(actual_end)
             await asyncio.wait_for(move, 0.5)
             assert adapter._gimbal_ready.is_set()
             assert service._cw_zoom == end
@@ -1008,3 +1025,163 @@ async def test_real_websocket_cruise_times_out_bare_done_but_stops_and_saves_onc
     assert run.media_local_path is not None
     assert (tmp_path / "cruise-e2e.mp4").is_file()
     assert capture.active_session() is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("succeeds_on", [1, 2, 3, None])
+async def test_cruise_corrects_only_failed_pose_up_to_three_writes(tmp_path, monkeypatch, succeeds_on):
+    """A completed-but-inaccurate move is retried inside the same shot, from actual pose."""
+    adapter = _connected_adapter()
+    sent = []
+
+    class Socket:
+        async def send(self, message):
+            sent.append(json.loads(message)["gimbal_control"])
+
+    adapter._socket = Socket()
+    events = EventHub()
+    service = CruiseService(events, RobotService(events, adapter=adapter),
+                            CaptureService(events, path=tmp_path / "capture.json"))
+
+    async def pose(yaw):
+        await adapter._handle_message(json.dumps({"gimbal": {"yaw": yaw, "pitch": 0, "zoom": 1}}))
+
+    await pose(0)
+
+    async def finish_attempt(*args, **kwargs):
+        await adapter._handle_message(json.dumps({"robot_gimbal_control": {"status": "ok"}}))
+        reached = len(sent) == succeeds_on
+        await pose(20 if reached else len(sent) * 2)
+        return reached, True
+
+    monkeypatch.setattr(service, "_await_camerawork_pose", finish_attempt)
+    if succeeds_on is None:
+        with pytest.raises(ValueError, match="已发送 3 次"):
+            await service._move_to_pose((20, 0), CameraworkConfig())
+    else:
+        await service._move_to_pose((20, 0), CameraworkConfig())
+    assert len(sent) == (succeeds_on or 3)
+    assert [c["yaw_start"] for c in sent] == [0, 2, 4][:len(sent)]
+    assert {c["yaw_end"] for c in sent} == {20}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("unsafe", ["busy", "fail", "unknown", "no_reply", "ambiguous", "stale", "reconnect"])
+async def test_cruise_does_not_retry_without_definite_completion(tmp_path, monkeypatch, unsafe):
+    adapter = _connected_adapter()
+    sent = []
+
+    class Socket:
+        async def send(self, message):
+            sent.append(json.loads(message))
+
+    adapter._socket = Socket()
+    events = EventHub()
+    service = CruiseService(events, RobotService(events, adapter=adapter),
+                            CaptureService(events, path=tmp_path / "capture.json"))
+    sample = json.dumps({"gimbal": {"yaw": 0, "pitch": 0, "zoom": 1}})
+    await adapter._handle_message(sample)
+
+    async def timed_out(*args, **kwargs):
+        if unsafe == "ambiguous":
+            adapter._gimbal_terminal_replies_trusted = False
+        if unsafe != "no_reply":
+            status = unsafe if unsafe in {"busy", "fail", "unknown"} else "ok"
+            await adapter._handle_message(json.dumps({"robot_gimbal_control": {"status": status}}))
+        if unsafe != "stale":
+            await adapter._handle_message(sample)
+        if unsafe == "reconnect":
+            adapter._connection_epoch += 1
+            adapter._clear_heartbeat_diagnostics()
+            await adapter._handle_message(sample)
+        return False, True
+
+    monkeypatch.setattr(service, "_await_camerawork_pose", timed_out)
+    with pytest.raises(ValueError, match="未补发"):
+        await service._move_to_pose((20, 0), CameraworkConfig())
+    assert len(sent) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("interruption", ["busy", "reconnect", "cancel", "superseded"])
+async def test_retry_revalidates_owner_at_socket_write(interruption):
+    adapter = _connected_adapter()
+    sent = []
+    cancelled = asyncio.Event()
+
+    class Socket:
+        async def send(self, message):
+            sent.append(json.loads(message))
+
+    adapter._socket = Socket()
+    command = _gimbal_move(20)
+    owner = await adapter.send_cruise_gimbal(command, context="cruise_fixed_piece")
+    await adapter._handle_message(json.dumps({"robot_gimbal_control": {"status": "ok"}}))
+    await adapter._handle_message(json.dumps({"gimbal": {"yaw": 2, "pitch": 0, "zoom": 1}}))
+    await adapter._send_lock.acquire()
+    retry = asyncio.create_task(adapter.send_cruise_gimbal(
+        command, context="cruise_fixed_piece", retry_owner=owner, cancelled=cancelled.is_set,
+    ))
+    try:
+        for _ in range(5):
+            await asyncio.sleep(0)
+        if interruption == "busy":
+            await adapter._handle_message(json.dumps({"robot_gimbal_control": {"status": "busy"}}))
+        elif interruption == "reconnect":
+            adapter._connection_epoch += 1
+        elif interruption == "superseded":
+            adapter._gimbal_command_revision += 1
+        else:
+            cancelled.set()
+        adapter._send_lock.release()
+        with pytest.raises(asyncio.CancelledError if interruption == "cancel" else ValueError):
+            await retry
+        assert len(sent) == 1
+    finally:
+        if adapter._send_lock.locked():
+            adapter._send_lock.release()
+        if not retry.done():
+            retry.cancel()
+            with suppress(asyncio.CancelledError):
+                await retry
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("queued_yaw", [4, 15])
+async def test_retry_uses_latest_start_and_does_not_correct_within_five_degrees(queued_yaw):
+    adapter = _connected_adapter()
+    sent = []
+
+    class Socket:
+        async def send(self, message):
+            sent.append(json.loads(message)["gimbal_control"])
+
+    adapter._socket = Socket()
+    command = _gimbal_move(20)
+    owner = await adapter.send_cruise_gimbal(command, context="cruise_fixed_piece")
+    await adapter._handle_message(json.dumps({"robot_gimbal_control": {"status": "ok"}}))
+    await adapter._handle_message(json.dumps({"gimbal": {"yaw": 2, "pitch": 0, "zoom": 1}}))
+    await adapter._send_lock.acquire()
+    retry = asyncio.create_task(adapter.send_cruise_gimbal(
+        command, context="cruise_fixed_piece", retry_owner=owner,
+    ))
+    try:
+        for _ in range(5):
+            await asyncio.sleep(0)
+        await adapter._handle_message(json.dumps({"gimbal": {"yaw": queued_yaw, "pitch": 0, "zoom": 1}}))
+        adapter._send_lock.release()
+        if queued_yaw == 15:
+            with pytest.raises(ValueError, match="已在容差内"):
+                await retry
+            assert len(sent) == 1
+        else:
+            await retry
+            assert len(sent) == 2
+            assert sent[-1]["yaw_start"] == queued_yaw
+    finally:
+        if adapter._send_lock.locked():
+            adapter._send_lock.release()
+        if not retry.done():
+            retry.cancel()
+            with suppress(asyncio.CancelledError):
+                await retry

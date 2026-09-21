@@ -258,7 +258,7 @@ async def _shutdown_robot_and_capture(
 def create_app() -> FastAPI:
     ensure_generated_dirs()
     configure_diagnostics(GENERATED_DIRS["logs"] / "diagnostics.log")
-    log_event("info", "backend.started", version="0.1.11")
+    log_event("info", "backend.started", version="0.1.12")
     abandoned_parts = cleanup_abandoned_download_parts(
         GENERATED_DIRS["data"] / "downloads"
     )
@@ -318,7 +318,7 @@ def create_app() -> FastAPI:
             await jobs.compositions.close()
             await media.captures.close()
 
-    app = FastAPI(title="Automated Video Editing Backend", version="0.1.11", lifespan=lifespan)
+    app = FastAPI(title="Automated Video Editing Backend", version="0.1.12", lifespan=lifespan)
     app.add_middleware(
         CORSMiddleware,
         # electron-vite serves the installed renderer from file://, whose browser origin is
@@ -347,6 +347,19 @@ def create_app() -> FastAPI:
 
     return app
 
+
+# A frozen music worker must never start the server, scan the library, or connect the robot.
+if __name__ == "__main__" and "--music-analysis-worker" in sys.argv:
+    from automated_video_editing_backend.services.music_selection import worker_main
+
+    worker_main()
+    raise SystemExit(0)
+
+if __name__ == "__main__" and "--check-bundled-runtime" in sys.argv:
+    from automated_video_editing_backend.runtime_check import main as check_bundled_runtime
+
+    check_bundled_runtime()
+    raise SystemExit(0)
 
 app = create_app()
 

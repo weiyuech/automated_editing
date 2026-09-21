@@ -1,22 +1,29 @@
 from __future__ import annotations
 
+import json
+import time
+
 import httpx
 
 from automated_video_editing_backend.core.models import ProviderTestResult
+from automated_video_editing_backend.core.diagnostics import log_event
 from automated_video_editing_backend.services.settings import SettingsService
+from automated_video_editing_backend.services.narration_styles import style_context
 
 DOUBAO_API_URL = "https://ark.cn-beijing.volces.com/api/v3/chat/completions"
 
+# Verified against the configured provider, not inferred from SDK-wide parameter support.
+JSON_OUTPUT_MODELS = frozenset({"doubao-1-5-lite-32k-250115"})
+
+
+def narration_token_budget(character_budget: int, sections: int = 1) -> int:
+    """Output headroom, not a request for more reasoning or a longer spoken script."""
+    return min(8192, max(2048, 512 + character_budget * 4 + sections * 128))
+
+
 # Written in Chinese because the operator and the TTS voice are Chinese.
-VOICEOVER_SYSTEM_PROMPT = """你为机器人拍摄的短视频撰写口播文稿。
-
-你会收到运营希望表达的文案或要求。以它为唯一事实来源，整理成适合短视频配音的自然口播。
-
-规则：
-- 用中文输出。
-- 只使用文案中已有的信息。不得编造价格、品牌、名称或任何未给出的说法。
-- 如果文案没有可用信息，返回空字符串，不要用套话凑数。
-- 只返回口播正文，不要前言、标题、解释或引号。"""
+VOICEOVER_SYSTEM_PROMPT = """你是中文口播编辑。只改写用户原文，不补充产品事实或评价。保留数字、名称和限制条件；不要从参数推断效果。写一篇适合朗读的短文，风格只改变句式。只返回正文。
+例：原文“杯盖可拆卸”，可改为“杯盖可以拆下来”；不可改成“杯盖水洗很方便”。"""
 
 # Used only when the operator asks for a target length. Length is prioritised, but the ban on
 # inventing facts is absolute — the extra characters come from delivery (restating, transitions,
@@ -44,7 +51,9 @@ class LLMService:
     async def test(self) -> ProviderTestResult:
         cfg = self.settings.llm_config()
         if not self._configured(cfg):
-            return ProviderTestResult(ok=False, provider="doubao", message="LLM settings are incomplete")
+            return ProviderTestResult(
+                ok=False, provider="doubao", message="LLM settings are incomplete"
+            )
         try:
             text = await self._chat(
                 cfg,
@@ -63,8 +72,13 @@ class LLMService:
             return ProviderTestResult(ok=False, provider="doubao", message=str(exc))
 
     async def draft_voiceover(
-        self, raw_text: str, target_seconds: float | None = None, *,
-        instructions: str = "", system_prompt: str | None = None
+        self,
+        raw_text: str,
+        target_seconds: float | None = None,
+        *,
+        instructions: str = "",
+        system_prompt: str | None = None,
+        narration_style=None,
     ) -> str:
         """Draft narration solely from text the operator deliberately supplied for speech.
 
@@ -82,13 +96,24 @@ class LLMService:
             raise ValueError("LLM is enabled but settings are incomplete")
 
         return await self._chat(
-            cfg, **self.voiceover_prompt(
-                raw_text, target_seconds, instructions=instructions, system_prompt=system_prompt
-            )
+            cfg,
+            **self.voiceover_prompt(
+                raw_text,
+                target_seconds,
+                instructions=instructions,
+                system_prompt=system_prompt,
+                narration_style=narration_style,
+            ),
         )
 
     def voiceover_prompt(
-        self, raw_text: str, target_seconds=None, *, instructions="", system_prompt=None
+        self,
+        raw_text: str,
+        target_seconds=None,
+        *,
+        instructions="",
+        system_prompt=None,
+        narration_style=None,
     ) -> dict:
         """Build the complete prompt without provider configuration or a network call."""
         body = raw_text.strip() or "（无）"
@@ -99,16 +124,20 @@ class LLMService:
             # A Chinese character is a couple of tokens; leave generous head-room so a long
             # target is never cut off mid-sentence. A slightly warmer temperature carries the
             # rhetorical expansion that makes length-first narration read smoothly.
-            max_tokens = min(2000, max(380, target_chars * 4))
+            max_tokens = narration_token_budget(target_chars)
             temperature = 0.7
         else:
             system = VOICEOVER_SYSTEM_PROMPT
             user = f"文案或要求：\n{body}"
-            max_tokens = 380
+            max_tokens = narration_token_budget(len(body))
             temperature = 0.55
 
         if instructions.strip():
             user += f"\n\n本次补充要求（控制表达与重点，不作为新增事实）：\n{instructions.strip()}"
+        if narration_style is not None:
+            user += "\n\n" + json.dumps(
+                style_context(narration_style), ensure_ascii=False, indent=2
+            )
         if system_prompt is not None:
             if not system_prompt.strip():
                 raise ValueError("自定义提示词不能为空，可恢复默认提示词")
@@ -134,6 +163,7 @@ class LLMService:
         user: str,
         max_tokens: int,
         temperature: float,
+        json_output: bool = False,
     ) -> str:
         timeout_ms = int(cfg.get("timeout_ms") or 20000)
         payload = {
@@ -145,16 +175,51 @@ class LLMService:
             "max_tokens": max_tokens,
             "temperature": temperature,
         }
+        json_output = json_output and cfg["model"] in JSON_OUTPUT_MODELS
+        if json_output:
+            payload["response_format"] = {"type": "json_object"}
+        started = time.monotonic()
         async with httpx.AsyncClient(timeout=timeout_ms / 1000) as client:
             response = await client.post(
                 DOUBAO_API_URL,
-                headers={"Authorization": f"Bearer {cfg['api_key']}", "Content-Type": "application/json"},
+                headers={
+                    "Authorization": f"Bearer {cfg['api_key']}",
+                    "Content-Type": "application/json",
+                },
                 json=payload,
             )
         if response.status_code >= 400:
             raise ValueError(self._api_error_message(response))
-        data = response.json()
-        return str(data["choices"][0]["message"]["content"]).strip()
+        try:
+            data = response.json()
+            choice = data["choices"][0]
+            finish_reason = choice.get("finish_reason")
+            content = choice["message"].get("content")
+            usage = data.get("usage") or {}
+            details = usage.get("completion_tokens_details") or {}
+        except (ValueError, KeyError, IndexError, TypeError, AttributeError) as exc:
+            raise ValueError("大模型响应格式无效，未使用不完整文案") from exc
+        # Keep diagnostics useful without logging prompts, narration, or credentials.
+        log_event(
+            "info",
+            "llm.response.received",
+            response_id=data.get("id"),
+            model=data.get("model"),
+            finish_reason=finish_reason,
+            max_tokens=max_tokens,
+            json_output=json_output,
+            elapsed_seconds=round(time.monotonic() - started, 3),
+            prompt_tokens=usage.get("prompt_tokens"),
+            completion_tokens=usage.get("completion_tokens"),
+            reasoning_tokens=details.get("reasoning_tokens"),
+        )
+        if finish_reason == "length":
+            raise ValueError("大模型输出达到长度上限，文案未完成；未自动追加请求")
+        if finish_reason == "content_filter":
+            raise ValueError("大模型内容审核未通过，未生成可用文案")
+        if finish_reason != "stop" or not isinstance(content, str) or not content.strip():
+            raise ValueError("大模型未返回完整文案；未自动追加请求")
+        return content.strip()
 
     def _api_error_message(self, response: httpx.Response) -> str:
         try:

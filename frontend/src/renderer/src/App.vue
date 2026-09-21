@@ -3,7 +3,7 @@
     <aside class="sidebar">
       <div class="brand">
         <div>
-          <div class="brand-title">拍摄拼接</div>
+          <div class="brand-title">自动剪辑</div>
           <div class="brand-subtitle">机器人拍摄剪辑台</div>
         </div>
       </div>
@@ -168,19 +168,19 @@
             <p class="form-hint">从起始角扫到目标角。偏航：负=右、正=左；俯仰：负=上、正=下。</p>
             <div class="gimbal-axis">
               <span class="axis-name">偏航</span>
-              <label><small>起始 (−90~90)</small><input v-model.number="gimbalForm.yaw_start" class="field" type="number" min="-90" max="90" step="1" /></label>
+              <label><small>起始（含容差 −95~95）</small><input v-model.number="gimbalForm.yaw_start" class="field" type="number" min="-95" max="95" step="0.1" /></label>
               <label><small>目标 (−90~90)</small><input v-model.number="gimbalForm.yaw_end" class="field" type="number" min="-90" max="90" step="1" /></label>
               <label><small>速度 (2~5)</small><input v-model.number="gimbalForm.yaw_speed" class="field" type="number" min="2" max="5" step="1" /></label>
             </div>
             <div class="gimbal-axis">
               <span class="axis-name">俯仰</span>
-              <label><small>起始 (−60~15)</small><input v-model.number="gimbalForm.pitch_start" class="field" type="number" min="-60" max="15" step="1" /></label>
+              <label><small>起始（含容差 −65~20）</small><input v-model.number="gimbalForm.pitch_start" class="field" type="number" min="-65" max="20" step="0.1" /></label>
               <label><small>目标 (−60~15)</small><input v-model.number="gimbalForm.pitch_end" class="field" type="number" min="-60" max="15" step="1" /></label>
               <label><small>速度 (2~5)</small><input v-model.number="gimbalForm.pitch_speed" class="field" type="number" min="2" max="5" step="1" /></label>
             </div>
             <div class="gimbal-axis">
               <span class="axis-name">变焦</span>
-              <label><small>起始 (1~3.5)</small><input v-model.number="gimbalForm.zoom_start" class="field" type="number" min="1" max="3.5" step="0.1" /></label>
+              <label><small>起始（含容差 0.95~3.55）</small><input v-model.number="gimbalForm.zoom_start" class="field" type="number" min="0.95" max="3.55" step="0.01" /></label>
               <label><small>目标 (1~3.5)</small><input v-model.number="gimbalForm.zoom_end" class="field" type="number" min="1" max="3.5" step="0.1" /></label>
             </div>
             <div class="button-row">
@@ -543,7 +543,8 @@
                         <button @click="cancelRename">取消</button>
                       </span>
                       <span v-else class="asset-actions">
-                        <button v-if="row.asset.can_rename" @click="startRename(row.asset.path, row.asset.name)">重命名</button>
+                        <button v-if="row.asset.role === 'music'" @click="editMusicLabels(row.asset)">标签</button>
+                  <button v-if="row.asset.can_rename" @click="startRename(row.asset.path, row.asset.name)">重命名</button>
                         <button :disabled="!row.asset.can_preview" @click="openAsset(row.asset)">打开</button>
                         <button @click="revealAsset(row.asset)">定位</button>
                         <button v-if="row.asset.can_forget" @click="forgetAsset(row.asset)">移出</button>
@@ -561,6 +562,24 @@
               <input v-model="vaultFilter" class="field compact-field" placeholder="筛选名称或类型" />
               <small>{{ filteredVaultAssets.length }} / {{ userVaultAssets.length }}</small>
             </div>
+            <section v-if="groupedVaultCompositions.length" class="saved-composition-groups">
+              <h3>已保存的组合</h3>
+              <CompositionGroups :items="groupedVaultCompositions" :originals="media" @preview="previewPoolItem">
+                <template #actions="{ item }">
+                  <template v-if="vaultAssetFor(item)">
+                    <template v-if="renameTarget === item.path">
+                      <input v-model="renameValue" class="field compact-field rename-input" placeholder="新名称" @keyup.enter="confirmRename" @keyup.esc="cancelRename" />
+                      <button :disabled="!renameValue.trim() || isRenaming" @click="confirmRename">确认</button><button @click="cancelRename">取消</button>
+                    </template>
+                    <template v-else>
+                      <button v-if="vaultAssetFor(item).can_rename" @click="startRename(item.path, vaultAssetFor(item).name)">重命名</button>
+                      <button @click="revealAsset(vaultAssetFor(item))">定位</button>
+                      <button class="danger" :disabled="!vaultAssetFor(item).can_delete" @click="trashAsset(vaultAssetFor(item))">删除</button>
+                    </template>
+                  </template>
+                </template>
+              </CompositionGroups>
+            </section>
             <div class="table vault-table scroll-list">
             <div class="table-row header"><span>类型</span><span>名称</span><span>大小</span><span>修改时间</span><span>操作</span></div>
             <div v-if="vaultRows.length === 0" class="table-row"><span>—</span><span>没有匹配的素材</span><span></span><span></span><span></span></div>
@@ -609,7 +628,7 @@
               </template>
               <div v-else-if="row.type === 'asset'" class="table-row">
                 <span><span class="role-pill" :class="row.asset.role">{{ roleKindLabel(row.asset.role, row.asset.kind) }}</span></span>
-                <span>{{ row.asset.name }}</span>
+                <span>{{ row.asset.name }}<small v-if="row.asset.role === 'music'" class="music-tags-inline">{{ musicLabels(row.asset).join(' · ') || '未分类' }}</small></span>
                 <span>{{ formatBytes(row.asset.size_bytes) }}</span>
                 <span>{{ formatDate(row.asset.modified_at) }}</span>
                 <span v-if="renameTarget === row.asset.path" class="asset-actions">
@@ -619,6 +638,7 @@
                   <button @click="cancelRename">取消</button>
                 </span>
                 <span v-else class="asset-actions">
+                  <button v-if="row.asset.role === 'music'" @click="editMusicLabels(row.asset)">标签</button>
                   <button v-if="row.asset.can_rename" @click="startRename(row.asset.path, row.asset.name)">重命名</button>
                   <button :disabled="!row.asset.can_preview" @click="openAsset(row.asset)">打开</button>
                   <button @click="revealAsset(row.asset)">定位</button>
@@ -630,16 +650,22 @@
             </div>
           </template>
 
-          <ControlledComposer v-else-if="vaultView === 'compose'" :api="api" :media-url="mediaFileUrl" @preview-source="previewPoolItem" @saved="refreshCompositionMedia" />
+          <CompositionWorkspace v-else-if="vaultView === 'compose'" :api="api" :media-url="mediaFileUrl" @preview-source="previewPoolItem" @saved="refreshCompositionMedia" @narration="active = 'assets'" />
           <div v-else class="storage-layout">
-            <div class="table storage-table">
-              <div class="table-row header"><span>目录</span><span>文件</span><span>大小</span><span>路径</span></div>
-              <div v-for="bucket in storageReport?.buckets || []" :key="bucket.key" class="table-row">
-                <span>{{ bucketLabel(bucket.label) }}</span>
-                <span>{{ bucket.file_count }}</span>
-                <span>{{ formatBytes(bucket.size_bytes) }}</span>
-                <span>{{ bucket.path }}</span>
-              </div>
+            <div class="storage-table-scroll" role="region" aria-label="存储目录，可滚动查看" tabindex="0">
+              <table class="storage-table" aria-label="存储目录统计">
+                <thead>
+                  <tr><th scope="col">目录</th><th scope="col">文件</th><th scope="col">大小</th><th scope="col">路径</th></tr>
+                </thead>
+                <tbody>
+                  <tr v-for="bucket in storageReport?.buckets || []" :key="bucket.key">
+                    <td>{{ bucketLabel(bucket.label) }}</td>
+                    <td>{{ bucket.file_count }}</td>
+                    <td>{{ formatBytes(bucket.size_bytes) }}</td>
+                    <td>{{ bucket.path }}</td>
+                  </tr>
+                </tbody>
+              </table>
             </div>
             <div class="cleanup-block">
               <div class="cleanup-title cleanup-title-row">
@@ -662,14 +688,14 @@
 
       <section v-show="active === 'studio' || active === 'assets'" class="grid two">
         <div v-if="studioOpened && apiConfig" v-show="active === 'studio'" class="panel wide studio-composer">
-          <StudioMediaPool :sources="sourcePoolItems" :music="musicPoolItems" :voices="voiceoverPoolItems" :effects="effectPoolItems"
+          <StudioMediaPool @labels="editMusicLabels" :sources="sourcePoolItems" :music="musicPoolItems" :voices="voiceoverPoolItems" :effects="effectPoolItems"
             :selected-sources="selectedSourceIds" :selected-music="selectedAutomationMusicIds" :selected-voices="selectedAutomationVoiceoverIds" :selected-intro="selectedIntroEffectIds" :selected-outro="selectedOutroEffectIds" :busy="mediaPoolSaving"
             @add="openMediaLibrary" @remove="removeFromMediaPool" @clear="clearMediaPool" @source="toggleSourceSelection" @music="toggleAutomationMusic" @voice="toggleAutomationVoiceover" @intro="toggleIntroEffect" @outro="toggleOutroEffect" @preview="previewPoolItem" @select-all="selectAllSources" @deselect-all="selectedSourceIds = []" />
           <div class="studio-divider"></div>
           <StudioWorkbench :active="active === 'studio'" :api="api" :media-url="mediaFileUrl" :sources="sourcePoolItems.filter(i => selectedSourceIds.includes(i.id))" :music="musicPoolItems.filter(i => selectedAutomationMusicIds.includes(i.id))" :voices="voiceoverPoolItems.filter(i => selectedAutomationVoiceoverIds.includes(i.id))" :intro="effectPoolItems.filter(i => selectedIntroEffectIds.includes(i.id))" :outro="effectPoolItems.filter(i => selectedOutroEffectIds.includes(i.id))" @created="refreshJobs" />
           <p v-if="mediaPoolStatus" class="inline-status wide" :class="mediaPoolStatusKind">{{ mediaPoolStatus }}</p>
         </div>
-        <NarrationPanel v-if="assetsOpened && apiConfig" v-show="active === 'assets'" :active="active === 'assets'" :api="api" :media-url="mediaFileUrl" @changed="refreshCompositionMedia" />
+        <NarrationStudio v-if="assetsOpened && apiConfig" v-show="active === 'assets'" :active="active === 'assets'" :api="api" :media-url="mediaFileUrl" @changed="refreshCompositionMedia" @preview-source="previewPoolItem" />
         <Panel v-if="active === 'assets'" title="特效制作" class="wide">
           <div class="effect-layout">
             <div class="form-stack">
@@ -762,7 +788,10 @@
           <div class="tune">
             <div class="tune-row">
               <select v-model="tuneSourceId" class="field">
-                <option value="">选择素材（导入、成片或特效）</option>
+                <option value="">选择素材（组合、拍摄、导入、成片或特效）</option>
+                <optgroup v-if="tuneCompositionSources.length" label="已保存组合">
+                  <option v-for="item in tuneCompositionSources" :key="item.id" :value="item.id">{{ compositionLabel(item) }}</option>
+                </optgroup>
                 <optgroup label="导入素材">
                   <option v-for="item in tuneImportedSources" :key="item.id" :value="item.id">{{ shortPath(item.path) }}</option>
                 </optgroup>
@@ -1140,6 +1169,7 @@
         </div>
       </section>
     </main>
+    <MusicLabelsDialog ref="musicLabelsDialog" :api="api" />
     <div v-if="mediaLibraryOpen" class="modal-backdrop" @click.self="closeMediaLibrary">
       <div class="modal-card media-library-picker">
         <div class="library-picker-head">
@@ -1157,7 +1187,7 @@
         </div>
         <div v-if="filteredMediaLibraryItems.length === 0" class="empty library-empty">该分类暂无可用素材。</div>
         <div v-else class="library-picker-list">
-          <template v-for="item in filteredMediaLibraryItems" :key="item.id">
+          <MusicGroups :items="filteredMediaLibraryItems" :grouped="mediaLibraryTab === 'music'" v-slot="{ item }">
           <div class="library-picker-row"
             :class="{ pooled: isItemInPool(mediaLibraryTab, item.id), unavailable: !isMediaPoolEligible(mediaLibraryTab, item) }">
             <label :title="mediaPoolAvailabilityTitle(mediaLibraryTab, item)">
@@ -1166,9 +1196,10 @@
                 @change="togglePendingPoolItem(item, $event.target.checked)" />
               <span><strong>{{ shortPath(item.path) }}</strong><small>{{ isItemInPool(mediaLibraryTab, item.id) ? '已在媒体池' : mediaPoolAvailabilityLabel(mediaLibraryTab, item) }}</small></span>
             </label>
+            <button v-if="mediaLibraryTab === 'music'" type="button" @click="editMusicLabels(item)">标签</button>
             <button type="button" @click="previewPoolItem(item)">{{ item.kind === 'audio' ? '试听' : '预览' }}</button>
           </div>
-          </template>
+          </MusicGroups>
         </div>
         <div class="library-picker-footer">
           <span>已选择 {{ pendingPoolIds.length }} 个待加入素材</span>
@@ -1192,16 +1223,22 @@
 </template>
 
 <script setup>
+import MusicLabelsDialog from './components/MusicLabelsDialog.vue'
+import MusicGroups from './components/MusicGroups.vue'
+import { isAudioFile, musicLabels } from './music-labels'
+
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import StatusCard from './components/StatusCard.vue'
 import Panel from './components/Panel.vue'
 import LogList from './components/LogList.vue'
 import CaptureGroupDetails from './components/CaptureGroupDetails.vue'
 import CameraProgramPicker from './components/CameraProgramPicker.vue'
-import ControlledComposer from './components/ControlledComposer.vue'
+import CompositionWorkspace from './components/CompositionWorkspace.vue'
+import CompositionGroups from './components/CompositionGroups.vue'
+import { compositionLabel, savedCompositions } from './composition-groups.js'
 import StudioMediaPool from './components/StudioMediaPool.vue'
 import StudioWorkbench from './components/StudioWorkbench.vue'
-import NarrationPanel from './components/NarrationPanel.vue'
+import NarrationStudio from './components/NarrationStudio.vue'
 import { activeVoiceSource, linkedVoiceSelection, poolWithItems, poolWithoutVoice, poolWithoutSources } from '../../shared/composition-selection.js'
 import {
   captureGroup,
@@ -1278,6 +1315,7 @@ const EMPTY_MEDIA_POOL = {
 }
 const captureOffsets = ref({})
 
+const musicLabelsDialog = ref(null)
 const active = ref('dashboard')
 const studioOpened = ref(false)
 const assetsOpened = ref(false)
@@ -1745,7 +1783,15 @@ function groupVaultAssets(assets) {
       : row
   )
 }
-const vaultRows = computed(() => groupVaultAssets(filteredVaultAssets.value))
+function vaultAssetFor(item) { return vaultAssets.value.find(asset => asset.path === item.path) }
+const groupedVaultCompositions = computed(() => {
+  const visiblePaths = new Set(filteredVaultAssets.value.map(asset => asset.path))
+  return savedCompositions(media.value).filter(item => visiblePaths.has(item.path))
+})
+const vaultRows = computed(() => {
+  const groupedPaths = new Set(groupedVaultCompositions.value.map(item => item.path))
+  return groupVaultAssets(filteredVaultAssets.value.filter(asset => !groupedPaths.has(asset.path)))
+})
 
 const weekdayNames = ['日', '一', '二', '三', '四', '五', '六']
 const calendarAssetMap = computed(() => {
@@ -2875,6 +2921,17 @@ function capturePhoto() {
 }
 function captureNoteSend() { sendWs('CAPTURE_NOTE', { note: captureNote.value }); captureNote.value = '' }
 
+async function editMusicLabels(asset) {
+  const item = media.value.find(entry => entry.path === asset.path)
+  if (!item) return
+  try {
+    const labels = await musicLabelsDialog.value.choose([shortPath(item.path)], musicLabels(item), true)
+    if (labels === null) return
+    await api(`/media/${item.id}/music-labels`, { method: 'PUT', body: JSON.stringify({ labels }) })
+    await Promise.all([refreshMedia(), refreshVault()])
+  } catch (err) { window.alert(`音乐标签未保存：${humanError(err.message)}`) }
+}
+
 async function importMedia() {
   if (isImporting.value) return
   if (!window.desktopApi?.selectMediaFiles || !window.desktopApi?.chooseMediaImportMode) {
@@ -2891,6 +2948,12 @@ async function importMedia() {
       importStatus.value = '未选择文件，已取消导入。'
       return
     }
+    const audioFiles = files.filter(isAudioFile)
+    const labels = audioFiles.length ? await musicLabelsDialog.value.choose(audioFiles.map(shortPath)) : null
+    if (audioFiles.length && labels === null) {
+      importStatus.value = '已取消导入。'
+      return
+    }
     const storageMode = await window.desktopApi.chooseMediaImportMode(files.length)
     if (!storageMode) {
       importStatus.value = '已取消导入，未复制或记录任何文件。'
@@ -2899,6 +2962,7 @@ async function importMedia() {
 
     const successes = []
     const failures = []
+    const labelWarnings = []
     let refreshWarning = ''
     for (const [index, file] of files.entries()) {
       importStatus.value = `正在导入 ${index + 1}/${files.length}：${shortPath(file)}`
@@ -2908,6 +2972,13 @@ async function importMedia() {
           body: JSON.stringify({ path: file, storage_mode: storageMode })
         })
         successes.push(item)
+        if (item.kind === 'audio' && itemRole(item) === 'music' && labels !== null) {
+          try {
+            await api(`/media/${item.id}/music-labels`, { method: 'PUT', body: JSON.stringify({ labels }) })
+          } catch (err) {
+            labelWarnings.push(`${shortPath(file)} 已导入，但标签保存失败：${humanError(err.message)}；可在素材旁点击「标签」重试`)
+          }
+        }
       } catch (err) {
         const reason = humanError(err.message)
         failures.push(`${shortPath(file)}：${reason}`)
@@ -2928,8 +2999,8 @@ async function importMedia() {
       storageMode,
       refreshWarning
     })
-    importStatusKind.value = outcome.kind
-    importStatus.value = outcome.text
+    importStatusKind.value = labelWarnings.length ? 'warn' : outcome.kind
+    importStatus.value = [outcome.text, ...labelWarnings].join('；')
     log(importStatus.value)
   } catch (err) {
     importStatusKind.value = 'danger'
@@ -2950,6 +3021,17 @@ async function downloadMedia() {
   try {
     const item = await api('/media/download', { method: 'POST', body: JSON.stringify({ url }) })
     downloadUrl.value = ''
+    if (item.kind === 'audio' && itemRole(item) === 'music') {
+      try {
+        const labels = await musicLabelsDialog.value.choose([shortPath(item.path)])
+        if (labels !== null) await api(`/media/${item.id}/music-labels`, { method: 'PUT', body: JSON.stringify({ labels }) })
+      } catch (err) {
+        await Promise.all([refreshMedia(), refreshVault()])
+        downloadStatusKind.value = 'warn'
+        downloadStatus.value = `音乐已导入，但标签未保存：${humanError(err.message)}；可在素材旁点击「标签」重试`
+        return
+      }
+    }
     await Promise.all([refreshMedia(), refreshVault()])
     downloadStatusKind.value = 'success'
     downloadStatus.value = `已导入${mediaKindLabel(item.kind)}：${shortPath(item.path)}`
@@ -3054,13 +3136,13 @@ function isItemInPool(kind, id) {
 function mediaPoolAvailabilityTitle(kind, item) {
   if (item.metadata?.capture_group) return '请在媒体库组合、预览并确认后再加入。'
   if (item.metadata?.binding_id && !item.metadata?.bound_source_id) return '这是已替换的历史旁白版本。'
-  return isMediaPoolEligible(kind, item) ? '' : '拼接暂不接受图片；仍可预览，并用于手动微调或生成特效。'
+  return isMediaPoolEligible(kind, item) ? '' : '自动剪辑暂不接受图片；仍可预览，并用于手动微调或生成特效。'
 }
 
 function mediaPoolAvailabilityLabel(kind, item) {
   if (item.metadata?.capture_group) return '录制树 · 请先在媒体库保存组合'
   if (item.metadata?.binding_id && !item.metadata?.bound_source_id) return '历史旁白 · 不可选用'
-  if (!isMediaPoolEligible(kind, item) && item.kind === 'image') return '拼接不可选 · 可手动使用'
+  if (!isMediaPoolEligible(kind, item) && item.kind === 'image') return '自动剪辑不可选 · 可手动使用'
   return roleKindLabel(itemRole(item), item.kind)
 }
 
@@ -3177,9 +3259,10 @@ function closePoolPreview() {
 // on the track. Clips always sit end to end, so dragging only ever reorders and no black
 // frames can appear.
 
+const tuneCompositionSources = computed(() => savedCompositions(media.value))
 const tuneImportedSources = computed(() =>
   media.value.filter((item) =>
-    (item.kind === 'video' && itemRole(item) === 'raw_video' && !captureGroup(item)) ||
+    (item.kind === 'video' && itemRole(item) === 'raw_video' && !captureGroup(item) && !item.metadata?.composition_id) ||
     (item.kind === 'image' && itemRole(item) === 'image')
   )
 )

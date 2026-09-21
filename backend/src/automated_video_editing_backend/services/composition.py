@@ -75,6 +75,8 @@ class CompositionService:
         self.records = {}
         self.tasks: dict[str, asyncio.Task] = {}
         self._confirm_lock = asyncio.Lock()
+        # Automatic batches share one preparation lane, including across API requests.
+        self._automatic_build_slot = asyncio.Semaphore(1)
         if self.directory.exists():
             for path in self.directory.glob("*.json"):
                 raw, _ = read_json(path)
@@ -91,7 +93,7 @@ class CompositionService:
     def save(self, record):
         self.directory.mkdir(parents=True, exist_ok=True)
         if not write_json(self.directory / f"{record['id']}.json", record):
-            raise OSError("拼接预览状态保存失败")
+            raise OSError("剪辑预览状态保存失败")
         self.records[record["id"]] = record
 
     def list(self):
@@ -113,10 +115,10 @@ class CompositionService:
 
     def get(self, key):
         if key not in self.records:
-            raise ValueError("拼接预览不存在")
+            raise ValueError("剪辑预览不存在")
         return self.records[key]
 
-    async def create(self, request: CompositionRequest):
+    async def create(self, request: CompositionRequest, *, automatic_snapshot: dict | None = None):
         self.media.list_items()
         if request.purpose == "library":
             # Selection order is the displayed source/tree order, never click order.
@@ -158,9 +160,41 @@ class CompositionService:
             "tree": [],
             "error": "",
         }
+        if automatic_snapshot is not None:
+            record.update(
+                automatic=deepcopy(automatic_snapshot["metadata"]),
+                files=deepcopy(automatic_snapshot["files"]),
+                groups=deepcopy(automatic_snapshot["groups"]),
+                source_recording_ids=deepcopy(automatic_snapshot["source_recording_ids"]),
+            )
         self.save(record)
-        self.tasks[record["id"]] = asyncio.create_task(self._build(record, request))
+        build = (
+            self._build_automatic(record, request, automatic_snapshot)
+            if automatic_snapshot is not None else self._build(record, request)
+        )
+        self.tasks[record["id"]] = asyncio.create_task(build)
         return self.public(record)
+
+    async def _build_automatic(self, record, request, snapshot):
+        """Keep queued snapshots leased and validate them before any expensive preparation."""
+        try:
+            async with self._automatic_build_slot:
+                self.validate_files(record)
+                await self._build(record, request, expected_groups=snapshot["groups"])
+        except BaseException as exc:
+            cancelled = isinstance(exc, asyncio.CancelledError)
+            record.update(
+                status="cancelled" if cancelled else "failed",
+                stage="cancelled" if cancelled else "failed",
+                message="预览已取消" if cancelled else "剪辑预览未完成",
+                error="" if cancelled else str(exc),
+                finished_at=time.time(),
+            )
+            self.save(record)
+            if cancelled:
+                raise
+        finally:
+            self.tasks.pop(record["id"], None)
 
     def _progress(self, record, detail):
         # Updates stay in memory while running; stage boundaries and terminal states persist.
@@ -200,7 +234,7 @@ class CompositionService:
         self.save(record)
         return self.public(record)
 
-    async def _build(self, record, request):
+    async def _build(self, record, request, *, expected_groups=None):
         preview = GENERATED_DIRS["previews"] / f"composition-{record['id']}.mp4"
         try:
             record.update(status="building", progress=0.05, message="读取选择与时长")
@@ -219,7 +253,7 @@ class CompositionService:
             for index, media_id in enumerate(ids):
                 item = self.media.get(media_id)
                 if item is None or item.kind != "video":
-                    raise ValueError("拼接素材必须是媒体库中的有效视频")
+                    raise ValueError("剪辑素材必须是媒体库中的有效视频")
                 is_effect = (index == 0 and request.intro_effect_media_id is not None) or (
                     index == len(ids) - 1 and request.outro_effect_media_id is not None
                 )
@@ -257,6 +291,10 @@ class CompositionService:
                     stored = await self.media.captures.ensure_timeline(
                         group["id"], lambda detail: self._progress(record, detail)
                     )
+                    if expected_groups is not None and expected_groups.get(group["id"]) != [
+                        stored["fingerprint"], stored["timeline_version"]
+                    ]:
+                        raise ValueError("拍摄时间轴已改变，请重新规划自动组合")
                     choice = choices.pop(
                         group["id"], {"capture_id": group["id"], "include_full": True}
                     )
@@ -364,6 +402,10 @@ class CompositionService:
                     "visual_signature": visual_signature,
                 },
             )
+            def music_boundaries(nodes):
+                return [value for node in nodes for value in [node["start"], *music_boundaries(node.get("children", []))]]
+
+            timeline.planning_diagnostics["music_cut_times"] = music_boundaries(tree)
             if request.music_media_id:
                 music = self.media.get(request.music_media_id)
                 if not music or music.kind != "audio":
@@ -464,6 +506,7 @@ class CompositionService:
                 message="请查看预览并确认最终组合",
                 preview_path=str(preview),
                 measured_duration=actual,
+                timeline=timeline.model_dump(mode="json"),
                 warnings=timeline.warnings,
             )
             self.save(record)
@@ -474,7 +517,7 @@ class CompositionService:
                 error="" if isinstance(exc, asyncio.CancelledError) else str(exc),
                 message="预览已取消"
                 if isinstance(exc, asyncio.CancelledError)
-                else "拼接预览未完成",
+                else "剪辑预览未完成",
                 finished_at=time.time(),
             )
             self.save(record)
@@ -562,6 +605,7 @@ class CompositionService:
                 "duration_seconds": record["duration"],
                 "notes": [note for root in record["tree"] for note in root.get("notes", [])],
                 "narration_binding_id": None,
+                **({"automatic": deepcopy(record["automatic"])} if record.get("automatic") else {}),
             }
             try:
                 await asyncio.to_thread(shutil.copyfile, record["preview_path"], stage)

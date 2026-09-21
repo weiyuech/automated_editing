@@ -6,9 +6,9 @@ This notice is informational; each component remains subject to its own license.
 ## FFmpeg
 
 The application bundles the immutable BtbN Windows snapshot
-`FFmpeg n8.1.2-34-g9b6c8969e0` (`autobuild-2026-08-11-13-11`) with `libass`, `libfreetype`,
+`FFmpeg n8.1.2-50-g1a748fe2cd` (`autobuild-2026-08-31-13-27`) with `libass`, `libfreetype`,
 and `libfontconfig` enabled for subtitle rendering. Its archive is verified against SHA-256
-`05eedc113542be39af5d0f78f0b1093bafb89c98cecf25b77e8644670293107f`. The selected build is
+`273abb45f3f9f76c303e35ff39f5bb6c23c163ae65f6244a32b7d4a7f6cf0616`. The selected build is
 distributed under GNU GPL v3. FFmpeg source and build scripts are available from:
 
 - https://github.com/FFmpeg/FFmpeg
@@ -24,8 +24,19 @@ inside the application beside the font assets under `automated_video_editing_bac
 
 Electron, Vue, Vite, FastAPI, Uvicorn, Pydantic, HTTPX, websockets, PyInstaller,
 and their transitive dependencies retain their respective licenses. Their package metadata
-is included in the packaged runtime where required. Retired automatic video-analysis
-and beat-detection libraries are no longer bundled.
+is included in the packaged runtime where required. Retired scene-detection libraries
+are not bundled. Music excerpt analysis uses librosa (ISC), NumPy and SciPy (BSD),
+Numba (BSD), llvmlite (BSD), soundfile (BSD), and soxr (LGPL-2.1-or-later).
+Bundled libsndfile and libsoxr retain their LGPL terms; package license texts accompany
+their distribution metadata. This notice does not replace those licenses or the
+corresponding-source obligations for redistributed GPL/LGPL binaries.
+
+## Interface appearance
+
+The lavender/pink/violet/blue gradients and shimmer are implemented locally in CSS.
+The reference screenshots used to discuss colors are not included as application assets;
+no third-party theme package or remote theme CDN was added. This statement concerns the
+new theme, not a blanket clearance of unrelated artwork, trademarks, or user media.
 
 ## Local narration matching
 

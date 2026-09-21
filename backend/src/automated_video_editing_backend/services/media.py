@@ -23,6 +23,7 @@ from automated_video_editing_backend.core.paths import (
 )
 from automated_video_editing_backend.core.store import read_json, write_json
 from automated_video_editing_backend.services.capture_library import CaptureLibrary
+from automated_video_editing_backend.services.music_labels import MusicLabels
 from automated_video_editing_backend.services.media_download import (
     MediaDownloadNotReadyError,
     validate_downloaded_video,
@@ -265,6 +266,7 @@ class MediaService:
         self.path = path or generated_path("data", "media-library.json")
         self._imports_blocked = False
         self.media_library_problem = ""
+        self.music_labels = MusicLabels(self.path.with_name(f"{self.path.stem}-music-labels.json"))
         self.pool_path = self.path.with_name(f"{self.path.stem}-pool.json")
         # Generated files are found again by scanning their folders, but a directory entry
         # cannot tell us that two exports came from one render. Keep that app-owned context in
@@ -1061,7 +1063,19 @@ class MediaService:
         from automated_video_editing_backend.services.composition_assets import enrich
 
         enrich(list(self._items.values()))
+        for item in self._items.values():
+            if item.kind == "audio" and item.metadata.get("role") == "music":
+                item.metadata["music_labels"] = self.music_labels.for_path(item.path)
         return list(self._items.values())
+
+    def set_music_labels(self, media_id: str, labels: list[str]) -> MediaItem:
+        item = self.get(media_id)
+        if item is None or not Path(item.path).is_file():
+            raise ValueError("音乐文件不存在，请刷新媒体库")
+        if item.kind != "audio" or item.metadata.get("role") != "music":
+            raise ValueError("只有音乐素材可以设置音乐标签")
+        item.metadata["music_labels"] = self.music_labels.assign(item.path, labels)
+        return item
 
     def _tag_cruise_points(self) -> None:
         """Record how many cruise points each video carries, if any.
@@ -1448,6 +1462,21 @@ class MediaService:
         return self._recognize_copied_import(self._copy_file_to_library(source))
 
     def repoint(self, media_id: str, new_path: str) -> MediaItem | None:
+        item = self._items.get(media_id)
+        if item is None or item.metadata.get("role") != "music":
+            return self._repoint(media_id, new_path)
+        # Commit labels before the existing path transaction. If it rejects the rename,
+        # restore labels as well; MediaRenameService restores the physical file.
+        previous = self.music_labels.data
+        self.music_labels.move(item.path, new_path)
+        try:
+            return self._repoint(media_id, new_path)
+        except Exception:
+            if self.music_labels.data is not previous:
+                self.music_labels.commit(previous)
+            raise
+
+    def _repoint(self, media_id: str, new_path: str) -> MediaItem | None:
         """Point a library entry at a file that has been renamed on disk."""
         item = self._items.get(media_id)
         if item is None:

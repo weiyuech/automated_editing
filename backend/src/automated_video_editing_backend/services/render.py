@@ -200,7 +200,7 @@ class RenderService:
             filter_parts.append(f"[origraw]volume={bed}[orig]")
             sources.append("[orig]")
         if timeline.music_path:
-            # Controlled composition uses music from its start, bounded by the picture.
+            # Music uses the selected continuous excerpt, bounded by the picture.
             bed = MUSIC_BED_VOLUME if timeline.voiceover_path else 1.0
             duration = timeline.music_duration_seconds or sum(
                 max(0.0, clip.duration) for clip in timeline.clips
@@ -531,6 +531,9 @@ class RenderService:
         if existing:
             raise RuntimeError(f"成片目标文件已存在：{', '.join(existing)}")
         try:
+            from automated_video_editing_backend.services.music_selection import prepare_music
+
+            await prepare_music(timeline, self, progress)
             subtitle_path = self.write_subtitle_script(timeline)
             if subtitle_path is not None and not self.supports_subtitles():
                 # Refused rather than rendered without them. An export that quietly comes out

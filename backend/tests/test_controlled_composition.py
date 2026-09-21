@@ -115,9 +115,9 @@ def evidence():
     }
 
 
-async def ready(service, request):
+async def ready(service, request, timeout=30):
     created = await service.create(request)
-    await asyncio.wait_for(service.tasks[created["id"]], 30)
+    await asyncio.wait_for(service.tasks[created["id"]], timeout)
     record = service.get(created["id"])
     assert record["status"] == "ready", record.get("error")
     return record
@@ -570,7 +570,7 @@ async def test_invalid_effect_and_release_preview_leases(studio, tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_music_uses_beginning_and_never_extends_picture_or_covers_effects_by_default(
+async def test_music_excerpt_never_extends_picture_or_covers_effects_by_default(
     studio, tmp_path
 ):
     from array import array
@@ -613,6 +613,7 @@ async def test_music_uses_beginning_and_never_extends_picture_or_covers_effects_
             outro_effect_media_id=outro.id,
             subtitles=False,
         ),
+        timeout=120,  # Includes a fresh librosa/Numba worker compilation on release runners.
     )
     assert record["measured_duration"] == pytest.approx(1.5, abs=1 / 30)
     assert record["timeline"]["music_delay_seconds"] == pytest.approx(0.2)
@@ -677,7 +678,7 @@ async def test_binding_survives_video_and_voice_rename_and_nested_notes(studio, 
 
 
 @pytest.mark.asyncio
-async def test_whole_draft_sees_transit_notes_and_orders_text_without_synthesizing(
+async def test_custom_whole_draft_sees_transit_notes_and_orders_text_without_synthesizing(
     studio, tmp_path
 ):
     from automated_video_editing_backend.core.composition import NarrationAllocateRequest
@@ -730,7 +731,9 @@ async def test_whole_draft_sees_transit_notes_and_orders_text_without_synthesizi
 
     tts = FakeTTS(tmp_path / "data/tts", studio.media, [])
     service = MappedNarrationService(studio, DraftLLM(), tts)
-    draft = await service.allocate(record["id"], NarrationAllocateRequest(text="入口介绍"))
+    draft = await service.allocate(record["id"], NarrationAllocateRequest(
+        text="入口介绍", system_prompt="用户原文是唯一事实来源，按时间表输出 sections JSON。"
+    ))
     assert draft["text"] == "这里是入口。\n\n接着向前走。"
     assert [s["node_id"] for s in draft["sections"]] == ["A", "AB"]
     assert tts.calls == []

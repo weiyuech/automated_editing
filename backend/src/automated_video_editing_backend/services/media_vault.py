@@ -79,6 +79,8 @@ class MediaVaultService:
         return sorted(by_path.values(), key=lambda item: item.day, reverse=True)
 
     def _attach_group(self, asset: MediaAsset, item: MediaItem) -> None:
+        if asset.role == "music":
+            asset.music_labels = list(item.metadata.get("music_labels", []))
         capture = item.metadata.get("capture_group")
         if capture:
             asset.capture_group = capture

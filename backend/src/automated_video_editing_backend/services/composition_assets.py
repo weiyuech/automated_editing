@@ -37,6 +37,7 @@ def enrich(items) -> None:
                     "duration_ms",
                     "timing_quality",
                     "narration_status",
+                    "narration_style",
                     "created_at",
                 ):
                     if key in raw:

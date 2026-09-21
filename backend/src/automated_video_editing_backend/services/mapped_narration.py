@@ -20,6 +20,10 @@ from automated_video_editing_backend.services.narration_alignment import (
 from automated_video_editing_backend.services.narration_audio import render_track
 from automated_video_editing_backend.services.semantic import BgeOnnxEmbedder
 from automated_video_editing_backend.services.narration_prompts import composition_prompt
+from automated_video_editing_backend.services.llm import narration_token_budget
+from automated_video_editing_backend.services.grounded_narration import (
+    GroundedNarration, ROUTING_PROMPT, WHOLE_WRITING_PROMPT, routing_payload, writing_options,
+)
 from automated_video_editing_backend.services.narration_context import (
     narration_context,
     narration_windows as narration_windows,
@@ -80,6 +84,9 @@ class MappedNarrationService:
         self.compositions, self.llm, self.tts = compositions, llm, tts
         self.tasks = {}
         self.embedder = embedder or BgeOnnxEmbedder()
+        from automated_video_editing_backend.services.narration_batch import NarrationBatchService
+
+        self.batches = NarrationBatchService(self)
 
     def _material(self, key):
         record, item = self.compositions.material(key)
@@ -110,10 +117,21 @@ class MappedNarrationService:
             if request.measured_feedback
             else None
         )
-        return {
+        prompt = {
             **composition_prompt(context, request, feedback=feedback),
             "title": metadata["title"],
         }
+        if context["mode"] == "single_recording" and request.system_prompt is None:
+            prompt.update(
+                strategy="grounded_whole",
+                system=ROUTING_PROMPT,
+                user=json.dumps(routing_payload(context, request), ensure_ascii=False, indent=2),
+                writing_system=WHOLE_WRITING_PROMPT,
+                writing_options=writing_options(request),
+                writing_note="一次对应事实，一次整篇润色，首次最多两次调用，不随点位数增加。实际输入在生成后可查看，仍只生成一条语音。",
+                measured_feedback=feedback,
+            )
+        return prompt
 
     async def allocate(self, key, request):
         prompt = self.prompt(key, request)
@@ -127,11 +145,18 @@ class MappedNarrationService:
         cfg = self.llm.settings.llm_config()
         if not self.llm._configured(cfg) or not cfg.get("enabled"):
             raise ValueError("请先配置并启用大模型，也可关闭润色直接填写整篇文案")
+        if prompt.get("strategy") == "grounded_whole":
+            if not hasattr(self, "_grounded"):
+                self._grounded = GroundedNarration(self.llm)
+            draft = await self._grounded.draft(prompt, request)
+            if len(draft["text"]) > 4000:
+                raise ValueError("文案过长，请减少素材或原始文案")
+            return {**draft, "prompt": prompt}
         raw = await self.llm._chat(
             cfg,
             system=prompt["system"],
             user=prompt["user"],
-            max_tokens=3500,
+            max_tokens=max(3500, narration_token_budget(len(request.text))),
             temperature=0.2,
         )
         if prompt["mode"] != "single_recording":
@@ -163,7 +188,9 @@ class MappedNarrationService:
             ):
                 raise ValueError("画面节点不正确")
             sections.sort(key=lambda section: order[section.node_id])
-            assignments = self._validate_assignments(payload.get("note_assignments", []), windows)
+            assignments = self._validate_assignments(
+                payload.get("note_assignments", []), windows, omit_empty=True
+            )
             general_notes = payload.get("general_notes", [])
             if (
                 not isinstance(general_notes, list)
@@ -187,18 +214,30 @@ class MappedNarrationService:
         }
 
     @staticmethod
-    def _validate_assignments(entries, windows):
-        entries = [NarrationBinding.model_validate(entry).model_dump() for entry in entries]
-        ids = {node["id"] for node in windows}
-        if (
-            len(entries) > 100
-            or len({e["node_id"] for e in entries}) != len(entries)
-            or any(e["node_id"] not in ids for e in entries)
-        ):
+    def _validate_assignments(entries, windows, *, omit_empty=False):
+        if not isinstance(entries, list) or len(entries) > 100:
             raise ValueError("备注对应的画面节点无效")
-        return entries
+        ids = {node["id"] for node in windows}
+        seen = set()
+        assignments = []
+        for entry in entries:
+            # Some provider responses use empty placeholders for unassigned windows.
+            # Only allocation responses may omit these; user-saved bindings stay strict.
+            empty = (
+                omit_empty and isinstance(entry, dict)
+                and isinstance(entry.get("text"), str) and not entry["text"].strip()
+            )
+            parsed = entry if empty else NarrationBinding.model_validate(entry).model_dump()
+            node_id = parsed.get("node_id")
+            if not isinstance(node_id, str) or node_id not in ids or node_id in seen:
+                raise ValueError("备注对应的画面节点无效")
+            seen.add(node_id)
+            if not empty:
+                assignments.append(parsed)
+        return assignments
 
-    async def start(self, key, request):
+    async def start(self, key, request, *, batch_id=None):
+        self.batches.check_owner(key, batch_id)
         record, item, metadata = self._material(key)
         if key in self.tasks:
             raise ValueError("这条组合的旁白正在合成")
@@ -220,6 +259,7 @@ class MappedNarrationService:
         )
         state = {
             "direct_narration": request.direct_narration,
+            "narration_style": None if request.direct_narration else request.narration_style,
             "note_assignments": assignments,
             "general_notes": request.general_notes
             if context["mode"] == "single_recording" and not request.direct_narration
@@ -266,6 +306,7 @@ class MappedNarrationService:
                 composition_id=record["id"],
                 visual_signature=metadata["visual_signature"],
                 narration_status="generating",
+                narration_style=state["narration_style"],
             )
             # Mark as unbound before any async processing: it must not enter a pool as ordinary TTS.
             if not write_json(source.with_suffix(".json"), voice_meta):
@@ -478,6 +519,7 @@ class MappedNarrationService:
             state.setdefault("warnings", []).append(f"旁白已绑定，列表暂未刷新：{exc}")
 
     async def adjust(self, key, request):
+        self.batches.check_owner(key)
         record, item, metadata = self._material(key)
         state = self._pending(record, request.attempt_id)
         if state["status"] not in {
@@ -533,6 +575,7 @@ class MappedNarrationService:
         return state
 
     async def close(self):
+        await self.batches.close()
         tasks = list(self.tasks.values())
         for task in tasks:
             task.cancel()

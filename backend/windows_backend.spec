@@ -1,7 +1,7 @@
 import os
 from pathlib import Path
 
-from PyInstaller.utils.hooks import copy_metadata
+from PyInstaller.utils.hooks import copy_metadata, collect_data_files, collect_submodules
 
 
 BACKEND_ROOT = Path(SPECPATH).resolve()
@@ -25,8 +25,21 @@ for distribution in (
     "pydantic",
     "uvicorn",
     "python-multipart",
+    "numpy",
+    "scipy",
+    "numba",
+    "llvmlite",
+    "soundfile",
+    "soxr",
+    "onnxruntime",
+    "tokenizers",
 ):
     datas += copy_metadata(distribution)
+
+# librosa uses lazy imports and ships .pyi maps; include both in frozen builds.
+hiddenimports += collect_submodules("librosa")
+datas += collect_data_files("librosa", includes=["**/*.pyi"])
+datas += copy_metadata("librosa")
 
 datas += [
     (
@@ -35,6 +48,9 @@ datas += [
     ),
 ]
 if not EXTERNAL_MEDIA_TOOLS:
+    datas += [
+        (str(BACKEND_ROOT / "vendor" / "ffmpeg" / "win64" / "licenses"), "vendor/ffmpeg/win64/licenses"),
+    ]
     binaries += [
         (
             str(BACKEND_ROOT / "vendor" / "ffmpeg" / "win64" / "ffmpeg.exe"),
@@ -55,7 +71,7 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=["pytest", "matplotlib", "tkinter", "av", "cv2", "librosa", "numba", "llvmlite", "scenedetect"],
+    excludes=["pytest", "matplotlib", "tkinter", "av", "cv2", "scenedetect"],
     noarchive=False,
     optimize=0,
 )

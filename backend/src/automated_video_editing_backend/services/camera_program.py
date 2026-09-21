@@ -6,12 +6,6 @@ from dataclasses import dataclass
 from typing import Protocol
 
 
-# Shared by cruise arrival checks and the hardware command gate.
-POSE_TOLERANCE_DEG = 5.0
-POSE_STABLE_SAMPLES = 2
-ZOOM_TOLERANCE = 0.05
-
-
 class Bounds(Protocol):
     yaw_min: int
     yaw_max: int

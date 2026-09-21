@@ -2,9 +2,13 @@
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import { narrationMediaName, compositionDuration } from '../narration-context.js'
 import { useAutomaticRewrite } from '../use-automatic-rewrite.js'
+import NarrationStylePicker from './NarrationStylePicker.vue'
 const props = defineProps({
   api: Function,
   mediaUrl: Function,
+  initialAligned: { type: Boolean, default: true },
+  initialCompositionId: { type: String, default: '' },
+  hideMode: { type: Boolean, default: false },
   active: { type: Boolean, default: true },
 })
 const panel = ref(null)
@@ -16,12 +20,13 @@ watch(
   },
 )
 const emit = defineEmits(['changed'])
-const aligned = ref(true),
+const aligned = ref(props.initialAligned ?? true),
   useLlm = ref(false),
   items = ref([]),
-  composition = ref(''),
+  composition = ref(props.initialCompositionId || ''),
   title = ref(''),
   source = ref('')
+const applyStyle = ref(false), style = ref('natural'), draftStyle = ref(null)
 const draft = ref(''),
   draftSections = ref([]),
   noteAssignments = ref([]),
@@ -34,6 +39,7 @@ const draft = ref(''),
 const sourceEditing = ref(false), instructionsEditing = ref(false), customEditing = ref(false)
 const instructions = ref(''), contextData = ref(null), promptError = ref('')
 const showPrompt = ref(false), customEnabled = ref(false), customPrompt = ref(''), promptPreview = ref(null), promptLoading = ref(false), measuredFeedback = ref(false)
+const draftPromptTrace = ref([])
 function restorePrompt() { customEnabled.value = false; customPrompt.value = '' }
 function enableCustom(checked) {
   if (checked && !customPrompt.value) customPrompt.value = promptPreview.value?.baseline_system || ''
@@ -79,6 +85,7 @@ const rewriteInput = computed(() => measuredFeedback.value
   : source.value)
 const promptRequest = computed(() => ({text:rewriteInput.value, instructions:instructions.value,
   system_prompt:customEnabled.value ? customPrompt.value : null,
+  ...(useLlm.value && applyStyle.value ? { narration_style: style.value } : {}),
   ...(aligned.value ? {measured_feedback:measuredFeedback.value} : {}),
 }))
 const promptKey = computed(() => JSON.stringify([aligned.value,composition.value,promptRequest.value]))
@@ -123,6 +130,13 @@ const { pending: autoRewritePending, rewriting } = useAutomaticRewrite({
   enabled: useLlm,
   ready: rewriteReady,
   run: polish,
+})
+watch([applyStyle, style], () => {
+  revision++
+  if (useLlm.value) {
+    version.value = ''
+    autoRewritePending.value = true
+  }
 })
 const canGenerate = computed(
   () =>
@@ -279,14 +293,17 @@ async function polish(measured = false) {
   // Finish reactive invalidation before capturing this request's revision.
   await nextTick()
   const requested = ++revision
+  const request = promptRequest.value
   await safe(async () => {
     const endpoint = aligned.value ? `/compositions/${composition.value}/narration/draft` : '/tts/draft'
-    const data = await props.api(endpoint, {method:'POST',body:JSON.stringify(promptRequest.value)})
+    const data = await props.api(endpoint, {method:'POST',body:JSON.stringify(request)})
     if (disposed || requested !== revision) return
+    draftStyle.value = request.narration_style || null
     draft.value = data.text || data.draft_text
     draftSections.value = data.sections || []
     noteAssignments.value = data.note_assignments || []
     generalNotes.value = data.general_notes || []
+    draftPromptTrace.value = data.prompt_trace || []
     version.value = ''
     info.value = ''
   })
@@ -308,6 +325,8 @@ async function generate() {
             playback_rate: playbackRate.value,
             auto_tempo: autoTempo.value,
             direct_narration: !useLlm.value,
+            ...(useLlm.value && version.value === 'draft' && draftStyle.value
+              ? { narration_style: draftStyle.value } : {}),
           }),
         },
       )
@@ -373,7 +392,7 @@ onUnmounted(() => {
     @play.capture="exclusivePlayback"
   >
     <div class="panel-title">旁白制作</div>
-    <div class="mode-row">
+    <div v-if="!hideMode" class="mode-row">
       <label class="check-row"
         ><input
           v-model="aligned"
@@ -425,6 +444,8 @@ onUnmounted(() => {
           <label class="check-row polish-toggle"><input v-model="useLlm" type="checkbox" role="switch" :disabled="busy || running" />大模型润色</label>
           <button class="prompt-reveal" :aria-expanded="showPrompt" @click="showPrompt = !showPrompt">{{ showPrompt ? '收起提示词' : '展开提示词' }}</button>
         </div>
+        <NarrationStylePicker v-model="style" v-model:applied="applyStyle"
+          :enabled="useLlm" :busy="busy || running" />
         <label v-if="useLlm" class="script extra-instructions">
           <span>本次补充要求 <small :class="{required: needsInstructions}">{{ needsInstructions ? '必填' : '可选' }}</small></span>
           <textarea v-model="instructions" @input="instructionsEditing = true" @change="instructionsEditing = false" @blur="instructionsEditing = false" :required="needsInstructions" :aria-required="needsInstructions" class="field" maxlength="2000" :disabled="busy || running"
@@ -526,11 +547,13 @@ onUnmounted(() => {
           <p v-if="aligned && !selected" class="form-hint">先选择一个组合。</p>
           <template v-else>
             <div class="prompt-controls"><label class="check-row"><input type="checkbox" :checked="customEnabled" :disabled="busy || running || (!customEnabled && !promptPreview)" @change="enableCustom($event.target.checked)" />自定义系统提示词</label><button :disabled="busy || running || !customEnabled" @click="restorePrompt">恢复默认</button></div>
-            <label class="prompt-label">系统提示词</label>
+            <label class="prompt-label">{{ promptPreview?.writing_system ? '点位事实对应 · 系统提示词' : '系统提示词' }}</label>
             <textarea v-if="customEnabled" v-model="customPrompt" @input="customEditing = true" @change="customEditing = false" @blur="customEditing = false" aria-label="自定义系统提示词" class="field prompt-editor" maxlength="12000" :disabled="busy || running" />
             <pre v-else-if="promptPreview" class="prompt-content">{{ promptPreview.system }}</pre>
             <label v-if="promptPreview" class="prompt-label">本次输入</label>
             <pre v-if="promptPreview" class="prompt-content">{{ promptPreview.user }}</pre>
+            <details v-if="promptPreview?.writing_system"><summary>整篇润色 · 系统提示词</summary><pre class="prompt-content">{{ promptPreview.writing_system }}</pre><pre class="prompt-content">{{ JSON.stringify(promptPreview.writing_options, null, 2) }}</pre><p class="form-hint">{{ promptPreview.writing_note }}</p></details>
+            <details v-if="draftPromptTrace.length && draft"><summary>本稿实际请求</summary><div v-for="(entry, index) in draftPromptTrace" :key="index"><small>{{ index + 1 }}{{ entry.cached ? ' · 复用相同输入' : '' }}</small><pre class="prompt-content">{{ entry.system }}</pre><pre class="prompt-content">{{ entry.user }}</pre></div></details>
             <p v-if="promptLoading" class="form-hint" role="status">正在更新提示词…</p>
           </template>
         </section>

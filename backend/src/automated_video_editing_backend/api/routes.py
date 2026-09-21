@@ -9,6 +9,11 @@ from automated_video_editing_backend.core.composition import (
     NarrationAdjustRequest,
     StudioPreviewRequest,
 )
+from automated_video_editing_backend.core.automatic_composition import (
+    AutomaticCompositionPlanRequest, AutomaticCompositionRequest,
+)
+from automated_video_editing_backend.core.narration_batch import BatchNarrationRequest
+from automated_video_editing_backend.services.automatic_composition import AutomaticCompositionService
 
 import asyncio
 from contextlib import suppress
@@ -68,6 +73,14 @@ from automated_video_editing_backend.services.tts import TTSService
 class ImportMediaRequest(BaseModel):
     path: str
     storage_mode: Literal["reference", "copy"] = "reference"
+
+
+class MusicLabelCreateRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=20)
+
+
+class MusicLabelsUpdateRequest(BaseModel):
+    labels: list[str] = Field(default_factory=list, max_length=20)
 
 
 class DownloadMediaRequest(BaseModel):
@@ -692,6 +705,27 @@ def build_router(
             )
         return {"forgotten": True, "path": item.path}
 
+    @router.get("/music/labels")
+    async def music_labels(_: Secured = None):
+        try:
+            return media.music_labels.labels()
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @router.post("/music/labels")
+    async def music_label_create(request: MusicLabelCreateRequest, _: Secured = None):
+        try:
+            return media.music_labels.create(request.name)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @router.put("/media/{media_id}/music-labels")
+    async def music_labels_update(media_id: str, request: MusicLabelsUpdateRequest, _: Secured = None):
+        try:
+            return media.set_music_labels(media_id, request.labels)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
     @router.post("/media/import")
     async def media_import(request: ImportMediaRequest, _: Secured = None):
         try:
@@ -728,6 +762,38 @@ def build_router(
             return await jobs.compositions.save_material(key, request.signature)
         except (ValueError, OSError) as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @router.post("/compositions/automatic/plan")
+    async def automatic_composition_plan(request: AutomaticCompositionPlanRequest, _: Secured = None):
+        try:
+            return await AutomaticCompositionService(jobs.compositions).plan(request)
+        except (ValueError, OSError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @router.post("/compositions/automatic")
+    async def automatic_composition_create(request: AutomaticCompositionRequest, _: Secured = None):
+        try:
+            return await AutomaticCompositionService(jobs.compositions).create(request)
+        except (ValueError, OSError) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @router.post("/narration/batches")
+    async def narration_batch_create(request: BatchNarrationRequest, _: Secured = None):
+        try:
+            return await jobs.narration.batches.start(request)
+        except (ValueError, OSError) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @router.get("/narration/batches")
+    async def narration_batch_list(_: Secured = None):
+        return [jobs.narration.batches.get(key) for key in reversed(jobs.narration.batches.records)]
+
+    @router.get("/narration/batches/{key}")
+    async def narration_batch_get(key: str, _: Secured = None):
+        try:
+            return jobs.narration.batches.get(key)
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     @router.get("/compositions")
     async def compositions_list(_: Secured = None):
@@ -990,6 +1056,7 @@ def build_router(
                 **llm.voiceover_prompt(
                     request.text, request.target_seconds,
                     instructions=request.instructions, system_prompt=request.system_prompt,
+                    **({"narration_style": request.narration_style} if request.narration_style else {}),
                 ),
                 "baseline_system": baseline["system"],
             }
@@ -1011,6 +1078,7 @@ def build_router(
             draft_text = await llm.draft_voiceover(
                 source_text, request.target_seconds,
                 instructions=request.instructions, system_prompt=request.system_prompt,
+                **({"narration_style": request.narration_style} if request.narration_style else {}),
             )
             if not draft_text.strip():
                 raise ValueError("Nothing usable was found in the text")

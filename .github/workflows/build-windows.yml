@@ -117,6 +117,14 @@ jobs:
       - name: Smoke-test frozen backend startup and API authentication
         run: python scripts/smoke_frozen_backend.py frontend/build/backend-dist/automated-video-editing-backend.exe
 
+      - name: Exercise bundled media and model runtimes without downloads
+        env:
+          HF_HUB_OFFLINE: "1"
+          TRANSFORMERS_OFFLINE: "1"
+        run: |
+          unset FFMPEG_BIN FFPROBE_BIN
+          frontend/build/backend-dist/automated-video-editing-backend.exe --check-bundled-runtime
+
       - name: Install frontend dependencies
         working-directory: frontend
         run: pnpm install --frozen-lockfile

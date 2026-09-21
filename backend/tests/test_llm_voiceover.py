@@ -10,10 +10,12 @@ from automated_video_editing_backend.services.llm import (
 
 def _service(tmp_path, speed=1.0, enabled=True):
     settings = SettingsService(path=tmp_path / "settings.json")
-    settings.replace_for_development({
-        "llm": {"enabled": enabled, "api_key": "k", "model": "m"},
-        "tts": {"speed_ratio": speed},
-    })
+    settings.replace_for_development(
+        {
+            "llm": {"enabled": enabled, "api_key": "k", "model": "m"},
+            "tts": {"speed_ratio": speed},
+        }
+    )
     return LLMService(settings)
 
 
@@ -37,7 +39,7 @@ async def test_no_target_keeps_original_prompt(tmp_path):
     assert captured["system"] == VOICEOVER_SYSTEM_PROMPT
     assert "目标字数" not in captured["user"]
     assert captured["temperature"] == 0.55
-    assert captured["max_tokens"] == 380
+    assert captured["max_tokens"] == 2048
 
 
 @pytest.mark.asyncio
@@ -50,7 +52,7 @@ async def test_target_seconds_embeds_char_count_in_user_message(tmp_path):
     assert "目标字数：约 120 字" in captured["user"]
     assert "六和桥OPC，适合创业" in captured["user"]
     assert captured["temperature"] == 0.7
-    assert captured["max_tokens"] == 480  # min(2000, max(380, 120*4))
+    assert captured["max_tokens"] == 2048  # Output headroom does not change the 120-char target.
 
 
 def test_target_chars_scales_with_speed_ratio(tmp_path):

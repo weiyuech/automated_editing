@@ -23,12 +23,12 @@ from automated_video_editing_backend.core.models import (
 from automated_video_editing_backend.services.capture import CaptureService
 from automated_video_editing_backend.services.robot import RobotCommandNotSentError, RobotService
 
-from automated_video_editing_backend.services.camera_program import (
+from automated_video_editing_backend.core.gimbal_limits import (
     POSE_STABLE_SAMPLES as _CW_POSE_STABLE_SAMPLES,
     POSE_TOLERANCE_DEG as _CW_POSE_TOLERANCE_DEG,
     ZOOM_TOLERANCE,
-    camera_program,
 )
+from automated_video_editing_backend.services.camera_program import camera_program
 
 _CW_POSE_POLL_SECONDS = 0.2
 _ARRIVAL_TIMEOUT_SECONDS = 60.0
@@ -556,51 +556,62 @@ class CruiseService:
         self, target: tuple[float, float], config: CameraworkConfig,
         *, target_zoom: float | None = None,
     ) -> None:
-        """One command, then fresh physical confirmation. A timeout never means arrival."""
-        if self._cancel.is_set():
-            raise asyncio.CancelledError
-        yaw, pitch = self.robot.heartbeat_yaw(), self._heartbeat_pitch()
-        if yaw is None or pitch is None:
-            raise ValueError("缺少云台角度反馈，已停止后续导航；请检查机器人心跳")
+        """Confirm the physical target; retry only with adapter-proven completion.
+
+        All attempts belong to this same shot. A timeout alone never permits another
+        write: the adapter requires a trusted terminal reply and fresh hardware samples.
+        """
+        owner = None
         desired_zoom = config.anchor_zoom if target_zoom is None else target_zoom
-        zoom = self._heartbeat_zoom()
-        start_zoom = self._cw_zoom if zoom is None else zoom
-        check_zoom = target_zoom is not None or abs(start_zoom - desired_zoom) > ZOOM_TOLERANCE
-        if check_zoom and zoom is None:
-            raise ValueError("缺少变焦倍率反馈，已停止后续镜头和导航；请检查机器人心跳 zoom")
-        speed = config.speed_max
-        await asyncio.wait_for(
-            self.robot.set_gimbal(
-                GimbalMoveRequest(
-                    yaw_start=yaw,
-                    yaw_end=target[0],
-                    yaw_speed=speed,
-                    pitch_start=pitch,
-                    pitch_end=target[1],
-                    pitch_speed=speed,
-                    zoom_start=start_zoom,
-                    zoom_end=desired_zoom,
-                ),
-                context="cruise_fixed_zoom" if check_zoom else "cruise_fixed_piece",
-            ),
-            timeout=10,
-        )
-        revision = self._heartbeat_revision()
-        zoom_revision = self._zoom_revision()
-        budget = max(abs(target[0] - yaw), abs(target[1] - pitch)) / speed + 8.0
-        if check_zoom:
-            budget = max(budget, 15.0)
-        reached, _ = await self._await_camerawork_pose(
-            *target, budget, after_revision=revision,
-            target_zoom=desired_zoom if check_zoom else None,
-            after_zoom_revision=zoom_revision,
-        )
-        if self._cancel.is_set():
-            raise asyncio.CancelledError
-        if not reached:
-            detail = f"，倍率 {desired_zoom:g}×" if check_zoom else ""
-            raise ValueError(f"云台未确认到达 ({target[0]}, {target[1]}){detail}；已停止后续镜头和导航")
-        self._cw_zoom = desired_zoom
+        for attempt in range(1, 4):  # Initial command plus at most two corrective attempts.
+            if self._cancel.is_set():
+                raise asyncio.CancelledError
+            yaw, pitch = self.robot.heartbeat_yaw(), self._heartbeat_pitch()
+            if yaw is None or pitch is None:
+                raise ValueError("缺少云台角度反馈，已停止后续导航；请检查机器人心跳")
+            zoom = self._heartbeat_zoom()
+            start_zoom = self._cw_zoom if zoom is None else zoom
+            check_zoom = target_zoom is not None or abs(start_zoom - desired_zoom) > ZOOM_TOLERANCE
+            if check_zoom and zoom is None:
+                raise ValueError("缺少变焦倍率反馈，已停止后续镜头和导航；请检查机器人心跳 zoom")
+            speed = config.speed_max
+            command = GimbalMoveRequest(
+                yaw_start=yaw, yaw_end=target[0], yaw_speed=speed,
+                pitch_start=pitch, pitch_end=target[1], pitch_speed=speed,
+                zoom_start=start_zoom, zoom_end=desired_zoom,
+            )
+            context = "cruise_fixed_zoom" if check_zoom else "cruise_fixed_piece"
+            sender = getattr(self.robot, "send_cruise_gimbal", None)
+            if sender is None:
+                await asyncio.wait_for(self.robot.set_gimbal(command, context=context), timeout=10)
+            else:
+                owner = await asyncio.wait_for(
+                    sender(command, context=context, retry_owner=owner, cancelled=self._cancel.is_set), timeout=10,
+                )
+            if attempt > 1:
+                log_event("warning", "cruise.gimbal.corrective_attempt", attempt=attempt,
+                          target_yaw=target[0], target_pitch=target[1], target_zoom=desired_zoom)
+            revision = self._heartbeat_revision()
+            zoom_revision = self._zoom_revision()
+            budget = max(abs(target[0] - yaw), abs(target[1] - pitch)) / speed + 8.0
+            if check_zoom:
+                budget = max(budget, 15.0)
+            reached, _ = await self._await_camerawork_pose(
+                *target, budget, after_revision=revision,
+                target_zoom=desired_zoom if check_zoom else None,
+                after_zoom_revision=zoom_revision,
+            )
+            if self._cancel.is_set():
+                raise asyncio.CancelledError
+            if reached:
+                self._cw_zoom = desired_zoom
+                return
+            if owner is None or attempt == 3:
+                detail = f"，倍率 {desired_zoom:g}×" if check_zoom else ""
+                attempts = f"（已发送 {attempt} 次）"
+                raise ValueError(
+                    f"云台未确认到达 ({target[0]}, {target[1]}){detail}{attempts}；已停止后续镜头和导航"
+                )
 
     async def _run_camera_program(self, run, segment, config, selected) -> None:
         pieces = camera_program(config, config.piece_ids if selected is None else selected)

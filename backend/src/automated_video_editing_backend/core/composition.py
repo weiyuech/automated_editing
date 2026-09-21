@@ -3,12 +3,12 @@
 from typing import Literal
 
 from pydantic import BaseModel, Field
-from automated_video_editing_backend.core.models import CaptureSelection, OutputAspectRatio
+from automated_video_editing_backend.core.models import CaptureSelection, OutputAspectRatio, NarrationStyle
 
 
 class CompositionRequest(BaseModel):
     purpose: Literal["library", "edit"] = "edit"
-    title: str = Field(default="精确拼接", max_length=200)
+    title: str = Field(default="自动剪辑", max_length=200)
     media_ids: list[str] = Field(min_length=1, max_length=20)
     capture_selections: list[CaptureSelection] = Field(default_factory=list, max_length=20)
     music_media_id: str | None = None
@@ -35,6 +35,7 @@ class NarrationBinding(BaseModel):
 
 
 class MappedNarrationRequest(BaseModel):
+    narration_style: NarrationStyle | None = None
     text: str = Field(min_length=1, max_length=4000)
     sections: list[NarrationBinding] = Field(default_factory=list, max_length=100)
     playback_rate: float = Field(default=1.0, ge=0.9, le=1.1)
@@ -54,6 +55,7 @@ class NarrationAdjustRequest(NarrationReviewRequest):
 
 
 class NarrationPromptRequest(BaseModel):
+    narration_style: NarrationStyle | None = None
     text: str = Field(default="", max_length=8000)
     instructions: str = Field(default="", max_length=2000)
     system_prompt: str | None = Field(default=None, min_length=1, max_length=12000)

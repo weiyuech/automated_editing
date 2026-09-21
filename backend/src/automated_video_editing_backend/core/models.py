@@ -7,6 +7,10 @@ from typing import Any, Literal
 from uuid import uuid4
 
 from pydantic import BaseModel, Field, computed_field, field_validator, model_validator
+from automated_video_editing_backend.core.gimbal_limits import (
+    PITCH_MIN, PITCH_MAX, YAW_MIN, YAW_MAX, ZOOM_MIN, ZOOM_MAX,
+    POSE_TOLERANCE_DEG, ZOOM_TOLERANCE,
+)
 
 
 def utc_now() -> datetime:
@@ -149,19 +153,20 @@ class CameraAngle(BaseModel):
 class GimbalMoveRequest(BaseModel):
     """Full 镜头控制 move: yaw/pitch pan from start to end at a speed; zoom from start to end.
 
-    start and end are independent points, each inside the axis' UI range (any direction — 80→-30
-    is fine); the UI ranges sit inside the hardware limits (yaw ±135, pitch -90..25) so an
-    overshoot at the end cannot cross them. Zoom has no speed. The service fixes mode to 1.
+    Endpoints remain inside the configured command limits. Starts may describe physical
+    feedback just outside those limits: ±5 degrees for angles, ±0.05 for zoom. Preserve
+    the measured start rather than clipping it or expanding the destination rectangle.
+    Zoom has no speed. The service fixes mode to 1.
     Direction convention: negative yaw = right, negative pitch = up.
     """
-    yaw_start: float = Field(ge=-90, le=90)
-    yaw_end: float = Field(ge=-90, le=90)
+    yaw_start: float = Field(ge=YAW_MIN - POSE_TOLERANCE_DEG, le=YAW_MAX + POSE_TOLERANCE_DEG)
+    yaw_end: float = Field(ge=YAW_MIN, le=YAW_MAX)
     yaw_speed: float = Field(default=5, ge=2, le=5)
-    pitch_start: float = Field(default=0, ge=-60, le=15)
-    pitch_end: float = Field(default=0, ge=-60, le=15)
+    pitch_start: float = Field(default=0, ge=PITCH_MIN - POSE_TOLERANCE_DEG, le=PITCH_MAX + POSE_TOLERANCE_DEG)
+    pitch_end: float = Field(default=0, ge=PITCH_MIN, le=PITCH_MAX)
     pitch_speed: float = Field(default=5, ge=2, le=5)
-    zoom_start: float = Field(default=1, ge=1, le=3.5)
-    zoom_end: float = Field(default=1, ge=1, le=3.5)
+    zoom_start: float = Field(default=1, ge=ZOOM_MIN - ZOOM_TOLERANCE, le=ZOOM_MAX + ZOOM_TOLERANCE)
+    zoom_end: float = Field(default=1, ge=ZOOM_MIN, le=ZOOM_MAX)
 
 
 class CameraworkProfile(BaseModel):
@@ -769,6 +774,7 @@ class EditTimeline(BaseModel):
 
 
 class MediaAsset(BaseModel):
+    music_labels: list[str] = Field(default_factory=list)
     id: str
     name: str
     path: str
@@ -1015,7 +1021,11 @@ class TTSGenerateRequest(BaseModel):
     target_seconds: float | None = Field(default=None, ge=1, le=600)
 
 
+NarrationStyle = Literal["natural", "professional", "concise", "humorous", "poetic", "classical"]
+
+
 class VoiceoverDraftRequest(BaseModel):
+    narration_style: NarrationStyle | None = None
     text: str = Field(default="", max_length=8000)
     instructions: str = Field(default="", max_length=2000)
     system_prompt: str | None = Field(default=None, min_length=1, max_length=12000)

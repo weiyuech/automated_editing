@@ -355,7 +355,9 @@ def prepare_ffmpeg(platform_key: str, force: bool) -> Path | None:
     if build.get("probe_member"):
         member_names.append(build["probe_member"])
     targets = [target_dir / member_name for member_name in member_names]
-    if all(path.exists() for path in targets) and not force:
+    licenses = target_dir / "licenses"
+    licenses_ready = platform_key != "win64" or (licenses.is_dir() and any(licenses.iterdir()))
+    if all(path.exists() for path in targets) and licenses_ready and not force:
         print(f"  ffmpeg ({platform_key}): present, skipping")
         return target
 
@@ -380,6 +382,17 @@ def prepare_ffmpeg(platform_key: str, force: bool) -> Path | None:
                 if member is None:
                     raise SystemExit(f"{member_name} not found in the archive")
                 member_target.write_bytes(archive.read(member))
+            if platform_key == "win64":
+                license_members = [
+                    name for name in archive.namelist()
+                    if not name.endswith("/")
+                    and Path(name).name.lower().startswith(("license", "copying"))
+                ]
+                if not license_members:
+                    raise SystemExit("Pinned FFmpeg archive has no license text")
+                licenses.mkdir(parents=True, exist_ok=True)
+                for index, name in enumerate(license_members):
+                    (licenses / f"{index}-{Path(name).name}").write_bytes(archive.read(name))
     else:
         import tarfile
 

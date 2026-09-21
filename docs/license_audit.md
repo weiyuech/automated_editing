@@ -1,5 +1,11 @@
 # Licence audit — for commercial distribution to customers
 
+September 21, 2026 release note: the detailed audit below is historical, not a clearance
+for 0.1.12. PyAV/OpenCV/scene detection are now excluded; librosa and its audio dependencies
+are included again. The full Windows package still ships GPL FFmpeg. Its pinned version
+and current dependencies are documented in `THIRD_PARTY_NOTICES.md`. The new interface
+theme uses local CSS only; the color-reference screenshots are not redistributed.
+
 Scope: everything the packaged Windows application would put on a customer's machine. Findings
 come from inspecting the actual binaries — configure strings, exported symbols, bundled shared
 libraries — not from reading package metadata. That distinction turned out to be the whole point;
