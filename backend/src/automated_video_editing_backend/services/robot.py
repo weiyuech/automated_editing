@@ -169,7 +169,8 @@ class HardwareRobotAdapter(RobotAdapter):
         self._gimbal_pose_zoom_revision = 0
         self._gimbal_command_revision = 0
         self._gimbal_terminal_status: str | None = None
-        self._gimbal_terminal_at = 0.0
+        self._gimbal_terminal_pose_revision = 0
+        self._gimbal_terminal_zoom_revision = 0
         self._heartbeat_pose_at = 0.0
         self._heartbeat_zoom_at = 0.0
         # Recording acknowledgements have no request id. Serialize the whole request -> state
@@ -844,10 +845,10 @@ class HardwareRobotAdapter(RobotAdapter):
             reason = "无法确认无编号回包属于当前指令"
         elif self._gimbal_terminal_status != "ok":
             reason = "上一条指令尚未明确完成，或机器人已拒绝指令"
-        elif (self._heartbeat_pose_at <= self._gimbal_terminal_at
+        elif ((self._heartbeat_revision or 0) <= self._gimbal_terminal_pose_revision
               or time.monotonic() - self._heartbeat_pose_at > _GIMBAL_RETRY_FEEDBACK_MAX_AGE_SECONDS):
             reason = "缺少完成回包之后的新鲜角度反馈"
-        elif (self._heartbeat_zoom_at <= self._gimbal_terminal_at
+        elif (self._heartbeat_zoom_revision <= self._gimbal_terminal_zoom_revision
               or time.monotonic() - self._heartbeat_zoom_at > _GIMBAL_RETRY_FEEDBACK_MAX_AGE_SECONDS):
             reason = "缺少完成回包之后的新鲜倍率反馈"
         elif (abs(self._heartbeat_yaw - command["yaw_end"]) <= POSE_TOLERANCE_DEG
@@ -1464,7 +1465,8 @@ class HardwareRobotAdapter(RobotAdapter):
                 self._gimbal_command_revision += 1
                 written_owner = (self._connection_epoch, self._gimbal_command_revision)
                 self._gimbal_terminal_status = None
-                self._gimbal_terminal_at = 0.0
+                self._gimbal_terminal_pose_revision = 0
+                self._gimbal_terminal_zoom_revision = 0
                 # connect() may have replaced the socket and cleared all old physical ownership
                 # while this command was queued. Re-arm the gate at the new socket's exact write
                 # boundary so a following command cannot overtake it.
@@ -1753,7 +1755,10 @@ class HardwareRobotAdapter(RobotAdapter):
                 # future camera control.
                 if self._gimbal_terminal_replies_trusted:
                     self._gimbal_terminal_status = gimbal_status
-                    self._gimbal_terminal_at = time.monotonic()
+                    # Windows clock ticks can be equal for distinct received frames.
+                    # Revisions establish order; monotonic time only bounds sample age.
+                    self._gimbal_terminal_pose_revision = self._heartbeat_revision or 0
+                    self._gimbal_terminal_zoom_revision = self._heartbeat_zoom_revision
                     self._gimbal_inflight = False
                     self._gimbal_release_deadline = 0.0
                     self._gimbal_ready.set()
@@ -2422,7 +2427,8 @@ class HardwareRobotAdapter(RobotAdapter):
         self._gimbal_release_deadline = 0.0
         self._gimbal_terminal_replies_trusted = True
         self._gimbal_terminal_status = None
-        self._gimbal_terminal_at = 0.0
+        self._gimbal_terminal_pose_revision = 0
+        self._gimbal_terminal_zoom_revision = 0
         self._heartbeat_pose_at = 0.0
         self._heartbeat_zoom_at = 0.0
         self._gimbal_pose_target = None

@@ -1066,6 +1066,30 @@ async def test_cruise_corrects_only_failed_pose_up_to_three_writes(tmp_path, mon
 
 
 @pytest.mark.asyncio
+async def test_retry_orders_feedback_even_when_monotonic_clock_does_not_advance(monkeypatch):
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(robot_module, "time", SimpleNamespace(monotonic=lambda: 100.0))
+    adapter = _connected_adapter()
+    sent = []
+
+    class Socket:
+        async def send(self, message):
+            sent.append(json.loads(message)["gimbal_control"])
+
+    adapter._socket = Socket()
+    sample = json.dumps({"gimbal": {"yaw": 2, "pitch": 0, "zoom": 1}})
+    owner = await adapter.send_cruise_gimbal(_gimbal_move(20), context="cruise_fixed_piece")
+    await adapter._handle_message(sample)
+    await adapter._handle_message(json.dumps({"robot_gimbal_control": {"status": "ok"}}))
+    with pytest.raises(ValueError, match="新鲜角度反馈"):
+        adapter._check_gimbal_retry(owner, sent[0])
+    await adapter._handle_message(sample)
+    adapter._check_gimbal_retry(owner, sent[0])
+    assert len(sent) == 1  # Checking eligibility never sends a correction itself.
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("unsafe", ["busy", "fail", "unknown", "no_reply", "ambiguous", "stale", "reconnect"])
 async def test_cruise_does_not_retry_without_definite_completion(tmp_path, monkeypatch, unsafe):
     adapter = _connected_adapter()

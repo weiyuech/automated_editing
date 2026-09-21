@@ -231,5 +231,5 @@ async def test_real_batch_failed_replacement_keeps_previous_binding_and_valid_sk
     assert read_manifest(material.path)["narration_binding_id"] == original_binding
     assert studio.material(record["id"])[1].metadata["bound_voice_id"] == original_voice
     assert Path(studio.media.get(original_voice).path).is_file()
-    persisted = json.loads((narration.batches.directory / f"{result['id']}.json").read_text())
+    persisted = json.loads((narration.batches.directory / f"{result['id']}.json").read_text(encoding="utf-8"))
     assert persisted["status"] == "needs_attention"
