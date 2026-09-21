@@ -51,7 +51,7 @@ async def check_runtime() -> None:
         video = root / "sample.mp4"
         subprocess.run([
             ffmpeg, "-v", "error", "-y", "-f", "lavfi", "-i", "color=s=320x180:d=1:r=10",
-            "-vf", f"subtitles='{_filter_argument(subtitles)}':fontsdir='{_filter_argument(FONT_DIR)}'",
+            "-vf", f"subtitles={_filter_argument(subtitles)}:fontsdir={_filter_argument(FONT_DIR)}",
             "-c:v", "libx264", "-threads", "2", "-pix_fmt", "yuv420p", str(video),
         ], check=True, timeout=45, capture_output=True)
         probe = subprocess.run([

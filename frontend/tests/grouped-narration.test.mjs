@@ -46,7 +46,7 @@ test('batch snapshot cannot synthesize a stale or unreviewed draft', () => {
 })
 
 const code = readFileSync(new URL('../src/renderer/src/use-grouped-narration.js', import.meta.url), 'utf8')
-  .replace(/^import .*\n/gm, '').replace('export function useGroupedNarration', 'function useGroupedNarration') + '\nreturn useGroupedNarration'
+  .replace(/^import .*\r?\n/gm, '').replace('export function useGroupedNarration', 'function useGroupedNarration') + '\nreturn useGroupedNarration'
 function harness(api) {
   const deps = { computed, reactive, ref, watch, groupCompositions, savedCompositions,
     narrationRequest, draftIdentity, batchNarrationItem, needsNarrationInstructions,
