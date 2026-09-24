@@ -1,0 +1,101 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>云台 busy 行为验证</title>
+<style>
+:root{font:15px/1.5 system-ui,-apple-system,"PingFang SC",sans-serif;color:#26233e;background:#f7f5ff}*{box-sizing:border-box}body{margin:0;padding:26px}main{max-width:1080px;margin:auto}h1{font-size:26px;margin:0 0 4px}h2{font-size:16px;margin:0 0 14px}p{margin:5px 0 14px}.muted{color:#696582}.lead{max-width:850px}.grid{display:grid;grid-template-columns:1.1fr .9fr;gap:16px}.card{background:#fff;border:1px solid #ded8fa;border-radius:16px;padding:20px;margin:16px 0;box-shadow:0 8px 28px #3b238009}.fields{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}.field{display:flex;flex-direction:column;gap:5px;color:#55516e;font-size:13px}input,select,button{font:inherit}input,select{width:100%;padding:9px 11px;border:1px solid #cbc4e9;border-radius:9px;background:#fff;color:#27243d}input:focus,select:focus{outline:2px solid #aaa1ef}.row{display:flex;gap:9px;align-items:center;flex-wrap:wrap}button{padding:9px 14px;border:1px solid #c6bfea;border-radius:9px;background:#fff;color:#302b55;cursor:pointer}button.primary{background:linear-gradient(105deg,#765bd3,#aa8ce5);color:#fff;border-color:#765bd3}button:disabled{opacity:.44;cursor:not-allowed}.pill{display:inline-block;padding:5px 10px;border-radius:99px;background:#eeeafd;color:#4a3c8b;font-size:13px}.value{font-variant-numeric:tabular-nums;font-size:20px;font-weight:700}.metrics{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}.metric{border:1px solid #e8e3fa;border-radius:10px;padding:11px;background:#faf9ff}.metric span{display:block;color:#77718e;font-size:12px}.status{padding:13px;border-radius:10px;background:#f0ecff;border:1px solid #ded6ff;min-height:52px}.warn{background:#fff5e8;border-color:#f3d6a5}.good{background:#eaf9f0;border-color:#b9e7c9}.bad{background:#fff0f1;border-color:#edc5cc}.timeline{max-height:380px;overflow:auto;border:1px solid #e7e1f6;border-radius:10px;background:#fcfbff}.event{display:grid;grid-template-columns:90px 100px 1fr;gap:9px;padding:8px 11px;border-bottom:1px solid #eee9fb;font-size:13px;word-break:break-word}.event:last-child{border:0}.event b{color:#5544a0}.event code{font:12px/1.4 ui-monospace,SFMono-Regular,monospace}.full{grid-column:1/-1}.hint{font-size:12px;color:#756e8a}label.check{display:flex;align-items:center;gap:7px;font-size:13px}.check input{width:auto}canvas{display:block;width:100%;height:210px;border:1px solid #e9e3f8;border-radius:10px;background:#fcfbff}@media(max-width:760px){body{padding:12px}.grid{display:block}.fields{grid-template-columns:repeat(2,minmax(0,1fr))}.event{grid-template-columns:75px 75px 1fr}}
+</style>
+</head>
+<body><main>
+<h1>云台 busy 行为验证</h1>
+<p class="lead muted">先观察心跳，再做一次受控的“转动 → 变焦”试验。页面不会自动重发；如果第二条收到 busy，继续观察实际倍率，判断它是被执行、排队，还是在观察窗口内没有执行。</p>
+<div class="grid">
+<section class="card"><h2>1 · 连接与试验目标</h2>
+<div class="row"><input id="url" aria-label="机器人 WebSocket 地址" placeholder="ws://机器人地址:端口/路径" style="flex:1;min-width:230px"><button id="connect" class="primary">连接</button><button id="disconnect" disabled>断开</button></div>
+<p class="hint">请先退出其他机器人控制程序，避免多个连接同时发指令。本页不控制底盘、不录制。</p>
+<div class="fields"><label class="field">第一条：目标水平角（°）<input id="yawTarget" type="number" min="-90" max="90" step="0.1" value="0"></label><label class="field">第一条：目标俯仰角（°）<input id="pitchTarget" type="number" min="-60" max="15" step="0.1" value="0"></label><label class="field">第二条：目标倍率（×）<input id="zoomTarget" type="number" min="1" max="3.5" step="0.1" value="2"></label><label class="field">水平/俯仰速度（°/秒）<input id="speed" type="number" min="2" max="5" step="0.1" value="5"></label><label class="field">第二条发送时机<select id="trigger"><option value="grace">首次进入目标 ±5°（复现问题）</option><option value="settled">进入 ±5° 且连续心跳停稳</option><option value="manual">手动发送第二条</option></select></label><label class="field">观察窗口（秒）<input id="window" type="number" min="10" max="120" step="1" value="30"></label></div>
+<p class="hint">角度与倍率起点取发送瞬间的新鲜心跳，不拿上一条目标值代替。第一条需要从当前位置移动至少 10°，第二条倍率需与当前值相差至少 0.3×。</p>
+<div class="row"><button id="start" class="primary" disabled>发送第一条并启动试验</button><button id="second" disabled>现在发送第二条</button><button id="finish" disabled>结束观察</button></div>
+<p class="hint">自动发送只发生一次。建议先用“首次进入目标 ±5°”复现 busy，再重新试一次“连续心跳停稳”，对比两个结果。所有发送均需您主动点击“启动试验”。</p>
+</section>
+<section class="card"><h2>实时心跳与判读</h2><div class="metrics"><div class="metric"><span>水平角</span><strong class="value" id="yaw">—</strong></div><div class="metric"><span>俯仰角</span><strong class="value" id="pitch">—</strong></div><div class="metric"><span>倍率</span><strong class="value" id="zoom">—</strong></div></div>
+<p><span class="pill" id="connection">未连接</span> <span class="pill" id="heartbeat">等待心跳</span></p><p class="status" id="readiness">需要 3 个新鲜心跳，且角度变化不超过 0.5°、倍率变化不超过 0.03×，才视为停稳候选。</p><p class="status" id="verdict">尚未试验。</p><p class="hint">“未执行”只能表述为“观察窗口内未见执行”；没有指令 ID 的回复无法可靠对应某次发送。最终以发送后的物理心跳变化为准。</p></section>
+<section class="card full"><h2>2 · 发送、回复与实测时间线</h2><canvas id="chart" aria-label="水平角与倍率时间线"></canvas><p class="hint">紫线：水平角；蓝线：倍率。竖线：第二条发送。原始数值和回复见下方。</p><div class="row"><button id="export" disabled>下载 JSON 记录</button><button id="clear">清空记录</button></div><div class="timeline" id="events" aria-live="polite"></div></section>
+</div></main>
+<script>
+(()=>{'use strict';
+const $=id=>document.getElementById(id), now=()=>performance.now(), safeNumber=value=>{if(value===null||value===undefined||value==='')return null;const n=Number(value);return Number.isFinite(n)?n:null};
+let ws=null, samples=[], events=[], trial=null, deadlineTimer=null, lastHeartbeatLogged=0;
+let fields={yaw:null,pitch:null,zoom:null}, fieldAt={yaw:0,pitch:0,zoom:0};
+let pendingYaw=false,pendingPitch=false;
+function timeLabel(t){return new Date(t).toLocaleTimeString('zh-CN',{hour12:false})+'.'+String(t%1000).padStart(3,'0')}
+function log(type,data){const e={at:Date.now(),type,data};events.push(e);const row=document.createElement('div');row.className='event';const a=document.createElement('span');a.textContent=timeLabel(e.at);const b=document.createElement('b');b.textContent=type;const c=document.createElement('code');c.textContent=typeof data==='string'?data:JSON.stringify(data);row.append(a,b,c);$('events').append(row);$('events').scrollTop=$('events').scrollHeight;$('export').disabled=false;draw()}
+function setVerdict(text,kind=''){$('verdict').textContent=text;$('verdict').className='status '+kind}
+function socketReady(){return ws&&ws.readyState===WebSocket.OPEN}
+function latest(){return samples.at(-1)}
+function fresh(){const s=latest();return s&&now()-s.mono<4000?s:null}
+function near(s,y,p){return Math.abs(s.yaw-y)<=5&&Math.abs(s.pitch-p)<=5}
+function settled(){const a=samples.slice(-3);if(a.length<3||now()-a[2].mono>4000||a[2].mono-a[0].mono>10000)return false;return a.every((s,i)=>i===0||(Math.abs(s.yaw-a[i-1].yaw)<=.5&&Math.abs(s.pitch-a[i-1].pitch)<=.5&&Math.abs(s.zoom-a[i-1].zoom)<=.03))}
+function readinessReason(open,s){
+  if(!open)return '请先连接机器人。';
+  const missing=['yaw','pitch','zoom'].filter(k=>fields[k]===null);
+  if(missing.length)return `已连接，但尚未收到 ${missing.join(' / ')} 心跳字段。变焦试验必须有倍率反馈。`;
+  const stale=['yaw','pitch','zoom'].filter(k=>now()-fieldAt[k]>4000);
+  if(stale.length)return `已连接，但 ${stale.join(' / ')} 反馈超过 4 秒；请检查心跳是否持续。`;
+  if(!s)return '已连接，等待新的完整角度与倍率样本。';
+  if(samples.length<3)return `已收到 ${samples.length}/3 组有效样本；再等 ${3-samples.length} 组。`;
+  if(!settled())return '收到有效心跳，但最近三组还未停稳（角度变化需 ≤0.5°，倍率变化需 ≤0.03×）。';
+  if(trial)return '本轮试验已启动；要重新试验，请先结束并清空记录。';
+  return '心跳新鲜且停稳，可以启动试验。';
+}
+function refresh(){
+  const s=fresh(),open=socketReady(),reason=readinessReason(open,s);
+  $('connection').textContent=open?'已连接':'未连接';
+  $('heartbeat').textContent=s?'心跳新鲜':'心跳过期/缺失';
+  for(const k of ['yaw','pitch','zoom'])$(''+k).textContent=s?s[k].toFixed(k==='zoom'?2:1)+(k==='zoom'?'×':'°'):'—';
+  $('start').disabled=!(open&&s&&settled()&&!trial);
+  $('start').title=$('start').disabled?reason:'';
+  $('second').disabled=!(open&&s&&trial&&!trial.second&&!trial.ended);
+  $('finish').disabled=!(trial&&!trial.ended);
+  if(trial&&!trial.second&&!trial.ended){
+    $('readiness').textContent=`第二条发送门槛：接近第一目标 ${near(s||{yaw:Infinity,pitch:Infinity},trial.first.yaw_end,trial.first.pitch_end)?'是':'否'}；连续心跳停稳 ${settled()?'是':'否'}。`;
+  }else $('readiness').textContent=reason;
+}
+function command(targetYaw,targetPitch,targetZoom){const s=fresh();if(!s)throw Error('没有 4 秒内的完整心跳');const speed=safeNumber($('speed').value);if(speed===null||speed<2||speed>5)throw Error('速度需为 2–5°/秒');if(targetYaw<-90||targetYaw>90||targetPitch<-60||targetPitch>15||targetZoom<1||targetZoom>3.5)throw Error('目标超出机器人允许范围');return{gimbal_control:{mode:1,yaw_start:+s.yaw.toFixed(1),yaw_speed:speed,yaw_end:targetYaw,pitch_start:+s.pitch.toFixed(1),pitch_speed:speed,pitch_end:targetPitch,zoom_start:+s.zoom.toFixed(2),zoom_speed:0,zoom_end:targetZoom}}}
+function send(payload,label){if(!socketReady())throw Error('WebSocket 未连接');ws.send(JSON.stringify(payload));log('发送 '+label,payload);return payload.gimbal_control}
+function end(reason){if(!trial||trial.ended)return;trial.ended=true;clearTimeout(deadlineTimer);log('观察结束',reason);classify();refresh()}
+function classify(){if(!trial||!trial.second)return;const after=samples.filter(s=>s.mono>=trial.secondAt);const moved=after.some(s=>Math.abs(s.zoom-trial.second.zoom_start)>=.1);const reached=after.some(s=>Math.abs(s.zoom-trial.second.zoom_end)<=.1);const busy=trial.busyReplies>0;if(reached)setVerdict(`${busy?'收到 busy，但':'第二条发送后'}心跳显示倍率已到目标：第二条确实执行。无法仅凭这些数据判断 busy 是否对应第二条。`,'good');else if(moved)setVerdict('第二条发送后倍率发生变化，但尚未到目标；继续观察可区分延迟执行与中途停止。','warn');else if(trial.ended)setVerdict(`观察窗口内倍率未离开 ${trial.second.zoom_start.toFixed(2)}×${busy?'，且收到 busy':''}。这与“第二条被忽略”一致，但不能排除更晚执行；请查看时间线并可延长窗口复测。`,'warn');else setVerdict(`第二条已发送，${busy?'收到 busy；':'尚无 busy；'}正在观察倍率是否变化。`,'warn')}
+function sendSecond(source){if(!trial||trial.second||trial.ended)return;try{const z=trial.targetZoom;const cmd=command(trial.first.yaw_end,trial.first.pitch_end,z);trial.second=send(cmd,'第二条 · '+source);trial.secondAt=now();trial.secondWallAt=Date.now();trial.phase='observing';const seconds=Number($('window').value);deadlineTimer=setTimeout(()=>end('观察窗口到期'),seconds*1000);classify();refresh()}catch(err){log('第二条未发送',err.message);setVerdict(err.message,'bad')}}
+function onSample(g){
+  const stamp=now();
+  for(const k of ['yaw','pitch','zoom']){
+    if(!Object.prototype.hasOwnProperty.call(g,k))continue;
+    const value=safeNumber(g[k]);
+    if(value===null)continue;
+    fields[k]=value;fieldAt[k]=stamp;
+    if(k==='yaw')pendingYaw=true;
+    if(k==='pitch')pendingPitch=true;
+  }
+  if(!pendingYaw||!pendingPitch||fields.zoom===null||stamp-fieldAt.zoom>4000){refresh();return}
+  pendingYaw=false;pendingPitch=false;
+  const {yaw,pitch,zoom}=fields;
+  const s={mono:stamp,at:Date.now(),yaw,pitch,zoom};
+  samples.push(s);if(samples.length>1000)samples.shift();
+  if(stamp-lastHeartbeatLogged>250){log('心跳',{yaw,pitch,zoom,mode:g.mode??null});lastHeartbeatLogged=stamp}
+  if(trial&&!trial.second&&!trial.ended){
+    const matched=near(s,trial.first.yaw_end,trial.first.pitch_end),mode=$('trigger').value;
+    if(mode==='grace'&&matched)sendSecond('首次进入 ±5°');
+    if(mode==='settled'&&matched&&settled())sendSecond('心跳停稳');
+  }
+  if(trial&&trial.second)classify();
+  refresh();
+}
+function connect(){const url=$('url').value.trim();if(!/^wss?:\/\//i.test(url)){setVerdict('请输入 ws:// 或 wss:// 地址。','bad');return}if(ws)ws.close();samples=[];fields={yaw:null,pitch:null,zoom:null};fieldAt={yaw:0,pitch:0,zoom:0};pendingYaw=false;pendingPitch=false;ws=new WebSocket(url);$('connect').disabled=true;ws.onopen=()=>{log('连接','WebSocket 已连接');$('disconnect').disabled=false;refresh()};ws.onerror=()=>{log('连接错误','WebSocket 错误；检查地址与网络');setVerdict('连接失败或中断。','bad')};ws.onclose=()=>{log('断开','WebSocket 已关闭');$('connect').disabled=false;$('disconnect').disabled=true;if(trial&&!trial.ended)end('连接中断');refresh()};ws.onmessage=async event=>{let raw=event.data;try{if(raw instanceof Blob)raw=await raw.text();else if(raw instanceof ArrayBuffer)raw=new TextDecoder().decode(raw);const obj=JSON.parse(raw);if(obj.gimbal)onSample(obj.gimbal);const reply=obj.robot_gimbal_control;if(reply){log('云台回复',reply);if(trial&&trial.second&&String(reply.status||'').toLowerCase()==='busy')trial.busyReplies++;if(trial&&trial.second)classify()}}catch(err){log('无法解析',String(err))}}}
+function start(){try{const s=fresh();if(!s||!settled())throw Error('请先等至少 3 个停稳的完整心跳');const y=safeNumber($('yawTarget').value),p=safeNumber($('pitchTarget').value),z=safeNumber($('zoomTarget').value);if(y===null||p===null||z===null)throw Error('请填写三个目标');if(Math.max(Math.abs(y-s.yaw),Math.abs(p-s.pitch))<10)throw Error('第一条至少移动 10°，才能观察边界时序');if(Math.abs(z-s.zoom)<.3)throw Error('第二条倍率需与当前值至少相差 0.3×');const cmd=command(y,p,s.zoom);const seconds=Number($('window').value);if(!Number.isInteger(seconds)||seconds<10||seconds>120)throw Error('观察窗口需为 10–120 秒');if(!confirm(`机器人将从实测 ${s.yaw.toFixed(1)}°/${s.pitch.toFixed(1)}° 移至 ${y}°/${p}°，之后一次性发送 ${z}× 变焦。确认启动？`))return;trial={first:null,second:null,secondAt:0,ended:false,busyReplies:0,targetZoom:z};trial.first=send(cmd,'第一条');setVerdict('第一条已发送；等待您选定的第二条触发时机。','warn');refresh()}catch(err){setVerdict(err.message,'bad')}}
+function draw(){const canvas=$('chart'),dpr=window.devicePixelRatio||1,w=canvas.clientWidth,h=canvas.clientHeight;if(!w||!h)return;canvas.width=Math.round(w*dpr);canvas.height=Math.round(h*dpr);const c=canvas.getContext('2d');c.scale(dpr,dpr);c.clearRect(0,0,w,h);const list=samples.slice(-160);if(list.length<2)return;const t0=list[0].mono,t1=list.at(-1).mono,range=Math.max(1,t1-t0),x=s=>30+(s.mono-t0)/range*(w-46);c.strokeStyle='#ebe5f8';for(let i=0;i<5;i++){const y=15+i*(h-30)/4;c.beginPath();c.moveTo(30,y);c.lineTo(w-15,y);c.stroke()}const line=(color,fn,min,max)=>{c.strokeStyle=color;c.lineWidth=2;c.beginPath();list.forEach((s,i)=>{const yy=h-15-(fn(s)-min)/(max-min)*(h-30);i?c.lineTo(x(s),yy):c.moveTo(x(s),yy)});c.stroke()};line('#765bd3',s=>s.yaw,-90,90);line('#348ec7',s=>s.zoom,1,3.5);if(trial&&trial.secondAt>=t0&&trial.secondAt<=t1){const xx=30+(trial.secondAt-t0)/range*(w-46);c.strokeStyle='#cc5d77';c.setLineDash([5,4]);c.beginPath();c.moveTo(xx,10);c.lineTo(xx,h-10);c.stroke();c.setLineDash([])}}
+$('connect').onclick=connect;$('disconnect').onclick=()=>{if(ws)ws.close()};$('start').onclick=start;$('second').onclick=()=>sendSecond('手动');$('finish').onclick=()=>end('用户结束观察');$('clear').onclick=()=>{if(trial&&!trial.ended){setVerdict('请先结束当前试验。','warn');return}events=[];samples=[];trial=null;$('events').replaceChildren();$('export').disabled=true;setVerdict('记录已清空。');refresh();draw()};$('export').onclick=()=>{const payload={description:'gimbal busy probe; reply has no command ID',events,samples:samples.map(({mono,...rest})=>rest),trial:trial?{first:trial.first,second:trial.second,secondWallAt:trial.secondWallAt,busyReplies:trial.busyReplies,ended:trial.ended}:null};const blob=new Blob([JSON.stringify(payload,null,2)],{type:'application/json'}),url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download='gimbal-busy-probe-'+Date.now()+'.json';a.click();setTimeout(()=>URL.revokeObjectURL(url),1000)};window.addEventListener('resize',draw);setInterval(refresh,500);refresh();
+})();
+</script>
+</body></html>

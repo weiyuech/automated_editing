@@ -508,6 +508,7 @@ async def test_fixed_program_continues_after_pose_arrival_with_ambiguous_ok(
 
     adapter._socket = Socket()
     await pose(0, 0)
+    await pose(0, 0)  # Two stable heartbeats are required before the first command.
     events = EventHub()
     service = CruiseService(
         events, RobotService(events, adapter=adapter),
@@ -562,6 +563,8 @@ async def test_fixed_pose_gate_requires_fresh_both_axes_and_ignores_late_ok(monk
     await pose(yaw=85, pitch=5)
     assert not adapter._gimbal_ready.is_set()
     await pose(yaw=89.3, pitch=0.1)
+    assert not adapter._gimbal_ready.is_set()  # Inside ±5°, but still moving.
+    await pose(yaw=89.4, pitch=0.2)
     assert adapter._gimbal_ready.is_set()
 
     await adapter.set_gimbal(_gimbal_move(-90), context="cruise_fixed_piece")
@@ -604,6 +607,7 @@ async def test_zoom_pieces_wait_for_actual_zoom_and_restore_custom_base(
         await adapter._handle_message(json.dumps({"gimbal": gimbal}))
         await asyncio.sleep(0.005)
 
+    await sample(actual_base)
     await sample(actual_base)
     service._cw_zoom = base
     for start, end, actual_end in [(actual_base, target, actual_target), (actual_target, base, actual_base)]:
@@ -837,10 +841,12 @@ async def test_real_websocket_cruise_times_out_bare_done_but_stops_and_saves_onc
                         "record_status": "idle",
                         "yaw": 0,
                         "pitch": 0,
+                        "zoom": 1,
                         "mode": 1,
                     },
                 }
             )
+            await send_pose(0, 0)
             async for raw in connection:
                 payload = json.loads(raw)
                 commands.append(payload)
@@ -884,10 +890,11 @@ async def test_real_websocket_cruise_times_out_bare_done_but_stops_and_saves_onc
                 elif "gimbal_control" in payload:
                     if gimbal_busy:
                         premature_gimbal_commands.append(payload)
+                        await send({"robot_gimbal_control": {"status": "busy"}})
+                        gimbal_replies.append("busy")
+                        continue
                     gimbal_busy = True
                     target = payload["gimbal_control"]
-                    await send({"robot_gimbal_control": {"status": "busy"}})
-                    gimbal_replies.append("busy")
                     spawn_reply(
                         finish_gimbal(float(target["yaw_end"]), float(target["pitch_end"]), float(target["zoom_end"]))
                     )
@@ -1024,9 +1031,7 @@ async def test_real_websocket_cruise_times_out_bare_done_but_stops_and_saves_onc
     assert sum(payload.get("video_record", {}).get("stop") == 0 for payload in commands) == 1
     assert sum("set_switch_map" in payload for payload in commands) == manual_switch_count == 1
     assert premature_gimbal_commands == []
-    assert gimbal_replies and gimbal_replies == [
-        status for _ in range(len(gimbal_replies) // 2) for status in ("busy", "ok")
-    ]
+    assert gimbal_replies and set(gimbal_replies) == {"ok"}
     assert downloads == [media_url]
     assert run.media_local_path is not None
     assert (tmp_path / "cruise-e2e.mp4").is_file()
@@ -1034,9 +1039,8 @@ async def test_real_websocket_cruise_times_out_bare_done_but_stops_and_saves_onc
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("succeeds_on", [1, 2, 3, None])
-async def test_cruise_corrects_only_failed_pose_up_to_three_writes(tmp_path, monkeypatch, succeeds_on):
-    """A completed-but-inaccurate move is retried inside the same shot, from actual pose."""
+@pytest.mark.parametrize("reached", [True, False])
+async def test_cruise_sends_only_once_even_if_pose_is_unconfirmed(tmp_path, monkeypatch, reached):
     adapter = _connected_adapter()
     sent = []
 
@@ -1053,22 +1057,59 @@ async def test_cruise_corrects_only_failed_pose_up_to_three_writes(tmp_path, mon
         await adapter._handle_message(json.dumps({"gimbal": {"yaw": yaw, "pitch": 0, "zoom": 1}}))
 
     await pose(0)
+    await pose(0)
 
     async def finish_attempt(*args, **kwargs):
         await adapter._handle_message(json.dumps({"robot_gimbal_control": {"status": "ok"}}))
-        reached = len(sent) == succeeds_on
-        await pose(20 if reached else len(sent) * 2)
+        await pose(20 if reached else 2)
         return reached, True
 
     monkeypatch.setattr(service, "_await_camerawork_pose", finish_attempt)
-    if succeeds_on is None:
-        with pytest.raises(ValueError, match="已发送 3 次"):
+    if not reached:
+        with pytest.raises(ValueError, match="已发送 1 次"):
             await service._move_to_pose((20, 0), CameraworkConfig())
     else:
         await service._move_to_pose((20, 0), CameraworkConfig())
-    assert len(sent) == (succeeds_on or 3)
-    assert [c["yaw_start"] for c in sent] == [0, 2, 4][:len(sent)]
+    assert len(sent) == 1
+    assert [c["yaw_start"] for c in sent] == [0]
     assert {c["yaw_end"] for c in sent} == {20}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("accepted_attempt", [2, 4, None])
+async def test_cruise_resends_busy_without_waiting_for_another_heartbeat(
+    tmp_path, monkeypatch, accepted_attempt,
+):
+    adapter = _connected_adapter()
+    sent = []
+
+    class Socket:
+        async def send(self, message):
+            sent.append(json.loads(message)["gimbal_control"])
+
+    adapter._socket = Socket()
+    events = EventHub()
+    service = CruiseService(events, RobotService(events, adapter=adapter),
+                            CaptureService(events, path=tmp_path / "capture.json"))
+    initial = json.dumps({"gimbal": {"yaw": 0, "pitch": 0, "zoom": 1}})
+    await adapter._handle_message(initial)
+    await adapter._handle_message(initial)
+
+    async def feedback(*args, **kwargs):
+        if len(sent) != accepted_attempt:
+            await adapter._handle_message(json.dumps({"robot_gimbal_control": {"status": "busy"}}))
+            return False, False
+        await adapter._handle_message(json.dumps({"gimbal": {"yaw": 20, "pitch": 0, "zoom": 1}}))
+        return True, True
+
+    monkeypatch.setattr(service, "_await_camerawork_pose", feedback)
+    if accepted_attempt is None:
+        with pytest.raises(ValueError, match="3 次补发"):
+            await service._move_to_pose((20, 0), CameraworkConfig())
+    else:
+        await service._move_to_pose((20, 0), CameraworkConfig())
+    assert len(sent) == (accepted_attempt or 4)
+    assert all(command["yaw_start"] == 0 for command in sent)
 
 
 @pytest.mark.asyncio
@@ -1096,7 +1137,7 @@ async def test_retry_orders_feedback_even_when_monotonic_clock_does_not_advance(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("unsafe", ["busy", "fail", "unknown", "no_reply", "ambiguous", "stale", "reconnect"])
+@pytest.mark.parametrize("unsafe", ["fail", "unknown", "no_reply", "ambiguous", "stale", "reconnect"])
 async def test_cruise_does_not_retry_without_definite_completion(tmp_path, monkeypatch, unsafe):
     adapter = _connected_adapter()
     sent = []
@@ -1110,6 +1151,7 @@ async def test_cruise_does_not_retry_without_definite_completion(tmp_path, monke
     service = CruiseService(events, RobotService(events, adapter=adapter),
                             CaptureService(events, path=tmp_path / "capture.json"))
     sample = json.dumps({"gimbal": {"yaw": 0, "pitch": 0, "zoom": 1}})
+    await adapter._handle_message(sample)
     await adapter._handle_message(sample)
 
     async def timed_out(*args, **kwargs):
@@ -1127,7 +1169,7 @@ async def test_cruise_does_not_retry_without_definite_completion(tmp_path, monke
         return False, True
 
     monkeypatch.setattr(service, "_await_camerawork_pose", timed_out)
-    with pytest.raises(ValueError, match="未补发"):
+    with pytest.raises(ValueError, match="已发送 1 次"):
         await service._move_to_pose((20, 0), CameraworkConfig())
     assert len(sent) == 1
 

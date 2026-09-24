@@ -25,6 +25,7 @@ from automated_video_editing_backend.services.robot import RobotCommandNotSentEr
 
 from automated_video_editing_backend.core.gimbal_limits import (
     POSE_STABLE_SAMPLES as _CW_POSE_STABLE_SAMPLES,
+    POSE_SETTLED_DELTA_DEG as _CW_POSE_SETTLED_DELTA_DEG,
     POSE_TOLERANCE_DEG as _CW_POSE_TOLERANCE_DEG,
     ZOOM_TOLERANCE,
 )
@@ -556,14 +557,10 @@ class CruiseService:
         self, target: tuple[float, float], config: CameraworkConfig,
         *, target_zoom: float | None = None,
     ) -> None:
-        """Confirm the physical target; retry only with adapter-proven completion.
-
-        All attempts belong to this same shot. A timeout alone never permits another
-        write: the adapter requires a trusted terminal reply and fresh hardware samples.
-        """
-        owner = None
+        """Check heartbeat readiness before sending; retry a busy rejection three times."""
         desired_zoom = config.anchor_zoom if target_zoom is None else target_zoom
-        for attempt in range(1, 4):  # Initial command plus at most two corrective attempts.
+        await self._wait_gimbal_settled()
+        for attempt in range(1, 5):
             if self._cancel.is_set():
                 raise asyncio.CancelledError
             yaw, pitch = self.robot.heartbeat_yaw(), self._heartbeat_pitch()
@@ -582,15 +579,13 @@ class CruiseService:
             )
             context = "cruise_fixed_zoom" if check_zoom else "cruise_fixed_piece"
             sender = getattr(self.robot, "send_cruise_gimbal", None)
+            owner = None
             if sender is None:
                 await asyncio.wait_for(self.robot.set_gimbal(command, context=context), timeout=10)
             else:
                 owner = await asyncio.wait_for(
-                    sender(command, context=context, retry_owner=owner, cancelled=self._cancel.is_set), timeout=10,
+                    sender(command, context=context, cancelled=self._cancel.is_set), timeout=10,
                 )
-            if attempt > 1:
-                log_event("warning", "cruise.gimbal.corrective_attempt", attempt=attempt,
-                          target_yaw=target[0], target_pitch=target[1], target_zoom=desired_zoom)
             revision = self._heartbeat_revision()
             zoom_revision = self._zoom_revision()
             budget = max(abs(target[0] - yaw), abs(target[1] - pitch)) / speed + 8.0
@@ -599,19 +594,35 @@ class CruiseService:
             reached, _ = await self._await_camerawork_pose(
                 *target, budget, after_revision=revision,
                 target_zoom=desired_zoom if check_zoom else None,
-                after_zoom_revision=zoom_revision,
+                after_zoom_revision=zoom_revision, busy_owner=owner,
             )
             if self._cancel.is_set():
                 raise asyncio.CancelledError
             if reached:
                 self._cw_zoom = desired_zoom
                 return
-            if owner is None or attempt == 3:
+            busy = getattr(self.robot, "gimbal_busy_seen", None)
+            if owner is None or not callable(busy) or not busy(owner):
                 detail = f"，倍率 {desired_zoom:g}×" if check_zoom else ""
-                attempts = f"（已发送 {attempt} 次）"
                 raise ValueError(
-                    f"云台未确认到达 ({target[0]}, {target[1]}){detail}{attempts}；已停止后续镜头和导航"
+                    f"云台未确认到达 ({target[0]}, {target[1]}){detail}（已发送 {attempt} 次）；已停止后续镜头和导航"
                 )
+            log_event("warning", "cruise.gimbal.busy_ignored", attempt=attempt,
+                      target_yaw=target[0], target_pitch=target[1], target_zoom=desired_zoom)
+        raise ValueError("机器人连续 4 次拒绝云台指令（含 3 次补发）；已停止后续镜头和导航")
+
+    async def _wait_gimbal_settled(self) -> None:
+        reader = getattr(self.robot, "gimbal_stable_now", None)
+        if not callable(reader):
+            return
+        deadline = time.monotonic() + 12.0
+        while time.monotonic() < deadline:
+            if self._cancel.is_set():
+                raise asyncio.CancelledError
+            if reader():
+                return
+            await asyncio.sleep(_CW_POSE_POLL_SECONDS)
+        raise ValueError("云台心跳未确认停稳，未发送下一条指令；请检查角度与倍率反馈")
 
     async def _run_camera_program(self, run, segment, config, selected) -> None:
         pieces = camera_program(config, config.piece_ids if selected is None else selected)
@@ -675,15 +686,20 @@ class CruiseService:
         after_revision: int | None = None,
         target_zoom: float | None = None,
         after_zoom_revision: int = 0,
+        busy_owner: tuple[int, int] | None = None,
     ) -> tuple[bool, bool]:
         """Require two distinct, post-command physical samples; expiry is never success."""
         deadline = time.monotonic() + max(0.0, budget)
         stable = 0
+        previous_near_pose = None
         observed = False
         last_revision = after_revision
         last_zoom_revision = after_zoom_revision
         while time.monotonic() < deadline:
             if self._cancel.is_set():
+                return False, observed
+            busy = getattr(self.robot, "gimbal_busy_seen", None)
+            if busy_owner is not None and callable(busy) and busy(busy_owner):
                 return False, observed
             yaw = self.robot.heartbeat_yaw()
             pitch = self._heartbeat_pitch()
@@ -709,11 +725,17 @@ class CruiseService:
                     and abs(pitch - target_pitch) <= _CW_POSE_TOLERANCE_DEG
                     and zoom_matches
                 ):
-                    stable += 1
+                    settled = previous_near_pose is not None and all(
+                        abs(current - previous) <= _CW_POSE_SETTLED_DELTA_DEG
+                        for current, previous in zip((yaw, pitch), previous_near_pose)
+                    )
+                    stable = stable + 1 if settled else 1
+                    previous_near_pose = (yaw, pitch)
                     if stable >= _CW_POSE_STABLE_SAMPLES:
                         return True, True
                 else:
                     stable = 0
+                    previous_near_pose = None
             await asyncio.sleep(min(_CW_POSE_POLL_SECONDS, max(0.0, deadline - time.monotonic())))
         return False, observed
 

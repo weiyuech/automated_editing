@@ -4,6 +4,7 @@ import asyncio
 import json
 import time
 from abc import ABC, abstractmethod
+from collections import deque
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from copy import deepcopy
@@ -36,6 +37,7 @@ from automated_video_editing_backend.services.media_download import (
 )
 from automated_video_editing_backend.core.gimbal_limits import (
     POSE_STABLE_SAMPLES,
+    POSE_SETTLED_DELTA_DEG,
     POSE_TOLERANCE_DEG,
     ZOOM_TOLERANCE,
 )
@@ -166,9 +168,12 @@ class HardwareRobotAdapter(RobotAdapter):
         self._gimbal_terminal_replies_trusted = True
         self._gimbal_pose_target: tuple[float, float, float | None] | None = None
         self._gimbal_pose_samples = 0
+        self._gimbal_last_near_pose: tuple[float, float] | None = None
         self._gimbal_pose_zoom_revision = 0
         self._gimbal_command_revision = 0
+        self._gimbal_context: str | None = None
         self._gimbal_terminal_status: str | None = None
+        self._gimbal_busy_owner: tuple[int, int] | None = None
         self._gimbal_terminal_pose_revision = 0
         self._gimbal_terminal_zoom_revision = 0
         self._heartbeat_pose_at = 0.0
@@ -202,6 +207,7 @@ class HardwareRobotAdapter(RobotAdapter):
         self._heartbeat_zoom: float | None = None
         self._heartbeat_zoom_revision = 0
         self._heartbeat_revision: int | None = None
+        self._gimbal_pose_history: deque[tuple[int, float, float, float, float]] = deque(maxlen=2)
         self._heartbeat_yaw_pending = False
         self._heartbeat_pitch_pending = False
         self._pending_goal_attempt: GoalCommandAttemptDiagnostic | None = None
@@ -606,6 +612,28 @@ class HardwareRobotAdapter(RobotAdapter):
 
     def heartbeat_zoom_revision(self) -> int:
         return self._heartbeat_zoom_revision
+
+    def gimbal_busy_seen(self, owner: tuple[int, int]) -> bool:
+        """A busy reply belongs to the current socket write, as far as the id-less protocol allows."""
+        return self._gimbal_busy_owner == owner
+
+    def gimbal_stable_now(self, *, after_revision: int | None = None) -> bool:
+        """Use two fresh physical poses, not the ±5° framing grace, as command readiness."""
+        history = list(self._gimbal_pose_history)
+        if len(history) != 2 or not self.state.connected:
+            return False
+        if after_revision is not None and history[0][0] <= after_revision:
+            return False
+        if time.monotonic() - history[-1][1] > 3.0 or history[-1][1] - history[0][1] > 4.0:
+            return False
+        if time.monotonic() - self._heartbeat_zoom_at > 3.0:
+            return False
+        return all(
+            abs(current[2] - previous[2]) <= POSE_SETTLED_DELTA_DEG
+            and abs(current[3] - previous[3]) <= POSE_SETTLED_DELTA_DEG
+            and abs(current[4] - previous[4]) <= 0.03
+            for previous, current in zip(history, history[1:])
+        )
 
     def complete_map_heartbeat(self) -> RobotHeartbeatDiagnostic | None:
         """Newest coherent map-readiness report from one raw hardware frame."""
@@ -1441,6 +1469,7 @@ class HardwareRobotAdapter(RobotAdapter):
                 self._gimbal_release_deadline = 0.0
                 self._gimbal_pose_target = None
                 self._gimbal_pose_samples = 0
+                self._gimbal_last_near_pose = None
             write_started = False
             written_owner: tuple[int, int] | None = None
 
@@ -1463,8 +1492,10 @@ class HardwareRobotAdapter(RobotAdapter):
                         command[f"{axis}_start"] = _gimbal_num(getattr(validated, f"{axis}_start"))
                 write_started = True
                 self._gimbal_command_revision += 1
+                self._gimbal_context = context
                 written_owner = (self._connection_epoch, self._gimbal_command_revision)
                 self._gimbal_terminal_status = None
+                self._gimbal_busy_owner = None
                 self._gimbal_terminal_pose_revision = 0
                 self._gimbal_terminal_zoom_revision = 0
                 # connect() may have replaced the socket and cleared all old physical ownership
@@ -1481,6 +1512,7 @@ class HardwareRobotAdapter(RobotAdapter):
                 # Zoom changes also require fresh zoom feedback; position alone is insufficient.
                 command = payload["gimbal_control"]
                 self._gimbal_pose_samples = 0
+                self._gimbal_last_near_pose = None
                 self._gimbal_pose_zoom_revision = self._heartbeat_zoom_revision
                 self._gimbal_pose_target = (
                     (command["yaw_end"], command["pitch_end"],
@@ -1509,6 +1541,7 @@ class HardwareRobotAdapter(RobotAdapter):
                     self._gimbal_release_deadline = 0.0
                     self._gimbal_pose_target = None
                     self._gimbal_pose_samples = 0
+                    self._gimbal_last_near_pose = None
                     self._gimbal_ready.set()
                 raise
 
@@ -1522,6 +1555,7 @@ class HardwareRobotAdapter(RobotAdapter):
             for value, desired in zip((self._heartbeat_yaw, self._heartbeat_pitch), target[:2])
         ):
             self._gimbal_pose_samples = 0
+            self._gimbal_last_near_pose = None
             return
         if target[2] is not None:
             if self._heartbeat_zoom_revision <= self._gimbal_pose_zoom_revision:
@@ -1529,8 +1563,15 @@ class HardwareRobotAdapter(RobotAdapter):
             self._gimbal_pose_zoom_revision = self._heartbeat_zoom_revision
             if self._heartbeat_zoom is None or not abs(self._heartbeat_zoom - target[2]) <= ZOOM_TOLERANCE:
                 self._gimbal_pose_samples = 0
+                self._gimbal_last_near_pose = None
                 return
-        self._gimbal_pose_samples += 1
+        current_pose = (self._heartbeat_yaw, self._heartbeat_pitch)
+        settled = self._gimbal_last_near_pose is not None and all(
+            abs(current - previous) <= POSE_SETTLED_DELTA_DEG
+            for current, previous in zip(current_pose, self._gimbal_last_near_pose)
+        )
+        self._gimbal_pose_samples = self._gimbal_pose_samples + 1 if settled else 1
+        self._gimbal_last_near_pose = current_pose
         if self._gimbal_pose_samples < POSE_STABLE_SAMPLES:
             return
         # The id-less OK may still arrive later. Never let it release the next leg;
@@ -1741,14 +1782,23 @@ class HardwareRobotAdapter(RobotAdapter):
 
         gimbal_reply = payload.get("robot_gimbal_control")
         if isinstance(gimbal_reply, dict):
-            gimbal_status = str(gimbal_reply.get("status") or "").strip().casefold()
-            if gimbal_status == "busy":
+            if str(gimbal_reply.get("status") or "").strip().casefold() == "busy":
                 self._gimbal_terminal_status = "busy"
         if isinstance(gimbal_reply, dict) and self._gimbal_inflight:
             gimbal_status = str(gimbal_reply.get("status") or "").strip().casefold()
             if gimbal_status == "busy":
                 self._gimbal_terminal_status = "busy"
-                self._gimbal_ready.clear()
+                if self._gimbal_context in {"cruise_fixed_piece", "cruise_fixed_zoom"}:
+                    self._gimbal_busy_owner = (self._connection_epoch, self._gimbal_command_revision)
+                    # This firmware rejects a cruise write while its prior motion is busy.
+                    # Wait for new settled telemetry, then resend from the measured pose.
+                    self._gimbal_terminal_replies_trusted = False
+                    self._gimbal_inflight = False
+                    self._gimbal_pose_target = None
+                    self._gimbal_release_deadline = 0.0
+                    self._gimbal_ready.set()
+                else:
+                    self._gimbal_ready.clear()
             elif gimbal_status:
                 # Both success and rejection are terminal for command serialization.  The reply
                 # is still logged above; freeing the gate prevents one failure from wedging all
@@ -2302,6 +2352,11 @@ class HardwareRobotAdapter(RobotAdapter):
                 self._heartbeat_pose_at = time.monotonic()
                 self._heartbeat_yaw_pending = False
                 self._heartbeat_pitch_pending = False
+                if self._heartbeat_zoom is not None:
+                    self._gimbal_pose_history.append((
+                        self._heartbeat_revision, self._heartbeat_pose_at,
+                        self._heartbeat_yaw, self._heartbeat_pitch, self._heartbeat_zoom,
+                    ))
                 self._observe_gimbal_pose_completion()
             if self._heartbeat_yaw is not None:
                 self.state.camera_angle = self._heartbeat_yaw
@@ -2427,13 +2482,17 @@ class HardwareRobotAdapter(RobotAdapter):
         self._gimbal_release_deadline = 0.0
         self._gimbal_terminal_replies_trusted = True
         self._gimbal_terminal_status = None
+        self._gimbal_context = None
+        self._gimbal_busy_owner = None
         self._gimbal_terminal_pose_revision = 0
         self._gimbal_terminal_zoom_revision = 0
         self._heartbeat_pose_at = 0.0
         self._heartbeat_zoom_at = 0.0
         self._gimbal_pose_target = None
         self._gimbal_pose_samples = 0
+        self._gimbal_last_near_pose = None
         self._gimbal_pose_zoom_revision = 0
+        self._gimbal_pose_history.clear()
         self._gimbal_ready.set()
         self._recording_heartbeat_guard = None
         self._reset_recording_heartbeat_conflict()
@@ -3027,6 +3086,14 @@ class RobotService:
     def heartbeat_revision(self) -> int | None:
         reader = getattr(self.adapter, "heartbeat_revision", None)
         return reader() if callable(reader) else None
+
+    def gimbal_busy_seen(self, owner: tuple[int, int]) -> bool:
+        reader = getattr(self.adapter, "gimbal_busy_seen", None)
+        return bool(reader(owner)) if callable(reader) else False
+
+    def gimbal_stable_now(self, *, after_revision: int | None = None) -> bool:
+        reader = getattr(self.adapter, "gimbal_stable_now", None)
+        return bool(reader(after_revision=after_revision)) if callable(reader) else True
 
     def recording_status_known(self) -> bool:
         reader = getattr(self.adapter, "recording_status_known", None)

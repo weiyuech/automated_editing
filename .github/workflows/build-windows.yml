@@ -20,6 +20,8 @@ jobs:
     name: Package Windows x64
     runs-on: windows-latest
     timeout-minutes: 60
+    permissions:
+      contents: write
     defaults:
       run:
         shell: bash
@@ -152,6 +154,18 @@ jobs:
           if-no-files-found: error
           compression-level: 0
           retention-days: 14
+
+      - name: Publish public Windows installer
+        if: github.ref == 'refs/heads/codex/precise-composition-tts-20260918'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create v0.1.13 \
+            release/Automated-Video-Editing-0.1.13-Windows-x64-Setup.exe \
+            release/SHA256SUMS.txt \
+            --target "$GITHUB_SHA" \
+            --title "自动视频剪辑 0.1.13" \
+            --notes "完整 Windows 安装包，包含运行所需的后端、媒体工具、字体和本地模型。"
 
   package-external-media-tools:
     name: Package Windows x64 — external media tools

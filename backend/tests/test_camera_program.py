@@ -215,6 +215,26 @@ async def test_all_targets_allow_five_degrees_per_axis(
 
 
 @pytest.mark.asyncio
+async def test_pose_inside_grace_must_stop_moving_before_next_command(tmp_path, monkeypatch):
+    robot = Robot()
+    readings = iter([(8, 0), (4, 0), (0.5, 0), (0.3, 0)])
+    robot.revision = 0
+    original_sleep = asyncio.sleep
+
+    async def next_sample(_):
+        robot.pose = next(readings)
+        robot.revision += 1
+        await original_sleep(0)
+
+    service = CruiseService(EventHub(), robot, CaptureService(EventHub(), path=tmp_path / "capture.json"))
+    monkeypatch.setattr("automated_video_editing_backend.services.cruise._CW_POSE_POLL_SECONDS", 0.001)
+    monkeypatch.setattr("automated_video_editing_backend.services.cruise.asyncio.sleep", next_sample)
+    reached, observed = await service._await_camerawork_pose(0, 0, 0.1, after_revision=0)
+    assert (reached, observed) == (True, True)
+    assert robot.revision == 4  # 4° and 0.5° were close enough, but still in motion.
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("mode", [4, 8])
 async def test_full_program_keeps_order_without_extra_preparation_within_pose_grace(
     tmp_path, monkeypatch, mode
