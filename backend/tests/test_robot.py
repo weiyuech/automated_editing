@@ -4343,7 +4343,10 @@ def test_partial_heartbeat_preserves_each_physical_axis_and_movement_state():
     zoom_frame = adapter.state.diagnostics.last_heartbeat
     assert zoom_frame is not None
     assert zoom_frame.zoom == 1.5
-    assert zoom_frame.zoom_received_at != first.zoom_received_at
+    # Consecutive packets can share a timestamp on Windows. Sequence/revision is the
+    # authoritative freshness signal; the diagnostic timestamp must only be monotonic.
+    assert zoom_frame.sequence > first.sequence
+    assert zoom_frame.zoom_received_at >= first.zoom_received_at
     assert adapter.heartbeat_revision() == 2
 
     # Recording-only gimbal beats and partial task beats update diagnostics without inventing

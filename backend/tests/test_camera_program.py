@@ -237,7 +237,9 @@ async def test_all_targets_allow_five_degrees_per_axis(
         after_revision=0,
         target_zoom=1,
         after_zoom_revision=0,
-        monitor_failsafe_seconds=0.03,
+        # Windows' default asyncio timer granularity can be about 15.6 ms. Give the
+        # three-heartbeat stability window enough wall-clock time on every runner.
+        monitor_failsafe_seconds=0.25,
     )
     assert (reached, observed) == (expected, True)
     assert samples >= 3
