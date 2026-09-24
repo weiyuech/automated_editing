@@ -8,7 +8,8 @@ ZOOM_MIN = 1.0
 ZOOM_MAX = 3.5
 
 POSE_TOLERANCE_DEG = 5.0
-POSE_STABLE_SAMPLES = 2
+POSE_STABLE_SAMPLES = 3
 # The tolerance is a final framing allowance, not proof that a sweep has stopped.
-POSE_SETTLED_DELTA_DEG = 1.0
+POSE_SETTLED_DELTA_DEG = 0.5
 ZOOM_TOLERANCE = 0.05
+ZOOM_SETTLED_DELTA = 0.03

@@ -39,6 +39,7 @@ from automated_video_editing_backend.core.gimbal_limits import (
     POSE_STABLE_SAMPLES,
     POSE_SETTLED_DELTA_DEG,
     POSE_TOLERANCE_DEG,
+    ZOOM_SETTLED_DELTA,
     ZOOM_TOLERANCE,
 )
 
@@ -207,7 +208,9 @@ class HardwareRobotAdapter(RobotAdapter):
         self._heartbeat_zoom: float | None = None
         self._heartbeat_zoom_revision = 0
         self._heartbeat_revision: int | None = None
-        self._gimbal_pose_history: deque[tuple[int, float, float, float, float]] = deque(maxlen=2)
+        self._gimbal_pose_history: deque[tuple[int, float, float, float, float]] = deque(
+            maxlen=POSE_STABLE_SAMPLES
+        )
         self._heartbeat_yaw_pending = False
         self._heartbeat_pitch_pending = False
         self._pending_goal_attempt: GoalCommandAttemptDiagnostic | None = None
@@ -618,9 +621,9 @@ class HardwareRobotAdapter(RobotAdapter):
         return self._gimbal_busy_owner == owner
 
     def gimbal_stable_now(self, *, after_revision: int | None = None) -> bool:
-        """Use two fresh physical poses, not the ±5° framing grace, as command readiness."""
+        """Use three fresh physical poses, not framing tolerance, as command readiness."""
         history = list(self._gimbal_pose_history)
-        if len(history) != 2 or not self.state.connected:
+        if len(history) != POSE_STABLE_SAMPLES or not self.state.connected:
             return False
         if after_revision is not None and history[0][0] <= after_revision:
             return False
@@ -628,11 +631,13 @@ class HardwareRobotAdapter(RobotAdapter):
             return False
         if time.monotonic() - self._heartbeat_zoom_at > 3.0:
             return False
-        return all(
-            abs(current[2] - previous[2]) <= POSE_SETTLED_DELTA_DEG
-            and abs(current[3] - previous[3]) <= POSE_SETTLED_DELTA_DEG
-            and abs(current[4] - previous[4]) <= 0.03
-            for previous, current in zip(history, history[1:])
+        return (
+            max(sample[2] for sample in history) - min(sample[2] for sample in history)
+            <= POSE_SETTLED_DELTA_DEG
+            and max(sample[3] for sample in history) - min(sample[3] for sample in history)
+            <= POSE_SETTLED_DELTA_DEG
+            and max(sample[4] for sample in history) - min(sample[4] for sample in history)
+            <= ZOOM_SETTLED_DELTA
         )
 
     def complete_map_heartbeat(self) -> RobotHeartbeatDiagnostic | None:
@@ -2367,6 +2372,8 @@ class HardwareRobotAdapter(RobotAdapter):
             yaw_received_at = previous.yaw_received_at if previous else None
             pitch = previous.pitch if previous else None
             pitch_received_at = previous.pitch_received_at if previous else None
+            zoom = previous.zoom if previous else None
+            zoom_received_at = previous.zoom_received_at if previous else None
             gimbal_mode = previous.gimbal_mode if previous else None
             task_goal_status = previous.task_goal_status if previous else None
             task_goal_status_received_at = (
@@ -2423,12 +2430,16 @@ class HardwareRobotAdapter(RobotAdapter):
             if gimbal:
                 heartbeat_yaw = _maybe_float(gimbal.get("yaw")) if "yaw" in gimbal else None
                 heartbeat_pitch = _maybe_float(gimbal.get("pitch")) if "pitch" in gimbal else None
+                heartbeat_zoom = _maybe_float(gimbal.get("zoom")) if "zoom" in gimbal else None
                 if heartbeat_yaw is not None:
                     yaw = heartbeat_yaw
                     yaw_received_at = heartbeat_received_at
                 if heartbeat_pitch is not None:
                     pitch = heartbeat_pitch
                     pitch_received_at = heartbeat_received_at
+                if heartbeat_zoom is not None:
+                    zoom = heartbeat_zoom
+                    zoom_received_at = heartbeat_received_at
                 if "mode" in gimbal and gimbal.get("mode") is not None:
                     raw_mode = gimbal.get("mode")
                     gimbal_mode = raw_mode if isinstance(raw_mode, (int, str)) else str(raw_mode)
@@ -2439,6 +2450,8 @@ class HardwareRobotAdapter(RobotAdapter):
                 yaw_received_at=yaw_received_at,
                 pitch=pitch,
                 pitch_received_at=pitch_received_at,
+                zoom=zoom,
+                zoom_received_at=zoom_received_at,
                 gimbal_mode=gimbal_mode,
                 task_goal_status=task_goal_status,
                 task_goal_status_received_at=task_goal_status_received_at,

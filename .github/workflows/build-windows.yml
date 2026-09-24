@@ -160,12 +160,12 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create v0.1.13 \
-            release/Automated-Video-Editing-0.1.13-Windows-x64-Setup.exe \
+          gh release create v0.1.14 \
+            release/Automated-Video-Editing-0.1.14-Windows-x64-Setup.exe \
             release/SHA256SUMS.txt \
             --target "$GITHUB_SHA" \
-            --title "自动视频剪辑 0.1.13" \
-            --notes "完整 Windows 安装包，包含运行所需的后端、媒体工具、字体和本地模型。"
+            --title "自动视频剪辑 0.1.14" \
+            --notes "完整 Windows 安装包，包含运行所需的后端、媒体工具、字体和本地模型。本版新增基于云台心跳时间序列的停稳判断、可配置角度与倍率容差，以及有界 busy 补发。"
 
   package-external-media-tools:
     name: Package Windows x64 — external media tools

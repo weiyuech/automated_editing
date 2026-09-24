@@ -77,6 +77,8 @@ class RobotHeartbeatDiagnostic(BaseModel):
     yaw_received_at: datetime | None = None
     pitch: float | None = None
     pitch_received_at: datetime | None = None
+    zoom: float | None = None
+    zoom_received_at: datetime | None = None
     gimbal_mode: int | str | None = None
     task_goal_status: str | None = None
     task_goal_status_received_at: datetime | None = None
@@ -182,6 +184,8 @@ class CameraworkProfile(BaseModel):
     pitch_max: int = Field(default=15, ge=-60, le=15)
     # The robot firmware expects whole-number yaw/pitch speeds on the wire.
     speed_max: int = Field(default=5, ge=2, le=5)
+    angle_tolerance_degrees: float = Field(default=5.0, ge=0.1, le=30.0)
+    zoom_tolerance: float = Field(default=0.1, ge=0.01, le=1.5)
 
     point_mode: Literal[4, 8] = 4
     piece_ids: list[str] | None = Field(default=None, max_length=12)

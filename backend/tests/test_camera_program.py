@@ -1,4 +1,5 @@
 import asyncio
+from types import SimpleNamespace
 
 import pytest
 
@@ -12,6 +13,7 @@ from automated_video_editing_backend.core.models import (
 )
 from automated_video_editing_backend.services.camera_program import camera_program
 from automated_video_editing_backend.services.capture import CaptureService
+from automated_video_editing_backend.services import cruise as cruise_module
 from automated_video_editing_backend.services.cruise import CruiseService
 
 
@@ -57,6 +59,7 @@ def test_custom_zoom_profile_round_trip_and_limits():
 class Robot:
     def __init__(self):
         self.pose = (0, 0)
+        self.zoom = 1.0
         self.revision = 0
         self.goals = []
 
@@ -67,6 +70,12 @@ class Robot:
         return self.pose[1]
 
     def heartbeat_revision(self):
+        return self.revision
+
+    def heartbeat_zoom(self):
+        return self.zoom
+
+    def heartbeat_zoom_revision(self):
         return self.revision
 
     async def set_goal(self, command):
@@ -106,6 +115,8 @@ async def test_next_chassis_goal_waits_for_entire_selected_camera_program(tmp_pa
             entered.set()
             await release.wait()
         robot.pose = target
+        if target_zoom is not None:
+            robot.zoom = target_zoom
 
     monkeypatch.setattr(cruise, "_move_to_pose", move)
     task = asyncio.create_task(cruise._execute(request, run, CameraworkConfig(configured=True)))
@@ -143,6 +154,8 @@ async def test_unconfirmed_shot_blocks_next_navigation_and_still_finalizes_sessi
     )
 
     async def fail(target, config, *, target_zoom=None):
+        if target_zoom is not None:
+            robot.zoom = target_zoom
         if target != (0, 0):
             raise ValueError("缺少到位反馈")
 
@@ -163,7 +176,15 @@ async def test_cached_pose_and_elapsed_time_cannot_confirm_a_move(tmp_path, monk
     service = CruiseService(
         EventHub(), robot, CaptureService(EventHub(), path=tmp_path / "capture.json")
     )
-    reached, observed = await service._await_camerawork_pose(target_yaw, 0, 0.03, after_revision=7)
+    reached, observed = await service._await_camerawork_pose(
+        target_yaw,
+        0,
+        0,
+        after_revision=7,
+        target_zoom=1,
+        after_zoom_revision=7,
+        monitor_failsafe_seconds=0.03,
+    )
     assert (reached, observed) == (False, False)
     robot.pose = (0, 0)
 
@@ -200,6 +221,7 @@ async def test_all_targets_allow_five_degrees_per_axis(
     def fresh_revision():
         nonlocal samples
         samples += 1
+        robot.revision = samples
         return samples
 
     monkeypatch.setattr(robot, "heartbeat_revision", fresh_revision)
@@ -209,15 +231,22 @@ async def test_all_targets_allow_five_degrees_per_axis(
     service = CruiseService(
         EventHub(), robot, CaptureService(EventHub(), path=tmp_path / "capture.json")
     )
-    reached, observed = await service._await_camerawork_pose(*target, 0.03, after_revision=0)
+    reached, observed = await service._await_camerawork_pose(
+        *target,
+        0,
+        after_revision=0,
+        target_zoom=1,
+        after_zoom_revision=0,
+        monitor_failsafe_seconds=0.03,
+    )
     assert (reached, observed) == (expected, True)
-    assert samples >= 2
+    assert samples >= 3
 
 
 @pytest.mark.asyncio
 async def test_pose_inside_grace_must_stop_moving_before_next_command(tmp_path, monkeypatch):
     robot = Robot()
-    readings = iter([(8, 0), (4, 0), (0.5, 0), (0.3, 0)])
+    readings = iter([(8, 0), (4, 0), (0.5, 0), (0.3, 0), (0.2, 0)])
     robot.revision = 0
     original_sleep = asyncio.sleep
 
@@ -229,9 +258,160 @@ async def test_pose_inside_grace_must_stop_moving_before_next_command(tmp_path, 
     service = CruiseService(EventHub(), robot, CaptureService(EventHub(), path=tmp_path / "capture.json"))
     monkeypatch.setattr("automated_video_editing_backend.services.cruise._CW_POSE_POLL_SECONDS", 0.001)
     monkeypatch.setattr("automated_video_editing_backend.services.cruise.asyncio.sleep", next_sample)
-    reached, observed = await service._await_camerawork_pose(0, 0, 0.1, after_revision=0)
+    reached, observed = await service._await_camerawork_pose(
+        0,
+        0,
+        0,
+        after_revision=0,
+        target_zoom=1,
+        after_zoom_revision=0,
+        monitor_failsafe_seconds=0.1,
+    )
     assert (reached, observed) == (True, True)
-    assert robot.revision == 4  # 4° and 0.5° were close enough, but still in motion.
+    assert robot.revision == 5  # Being inside tolerance was insufficient until three stable samples.
+
+
+@pytest.mark.asyncio
+async def test_stability_samples_begin_only_after_angle_estimate(tmp_path, monkeypatch):
+    robot = Robot()
+    clock = 0.0
+
+    async def advance(delay):
+        nonlocal clock
+        clock += max(delay, 0.2)
+        robot.revision += 1
+
+    monkeypatch.setattr(cruise_module, "time", SimpleNamespace(monotonic=lambda: clock))
+    monkeypatch.setattr(cruise_module.asyncio, "sleep", advance)
+    service = CruiseService(
+        EventHub(), robot, CaptureService(EventHub(), path=tmp_path / "capture.json")
+    )
+    reached, observed = await service._await_camerawork_pose(
+        0,
+        0,
+        1.0,
+        after_revision=0,
+        target_zoom=1,
+        after_zoom_revision=0,
+        monitor_failsafe_seconds=2,
+    )
+    assert (reached, observed) == (True, True)
+    # Five samples arrived before 1.0 s. They were observed but none was allowed
+    # into the three-sample completion window.
+    assert clock >= 1.4
+    assert robot.revision >= 7
+
+
+@pytest.mark.asyncio
+async def test_settled_outside_tolerance_gets_three_seconds_then_reports_differences(
+    tmp_path, monkeypatch
+):
+    robot = Robot()
+    robot.pose = (20, -8)
+    robot.zoom = 1.4
+    clock = 0.0
+
+    async def advance(delay):
+        nonlocal clock
+        clock += max(delay, 0.5)
+        robot.revision += 1
+
+    monkeypatch.setattr(cruise_module, "time", SimpleNamespace(monotonic=lambda: clock))
+    monkeypatch.setattr(cruise_module.asyncio, "sleep", advance)
+    service = CruiseService(
+        EventHub(), robot, CaptureService(EventHub(), path=tmp_path / "capture.json")
+    )
+    with pytest.raises(ValueError, match=r"水平 20.00°.*俯仰 8.00°.*倍率 0.40×.*第 1 轮观察结束"):
+        await service._await_camerawork_pose(
+            0,
+            0,
+            0,
+            after_revision=0,
+            target_zoom=1,
+            after_zoom_revision=0,
+            angle_tolerance=5,
+            zoom_tolerance=0.1,
+            monitor_failsafe_seconds=10,
+        )
+    assert clock >= 4.0
+
+
+@pytest.mark.asyncio
+async def test_motion_during_extra_observation_can_settle_inside_custom_tolerances(
+    tmp_path, monkeypatch
+):
+    robot = Robot()
+    samples = iter([
+        (10, 0, 1.3), (10, 0, 1.3), (10, 0, 1.3),
+        (7, 0, 1.2), (3.8, 0, 1.09), (3.7, 0, 1.08), (3.6, 0, 1.07),
+    ])
+    clock = 0.0
+
+    async def advance(delay):
+        nonlocal clock
+        clock += max(delay, 0.2)
+        yaw, pitch, zoom = next(samples)
+        robot.pose = (yaw, pitch)
+        robot.zoom = zoom
+        robot.revision += 1
+
+    monkeypatch.setattr(cruise_module, "time", SimpleNamespace(monotonic=lambda: clock))
+    monkeypatch.setattr(cruise_module.asyncio, "sleep", advance)
+    service = CruiseService(
+        EventHub(), robot, CaptureService(EventHub(), path=tmp_path / "capture.json")
+    )
+    reached, observed = await service._await_camerawork_pose(
+        0,
+        0,
+        0,
+        after_revision=0,
+        target_zoom=1,
+        after_zoom_revision=0,
+        angle_tolerance=4,
+        zoom_tolerance=0.1,
+        monitor_failsafe_seconds=10,
+    )
+    assert (reached, observed) == (True, True)
+    assert robot.pose == (3.6, 0)
+    assert robot.zoom == 1.07
+
+
+@pytest.mark.asyncio
+async def test_moving_outside_tolerance_gets_at_most_three_observation_windows(
+    tmp_path, monkeypatch
+):
+    robot = Robot()
+    clock = 0.0
+    yaw = 10.0
+
+    async def advance(delay):
+        nonlocal clock, yaw
+        clock += max(delay, 0.5)
+        # Open the first window with a settled miss, then keep moving enough that
+        # every later three-sample range is above the internal stability limit.
+        if robot.revision >= 3:
+            yaw += 1
+        robot.pose = (yaw, 0)
+        robot.revision += 1
+
+    monkeypatch.setattr(cruise_module, "time", SimpleNamespace(monotonic=lambda: clock))
+    monkeypatch.setattr(cruise_module.asyncio, "sleep", advance)
+    service = CruiseService(
+        EventHub(), robot, CaptureService(EventHub(), path=tmp_path / "capture.json")
+    )
+    with pytest.raises(ValueError, match="连续 3 轮观察仍未停稳"):
+        await service._await_camerawork_pose(
+            0,
+            0,
+            0,
+            after_revision=0,
+            target_zoom=1,
+            after_zoom_revision=0,
+            angle_tolerance=5,
+            zoom_tolerance=0.1,
+            monitor_failsafe_seconds=20,
+        )
+    assert clock >= 10.5
 
 
 @pytest.mark.asyncio
@@ -254,6 +434,8 @@ async def test_full_program_keeps_order_without_extra_preparation_within_pose_gr
     async def move(target, config, *, target_zoom=None):
         targets.append(target)
         robot.pose = (target[0] - 5, target[1] + 5)
+        if target_zoom is not None:
+            robot.zoom = target_zoom
 
     monkeypatch.setattr(service, "_move_to_pose", move)
     await service._run_camera_program(run, segment, config, None)

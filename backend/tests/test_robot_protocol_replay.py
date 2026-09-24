@@ -508,12 +508,21 @@ async def test_fixed_program_continues_after_pose_arrival_with_ambiguous_ok(
 
     adapter._socket = Socket()
     await pose(0, 0)
-    await pose(0, 0)  # Two stable heartbeats are required before the first command.
+    await pose(0, 0)
+    await pose(0, 0)  # Three stable heartbeats are required before the first command.
     events = EventHub()
     service = CruiseService(
         events, RobotService(events, adapter=adapter),
         CaptureService(events, path=tmp_path / "capture.json"),
     )
+
+    async def await_replayed_feedback(*args, **kwargs):
+        # This integration test covers transport ownership and ambiguous terminal replies;
+        # the estimate/stability state machine has its own deterministic tests.
+        await asyncio.sleep(0.03)
+        return True, True
+
+    monkeypatch.setattr(service, "_await_camerawork_pose", await_replayed_feedback)
     config = CameraworkConfig(point_mode=mode, yaw_min=-90, yaw_max=90, pitch_min=-60, pitch_max=15)
     segment = CruiseSegment(index=0, path_name="route", goal_id=1)
     try:
@@ -565,6 +574,8 @@ async def test_fixed_pose_gate_requires_fresh_both_axes_and_ignores_late_ok(monk
     await pose(yaw=89.3, pitch=0.1)
     assert not adapter._gimbal_ready.is_set()  # Inside ±5°, but still moving.
     await pose(yaw=89.4, pitch=0.2)
+    assert not adapter._gimbal_ready.is_set()
+    await pose(yaw=89.5, pitch=0.2)
     assert adapter._gimbal_ready.is_set()
 
     await adapter.set_gimbal(_gimbal_move(-90), context="cruise_fixed_piece")
@@ -574,6 +585,8 @@ async def test_fixed_pose_gate_requires_fresh_both_axes_and_ignores_late_ok(monk
     assert not adapter._gimbal_ready.is_set()
     await pose(yaw=-88, pitch=0)
     await pose(yaw=-89, pitch=0)
+    await pose(yaw=-89.1, pitch=0)
+    await pose(yaw=-89.2, pitch=0)
     assert adapter._gimbal_ready.is_set()
     adapter._clear_heartbeat_diagnostics()
     assert adapter._gimbal_pose_target is None
@@ -609,6 +622,7 @@ async def test_zoom_pieces_wait_for_actual_zoom_and_restore_custom_base(
 
     await sample(actual_base)
     await sample(actual_base)
+    await sample(actual_base)
     service._cw_zoom = base
     for start, end, actual_end in [(actual_base, target, actual_target), (actual_target, base, actual_base)]:
         move = asyncio.create_task(service._move_to_pose((0, 0), config, target_zoom=end))
@@ -623,6 +637,7 @@ async def test_zoom_pieces_wait_for_actual_zoom_and_restore_custom_base(
             assert not move.done() and not adapter._gimbal_ready.is_set()
             await sample(actual_end)
             assert not move.done()
+            await sample(actual_end)
             await sample(actual_end)
             await asyncio.wait_for(move, 0.5)
             assert adapter._gimbal_ready.is_set()
@@ -772,12 +787,11 @@ async def test_real_websocket_cruise_times_out_bare_done_but_stops_and_saves_onc
             await send({"robot_gimbal_control": {"status": "ok"}})
             gimbal_replies.append("ok")
             gimbal_busy = False
-            # Two separately received samples exercise the same physical-pose confirmation used
+            # Three separately received samples exercise the same physical-pose confirmation used
             # in production.  They intentionally arrive after the command write boundary.
-            await asyncio.sleep(0.008)
-            await send_pose(yaw, pitch, zoom)
-            await asyncio.sleep(0.008)
-            await send_pose(yaw, pitch, zoom)
+            for _ in range(3):
+                await asyncio.sleep(0.008)
+                await send_pose(yaw, pitch, zoom)
 
         async def finish_goal(goal_id: int) -> None:
             nonlocal bare_done_count
@@ -846,6 +860,7 @@ async def test_real_websocket_cruise_times_out_bare_done_but_stops_and_saves_onc
                     },
                 }
             )
+            await send_pose(0, 0)
             await send_pose(0, 0)
             async for raw in connection:
                 payload = json.loads(raw)
@@ -980,6 +995,14 @@ async def test_real_websocket_cruise_times_out_bare_done_but_stops_and_saves_onc
             anchor_dwell_seconds=0.5,
         )
         cruise = CruiseService(events, robot, capture, lambda: config)
+
+        async def await_replayed_feedback(*args, **kwargs):
+            # Angle-estimate behavior is covered by deterministic unit tests. This replay
+            # isolates full websocket ownership, recording, navigation, and finalization.
+            await asyncio.sleep(0.05)
+            return True, True
+
+        monkeypatch.setattr(cruise, "_await_camerawork_pose", await_replayed_feedback)
         cruise._point_dwell_baseline_seconds = 0.005
         request = CruiseRequest(
             title="real websocket replay",
@@ -1058,6 +1081,7 @@ async def test_cruise_sends_only_once_even_if_pose_is_unconfirmed(tmp_path, monk
 
     await pose(0)
     await pose(0)
+    await pose(0)
 
     async def finish_attempt(*args, **kwargs):
         await adapter._handle_message(json.dumps({"robot_gimbal_control": {"status": "ok"}}))
@@ -1092,6 +1116,7 @@ async def test_cruise_resends_busy_without_waiting_for_another_heartbeat(
     service = CruiseService(events, RobotService(events, adapter=adapter),
                             CaptureService(events, path=tmp_path / "capture.json"))
     initial = json.dumps({"gimbal": {"yaw": 0, "pitch": 0, "zoom": 1}})
+    await adapter._handle_message(initial)
     await adapter._handle_message(initial)
     await adapter._handle_message(initial)
 
@@ -1151,6 +1176,7 @@ async def test_cruise_does_not_retry_without_definite_completion(tmp_path, monke
     service = CruiseService(events, RobotService(events, adapter=adapter),
                             CaptureService(events, path=tmp_path / "capture.json"))
     sample = json.dumps({"gimbal": {"yaw": 0, "pitch": 0, "zoom": 1}})
+    await adapter._handle_message(sample)
     await adapter._handle_message(sample)
     await adapter._handle_message(sample)
 

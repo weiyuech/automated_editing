@@ -1,7 +1,7 @@
 export const DEFAULT_CAMERAWORK_PROFILE = Object.freeze({
   anchor_yaw: 0, anchor_pitch: 0, anchor_zoom: 1, zoom_target: 2,
   yaw_min: -60, yaw_max: 60, pitch_min: -15, pitch_max: 15,
-  speed_max: 5,
+  speed_max: 5, angle_tolerance_degrees: 5, zoom_tolerance: 0.1,
   point_mode: 4, piece_ids: null
 })
 export function normalizeCameraworkProfile(saved = {}) {
@@ -19,5 +19,7 @@ export function cameraworkProfileWarning(form) {
   if (!(form.zoom_target >= 1 && form.zoom_target <= 3.5)) return '缩放倍率必须在 1~3.5 内。'
   if (form.zoom_target === form.anchor_zoom) return '缩放倍率需与基础倍率不同。'
   if (!(form.speed_max >= 2 && form.speed_max <= 5)) return '速度必须在 2~5°/秒内。'
+  if (!(form.angle_tolerance_degrees >= 0.1 && form.angle_tolerance_degrees <= 30)) return '可接受角度偏差必须在 0.1°~30° 内。'
+  if (!(form.zoom_tolerance >= 0.01 && form.zoom_tolerance <= 1.5)) return '可接受倍率偏差必须在 0.01~1.5 倍内。'
   return ''
 }

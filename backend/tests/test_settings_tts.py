@@ -222,6 +222,8 @@ def test_camerawork_profile_is_unconfigured_until_saved_and_persists_absolute_li
         zoom_max=1.8,
         speed_min=2,
         speed_max=4,
+        angle_tolerance_degrees=7.5,
+        zoom_tolerance=0.08,
         anchor_time_percent=35,
         anchor_dwell_seconds=8.5,
     )
@@ -260,6 +262,8 @@ def test_legacy_camerawork_settings_migrate_to_fixed_origin_and_program(tmp_path
     assert loaded.anchor_yaw == 0
     assert loaded.anchor_pitch == 0
     assert loaded.point_mode == 4
+    assert loaded.angle_tolerance_degrees == 5
+    assert loaded.zoom_tolerance == 0.1
     assert "anchor_time_percent" not in loaded.model_dump()
     assert "anchor_dwell_seconds" not in loaded.model_dump()
     assert CameraworkConfig(anchor_zoom=3.5).anchor_zoom == 3.5
@@ -270,6 +274,8 @@ def test_legacy_camerawork_settings_migrate_to_fixed_origin_and_program(tmp_path
     {"pitch_min": 0, "pitch_max": 5},
     {"anchor_zoom": 3.6},
     {"speed_max": 1},
+    {"angle_tolerance_degrees": 0},
+    {"zoom_tolerance": 2},
     {"point_mode": 5},
     {"piece_ids": ["upper-left"]},
 ])

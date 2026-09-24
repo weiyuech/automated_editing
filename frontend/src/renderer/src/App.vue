@@ -212,6 +212,10 @@
                 <span class="axis-nospeed">负＝上，正＝下</span>
               </div>
               <div class="gimbal-axis"><span class="axis-name">速度</span><label><small>水平 / 俯仰 (2~5°/秒)</small><input v-model.number="cameraworkForm.speed_max" class="field" type="number" min="2" max="5" step="1" @input="markCameraworkDirty" /></label></div>
+              <div class="gimbal-axis"><span class="axis-name">容差</span>
+                <label><small>可接受角度偏差</small><input v-model.number="cameraworkForm.angle_tolerance_degrees" class="field" type="number" min="0.1" max="30" step="0.1" @input="markCameraworkDirty" /></label>
+                <label><small>可接受倍率偏差</small><input v-model.number="cameraworkForm.zoom_tolerance" class="field" type="number" min="0.01" max="1.5" step="0.01" @input="markCameraworkDirty" /></label>
+              </div>
               <div class="button-row"><button class="primary" :disabled="cameraworkSaving || Boolean(cameraworkWarning)" @click="saveCameraworkPreference">保存固定运镜设置</button></div>
               <p v-if="cameraworkWarning" class="inline-status danger">{{ cameraworkWarning }}</p>
               <p v-if="cameraworkStatus" class="inline-status" :class="cameraworkStatusKind">{{ cameraworkStatus }}</p>
@@ -241,7 +245,7 @@
                 <div>
                   <span>变焦</span>
                   <strong>{{ appZoomTargetLabel }}</strong>
-                  <span class="muted">不回传</span>
+                  <strong>{{ heartbeatZoomLabel() }}</strong>
                 </div>
               </div>
             </div>
@@ -2305,6 +2309,20 @@ function heartbeatAxisLabel(axis) {
   const age = timestampAge(heartbeat?.[`${axis}_received_at`], nowTs.value)
   if (!robot.value.connected || age == null || age > HEARTBEAT_FRESH_MS) return '未实时回报'
   return `${compactNumber(value)}°`
+}
+
+function heartbeatZoomLabel() {
+  const heartbeat = lastHeartbeat.value
+  // Older packaged backends did not expose zoom as a top-level diagnostic field,
+  // although the raw whitelisted heartbeat already contained it.
+  const payloadZoom = heartbeat?.payload?.gimbal?.zoom
+  const value = heartbeat?.zoom ?? payloadZoom
+  if (value == null) return '未回报'
+  const receivedAt = heartbeat?.zoom_received_at
+    ?? (payloadZoom != null ? heartbeat?.received_at : null)
+  const age = timestampAge(receivedAt, nowTs.value)
+  if (!robot.value.connected || age == null || age > HEARTBEAT_FRESH_MS) return '未实时回报'
+  return `${compactNumber(value)}×`
 }
 
 const canStartCruise = computed(() =>

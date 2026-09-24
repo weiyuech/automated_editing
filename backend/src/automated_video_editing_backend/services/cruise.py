@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from collections import deque
 from collections.abc import Callable
 from contextlib import suppress
 from typing import Any
@@ -26,12 +27,16 @@ from automated_video_editing_backend.services.robot import RobotCommandNotSentEr
 from automated_video_editing_backend.core.gimbal_limits import (
     POSE_STABLE_SAMPLES as _CW_POSE_STABLE_SAMPLES,
     POSE_SETTLED_DELTA_DEG as _CW_POSE_SETTLED_DELTA_DEG,
-    POSE_TOLERANCE_DEG as _CW_POSE_TOLERANCE_DEG,
-    ZOOM_TOLERANCE,
+    ZOOM_SETTLED_DELTA as _CW_ZOOM_SETTLED_DELTA,
 )
 from automated_video_editing_backend.services.camera_program import camera_program
 
 _CW_POSE_POLL_SECONDS = 0.2
+_CW_OUT_OF_TOLERANCE_GRACE_SECONDS = 3.0
+_CW_OUT_OF_TOLERANCE_MAX_CHECKS = 3
+# This is only a fail-safe for missing or endlessly changing telemetry. It is not
+# added to the robot's estimated movement time and cannot make a move complete.
+_CW_MONITOR_FAILSAFE_SECONDS = 60.0
 _ARRIVAL_TIMEOUT_SECONDS = 60.0
 
 
@@ -557,7 +562,7 @@ class CruiseService:
         self, target: tuple[float, float], config: CameraworkConfig,
         *, target_zoom: float | None = None,
     ) -> None:
-        """Check heartbeat readiness before sending; retry a busy rejection three times."""
+        """Send one leg only after readiness; a busy rejection is resent at most three times."""
         desired_zoom = config.anchor_zoom if target_zoom is None else target_zoom
         await self._wait_gimbal_settled()
         for attempt in range(1, 5):
@@ -567,17 +572,25 @@ class CruiseService:
             if yaw is None or pitch is None:
                 raise ValueError("缺少云台角度反馈，已停止后续导航；请检查机器人心跳")
             zoom = self._heartbeat_zoom()
-            start_zoom = self._cw_zoom if zoom is None else zoom
-            check_zoom = target_zoom is not None or abs(start_zoom - desired_zoom) > ZOOM_TOLERANCE
-            if check_zoom and zoom is None:
+            if zoom is None:
                 raise ValueError("缺少变焦倍率反馈，已停止后续镜头和导航；请检查机器人心跳 zoom")
+            start_zoom = zoom
             speed = config.speed_max
+            # Capture the feedback boundary before the write. An immediate robot reply can
+            # be consumed before send_cruise_gimbal() resumes; requiring three newer complete
+            # samples still prevents cached pre-command state from confirming this leg.
+            revision = self._heartbeat_revision()
+            zoom_revision = self._zoom_revision()
             command = GimbalMoveRequest(
                 yaw_start=yaw, yaw_end=target[0], yaw_speed=speed,
                 pitch_start=pitch, pitch_end=target[1], pitch_speed=speed,
                 zoom_start=start_zoom, zoom_end=desired_zoom,
             )
-            context = "cruise_fixed_zoom" if check_zoom else "cruise_fixed_piece"
+            context = (
+                "cruise_fixed_zoom"
+                if target_zoom is not None or abs(start_zoom - desired_zoom) > config.zoom_tolerance
+                else "cruise_fixed_piece"
+            )
             sender = getattr(self.robot, "send_cruise_gimbal", None)
             owner = None
             if sender is None:
@@ -586,15 +599,19 @@ class CruiseService:
                 owner = await asyncio.wait_for(
                     sender(command, context=context, cancelled=self._cancel.is_set), timeout=10,
                 )
-            revision = self._heartbeat_revision()
-            zoom_revision = self._zoom_revision()
-            budget = max(abs(target[0] - yaw), abs(target[1] - pitch)) / speed + 8.0
-            if check_zoom:
-                budget = max(budget, 15.0)
+            angle_estimated_seconds = max(
+                abs(target[0] - yaw) / speed,
+                abs(target[1] - pitch) / speed,
+            )
             reached, _ = await self._await_camerawork_pose(
-                *target, budget, after_revision=revision,
-                target_zoom=desired_zoom if check_zoom else None,
-                after_zoom_revision=zoom_revision, busy_owner=owner,
+                *target,
+                angle_estimated_seconds,
+                after_revision=revision,
+                target_zoom=desired_zoom,
+                after_zoom_revision=zoom_revision,
+                angle_tolerance=config.angle_tolerance_degrees,
+                zoom_tolerance=config.zoom_tolerance,
+                busy_owner=owner,
             )
             if self._cancel.is_set():
                 raise asyncio.CancelledError
@@ -603,9 +620,9 @@ class CruiseService:
                 return
             busy = getattr(self.robot, "gimbal_busy_seen", None)
             if owner is None or not callable(busy) or not busy(owner):
-                detail = f"，倍率 {desired_zoom:g}×" if check_zoom else ""
                 raise ValueError(
-                    f"云台未确认到达 ({target[0]}, {target[1]}){detail}（已发送 {attempt} 次）；已停止后续镜头和导航"
+                    f"云台未确认到达 ({target[0]}, {target[1]})，倍率 {desired_zoom:g}×"
+                    f"（已发送 {attempt} 次）；已停止后续镜头和导航"
                 )
             log_event("warning", "cruise.gimbal.busy_ignored", attempt=attempt,
                       target_yaw=target[0], target_pitch=target[1], target_zoom=desired_zoom)
@@ -663,10 +680,11 @@ class CruiseService:
             zoom_start = config.anchor_zoom if piece.zooms is None else piece.zooms[0]
             observed_zoom = self._heartbeat_zoom()
             zoom_needs_preparation = (
-                observed_zoom is not None and abs(observed_zoom - zoom_start) > ZOOM_TOLERANCE
+                observed_zoom is not None
+                and abs(observed_zoom - zoom_start) > config.zoom_tolerance
             )
             if zoom_needs_preparation or previous != piece.poses[0] or any(
-                value is None or abs(value - desired) > _CW_POSE_TOLERANCE_DEG
+                value is None or abs(value - desired) > config.angle_tolerance_degrees
                 for value, desired in zip(observed, piece.poses[0])
             ):
                 await record_piece(
@@ -682,16 +700,32 @@ class CruiseService:
         self,
         target_yaw: float,
         target_pitch: float,
-        budget: float,
+        angle_estimated_seconds: float,
         after_revision: int | None = None,
         target_zoom: float | None = None,
         after_zoom_revision: int = 0,
+        angle_tolerance: float = 5.0,
+        zoom_tolerance: float = 0.1,
         busy_owner: tuple[int, int] | None = None,
+        monitor_failsafe_seconds: float | None = None,
     ) -> tuple[bool, bool]:
-        """Require two distinct, post-command physical samples; expiry is never success."""
-        deadline = time.monotonic() + max(0.0, budget)
-        stable = 0
-        previous_near_pose = None
+        """Wait for travel time, then use physical stability before applying tolerances.
+
+        Tolerance says whether a settled result is acceptable; it never proves the robot
+        stopped. Zoom has no protocol speed, so it is deliberately judged only from the same
+        fresh heartbeat time series as yaw and pitch.
+        """
+        started_at = time.monotonic()
+        evaluate_after = started_at + max(0.0, angle_estimated_seconds)
+        failsafe = (
+            _CW_MONITOR_FAILSAFE_SECONDS
+            if monitor_failsafe_seconds is None
+            else max(0.0, monitor_failsafe_seconds)
+        )
+        deadline = evaluate_after + failsafe
+        samples: deque[tuple[float, float, float]] = deque(maxlen=_CW_POSE_STABLE_SAMPLES)
+        observation_deadline: float | None = None
+        observation_check = 0
         observed = False
         last_revision = after_revision
         last_zoom_revision = after_zoom_revision
@@ -709,33 +743,67 @@ class CruiseService:
             # count cached split-axis values at startup and could falsely confirm arrival.
             fresh = revision is not None and (last_revision is None or revision > last_revision)
             if fresh and yaw is not None and pitch is not None:
-                observed = True
+                zoom_revision = self._zoom_revision()
+                zoom = self._heartbeat_zoom()
+                zoom_fresh = zoom_revision > last_zoom_revision
                 last_revision = revision
-                zoom_matches = True
-                if target_zoom is not None:
-                    zoom_revision = self._zoom_revision()
-                    zoom = self._heartbeat_zoom()
-                    zoom_matches = (
-                        zoom_revision > last_zoom_revision and zoom is not None
-                        and abs(zoom - target_zoom) <= ZOOM_TOLERANCE
-                    )
+                if zoom_fresh and zoom is not None:
+                    observed = True
                     last_zoom_revision = zoom_revision
-                if (
-                    abs(yaw - target_yaw) <= _CW_POSE_TOLERANCE_DEG
-                    and abs(pitch - target_pitch) <= _CW_POSE_TOLERANCE_DEG
-                    and zoom_matches
-                ):
-                    settled = previous_near_pose is not None and all(
-                        abs(current - previous) <= _CW_POSE_SETTLED_DELTA_DEG
-                        for current, previous in zip((yaw, pitch), previous_near_pose)
-                    )
-                    stable = stable + 1 if settled else 1
-                    previous_near_pose = (yaw, pitch)
-                    if stable >= _CW_POSE_STABLE_SAMPLES:
-                        return True, True
-                else:
-                    stable = 0
-                    previous_near_pose = None
+                    now = time.monotonic()
+                    # Do not even begin the stability window before the angle estimate.
+                    # Pre-estimate readings remain useful diagnostics, but cannot contribute
+                    # one of the three samples that permits the next command.
+                    if now < evaluate_after:
+                        continue
+                    samples.append((float(yaw), float(pitch), float(zoom)))
+                    if len(samples) == _CW_POSE_STABLE_SAMPLES:
+                        yaw_range = max(value[0] for value in samples) - min(value[0] for value in samples)
+                        pitch_range = max(value[1] for value in samples) - min(value[1] for value in samples)
+                        zoom_range = max(value[2] for value in samples) - min(value[2] for value in samples)
+                        stable = (
+                            yaw_range <= _CW_POSE_SETTLED_DELTA_DEG
+                            and pitch_range <= _CW_POSE_SETTLED_DELTA_DEG
+                            and zoom_range <= _CW_ZOOM_SETTLED_DELTA
+                        )
+                        yaw_error = abs(yaw - target_yaw)
+                        pitch_error = abs(pitch - target_pitch)
+                        zoom_error = 0.0 if target_zoom is None else abs(zoom - target_zoom)
+                        inside = (
+                            yaw_error <= angle_tolerance
+                            and pitch_error <= angle_tolerance
+                            and zoom_error <= zoom_tolerance
+                        )
+                        if stable and inside:
+                            return True, True
+
+                        # A settled but unacceptable pose opens a three-second observation
+                        # window. At each boundary, a stationary miss fails immediately;
+                        # continuing motion earns another window, up to three total.
+                        if stable and not inside and observation_deadline is None:
+                            observation_check = 1
+                            observation_deadline = now + _CW_OUT_OF_TOLERANCE_GRACE_SECONDS
+
+                        if observation_deadline is not None and now >= observation_deadline:
+                            detail = (
+                                f"水平 {yaw_error:.2f}°（允许 {angle_tolerance:g}°），"
+                                f"俯仰 {pitch_error:.2f}°（允许 {angle_tolerance:g}°），"
+                                f"倍率 {zoom_error:.2f}×（允许 {zoom_tolerance:g}×）"
+                            )
+                            if stable:
+                                raise ValueError(
+                                    f"云台已停稳但超出可接受偏差：{detail}；"
+                                    f"第 {observation_check} 轮观察结束，停止后续镜头和导航"
+                                )
+                            if observation_check >= _CW_OUT_OF_TOLERANCE_MAX_CHECKS:
+                                raise ValueError(
+                                    f"云台连续 {_CW_OUT_OF_TOLERANCE_MAX_CHECKS} 轮观察仍未停稳："
+                                    f"{detail}；停止后续镜头和导航"
+                                )
+                            observation_check += 1
+                            observation_deadline = (
+                                now + _CW_OUT_OF_TOLERANCE_GRACE_SECONDS
+                            )
             await asyncio.sleep(min(_CW_POSE_POLL_SECONDS, max(0.0, deadline - time.monotonic())))
         return False, observed
 

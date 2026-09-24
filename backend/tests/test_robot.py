@@ -4315,7 +4315,7 @@ def test_partial_heartbeat_preserves_each_physical_axis_and_movement_state():
 
     adapter._apply_protocol_state({
         "task": {"goal_status": "going", "goal_id": 4},
-        "gimbal": {"yaw": 7, "pitch": -2, "mode": 1},
+        "gimbal": {"yaw": 7, "pitch": -2, "zoom": 1.2, "mode": 1},
     })
     first = adapter.state.diagnostics.last_heartbeat
     assert first is not None
@@ -4328,11 +4328,22 @@ def test_partial_heartbeat_preserves_each_physical_axis_and_movement_state():
     assert second.yaw == 8
     assert second.pitch == -2
     assert second.pitch_received_at == first.pitch_received_at
+    assert second.zoom == 1.2
+    assert second.zoom_received_at == first.zoom_received_at
     assert adapter.state.pitch == -2
     assert adapter.heartbeat_revision() == 1
 
     # The matching pitch-only packet completes one new logical two-axis sample.
     adapter._apply_protocol_state({"gimbal": {"pitch": -2}})
+    assert adapter.heartbeat_revision() == 2
+
+    # A zoom-only heartbeat updates the diagnostic independently without inventing
+    # a new yaw/pitch pose sample.
+    adapter._apply_protocol_state({"gimbal": {"zoom": 1.5}})
+    zoom_frame = adapter.state.diagnostics.last_heartbeat
+    assert zoom_frame is not None
+    assert zoom_frame.zoom == 1.5
+    assert zoom_frame.zoom_received_at != first.zoom_received_at
     assert adapter.heartbeat_revision() == 2
 
     # Recording-only gimbal beats and partial task beats update diagnostics without inventing
@@ -4344,7 +4355,7 @@ def test_partial_heartbeat_preserves_each_physical_axis_and_movement_state():
     assert adapter.state.moving is True
     assert adapter.heartbeat_revision() == 2
     latest = adapter.state.diagnostics.last_heartbeat
-    assert latest.sequence == 5
+    assert latest.sequence == 6
     assert latest.task_goal_status == "going"
     assert latest.goal_id == 4
     assert latest.task_goal_status_received_at == first.task_goal_status_received_at

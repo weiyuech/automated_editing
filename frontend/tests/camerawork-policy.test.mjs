@@ -8,7 +8,17 @@ test('legacy anchors migrate to the fixed origin and unsupported controls are di
   assert.equal(profile.speed_max,4)
   assert.equal('anchor_time_percent' in profile,false)
   assert.equal(profile.point_mode,4)
+  assert.equal(profile.angle_tolerance_degrees,5)
+  assert.equal(profile.zoom_tolerance,0.1)
   assert.equal(cameraworkProfileWarning(profile),'')
+})
+test('operator framing tolerances are persisted and range checked', () => {
+  const profile = normalizeCameraworkProfile({angle_tolerance_degrees:'7.5',zoom_tolerance:'0.08'})
+  assert.equal(profile.angle_tolerance_degrees,7.5)
+  assert.equal(profile.zoom_tolerance,0.08)
+  assert.equal(cameraworkProfileWarning(profile),'')
+  assert.match(cameraworkProfileWarning({...profile,angle_tolerance_degrees:0}),/角度偏差/)
+  assert.match(cameraworkProfileWarning({...profile,zoom_tolerance:2}),/倍率偏差/)
 })
 test('four edges require bounds on both sides of physical zero', () => {
   assert.match(cameraworkProfileWarning(normalizeCameraworkProfile({yaw_min:5})),/原点两侧/)
