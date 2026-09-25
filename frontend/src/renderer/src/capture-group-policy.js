@@ -23,35 +23,37 @@ function coveredLeaves(group, selection) {
 export function normalizeCaptureSelection(group, selection) {
   if (!group || !selection) return null
   const selectable = selectableCaptureSegments(group)
-  const includeFull = Boolean(group.master_available && selection.include_full)
+  const valid = new Set(validCaptureLeaves(group).map((node) => node.id))
   const ids = new Set(selection.segment_ids || [])
-  const selected = (selection.include_full ? selectable : selectable.filter(node => ids.has(node.id))).map(node => node.id)
-  if (!includeFull && !selected.length) return null
-  return { capture_id: group.id, include_full: includeFull, segment_ids: selected }
+  // Legacy "include_full" selections now mean "all valid (non-preparation) leaves".
+  const selected = (selection.include_full
+    ? selectable.filter((node) => valid.has(node.id))
+    : selectable.filter((node) => ids.has(node.id))
+  ).map((node) => node.id)
+  if (!selected.length) return null
+  return { capture_id: group.id, include_full: false, segment_ids: selected }
 }
-export function fullCaptureSelection(group) {
-  return normalizeCaptureSelection(group, { include_full: true, segment_ids: [] })
+export function validCaptureLeaves(group) {
+  return captureLeaves(group?.segments).filter((node) => node.kind !== 'preparation')
 }
 export function defaultCaptureSelection(group) {
   return normalizeCaptureSelection(group, {
     include_full: false,
-    segment_ids: captureLeaves(group.segments)
-      .filter((node) => node.kind !== 'preparation')
-      .map((node) => node.id)
+    segment_ids: validCaptureLeaves(group).map((node) => node.id)
   })
 }
 export function captureSelectionState(group, selection) {
   const normalized = normalizeCaptureSelection(group, selection)
-  const leaves = captureLeaves(group.segments)
-  const selected = coveredLeaves(group, normalized)
-  const selectable = leaves.filter(node => group.master_available || (node.available && node.path))
-  const full = Boolean(normalized?.include_full)
-  const count = selected.length
-  const checked = full || (selectable.length > 0 && count === selectable.length)
+  const selectedIds = new Set(coveredLeaves(group, normalized).map((node) => node.id))
+  const selectable = validCaptureLeaves(group).filter(
+    (node) => group.master_available || (node.available && node.path),
+  )
+  const count = selectable.filter((node) => selectedIds.has(node.id)).length
+  const checked = selectable.length > 0 && count === selectable.length
   return { checked, partial: count > 0 && !checked,
-    whole: Boolean(group.master_available) && (full || (leaves.length > 0 && count === leaves.length)),
+    whole: Boolean(group.master_available) && checked,
     count, selectableCount: selectable.length,
-    duration: full ? group.duration : selected.reduce((sum, node) => sum + node.end - node.start, 0) }
+    duration: coveredLeaves(group, normalized).reduce((sum, node) => sum + node.end - node.start, 0) }
 }
 export function captureNodeState(group, selection, node) {
   const selected = new Set(coveredLeaves(group, selection).map(n => n.id))
@@ -60,9 +62,7 @@ export function captureNodeState(group, selection, node) {
   return { checked: count === leaves.length, partial: count > 0 && count < leaves.length }
 }
 export function changeCaptureChild(group, selection, id, checked) {
-  if (id === 'full' && checked) return fullCaptureSelection(group)
   const normalized = normalizeCaptureSelection(group, selection)
-  if (id === 'full') return normalizeCaptureSelection(group, { ...normalized, include_full: false })
   const selected = new Set(coveredLeaves(group, normalized).map(n => n.id))
   const node = captureNodes(group.segments).find(n => n.id === id)
   if (!node) return normalized

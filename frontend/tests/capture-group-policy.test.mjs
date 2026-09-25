@@ -7,7 +7,6 @@ import {
   captureTuneSourceGroups,
   changeCaptureChild,
   defaultCaptureSelection,
-  fullCaptureSelection,
   normalizeCaptureSelection
 } from '../src/renderer/src/capture-group-policy.js'
 
@@ -27,7 +26,7 @@ function group() {
 
 test('subtracting a child from a full capture becomes an actual partial selection', () => {
   const capture = group()
-  const selection = changeCaptureChild(capture, fullCaptureSelection(capture), 'b', false)
+  const selection = changeCaptureChild(capture, defaultCaptureSelection(capture), 'b', false)
 
   assert.deepEqual(selection, {
     capture_id: capture.id,
@@ -47,12 +46,12 @@ test('subtracting a child from a full capture becomes an actual partial selectio
 test('default selection uses available children rather than a missing master', () => {
   const capture = { ...group(), master_available: false }
 
-  assert.deepEqual(fullCaptureSelection(capture), {
+  assert.deepEqual(defaultCaptureSelection(capture), {
     capture_id: capture.id,
     include_full: false,
     segment_ids: ['a', 'c']
   })
-  assert.deepEqual(captureSelectionState(capture, fullCaptureSelection(capture)), {
+  assert.deepEqual(captureSelectionState(capture, defaultCaptureSelection(capture)), {
     checked: true,
     partial: false,
     whole: false,
@@ -69,12 +68,12 @@ test('missing master with all child files available selects every child', () => 
     segments: group().segments.map((segment) => ({ ...segment, available: true }))
   }
 
-  assert.deepEqual(fullCaptureSelection(capture), {
+  assert.deepEqual(defaultCaptureSelection(capture), {
     capture_id: capture.id,
     include_full: false,
     segment_ids: ['a', 'b', 'c']
   })
-  assert.equal(captureSelectionState(capture, fullCaptureSelection(capture)).checked, true)
+  assert.equal(captureSelectionState(capture, defaultCaptureSelection(capture)).checked, true)
 })
 
 test('missing master root state is partial until every selectable child is selected', () => {
@@ -89,7 +88,7 @@ test('missing master root state is partial until every selectable child is selec
     selectableCount: 2,
     duration: 10
   })
-  assert.deepEqual(changeCaptureChild(capture, partial, 'c', true), fullCaptureSelection(capture))
+  assert.deepEqual(changeCaptureChild(capture, partial, 'c', true), defaultCaptureSelection(capture))
 })
 
 test('stale full selection is normalized when its master has gone missing', () => {
@@ -111,7 +110,7 @@ test('missing master without usable children has no default selection', () => {
     segments: group().segments.map((segment) => ({ ...segment, available: false }))
   }
 
-  assert.equal(fullCaptureSelection(capture), null)
+  assert.equal(defaultCaptureSelection(capture), null)
   assert.deepEqual(captureSelectionState(capture, null), {
     checked: false,
     partial: false,
@@ -145,11 +144,8 @@ test('default selection excludes preparation intervals but keeps shots and trave
   })
 })
 
-test('selecting the full row canonicalizes every child and child choices keep timeline order', () => {
+test('child choices keep timeline order', () => {
   const capture = group()
-  const partial = { capture_id: capture.id, include_full: false, segment_ids: ['c'] }
-
-  assert.deepEqual(changeCaptureChild(capture, partial, 'full', true), fullCaptureSelection(capture))
   const firstClick = changeCaptureChild(capture, null, 'c', true)
   assert.deepEqual(changeCaptureChild(capture, firstClick, 'a', true)?.segment_ids, ['a', 'c'])
 })

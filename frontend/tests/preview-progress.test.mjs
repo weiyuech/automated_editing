@@ -4,7 +4,7 @@ import { readFileSync } from 'node:fs'
 import { compileScript, parse } from 'vue/compiler-sfc'
 import { computed, effectScope, ref, watch } from 'vue'
 import { isPreviewPending, previewProgress, previewStageLabel, previewTime } from '../src/renderer/src/preview-progress.js'
-import { captureGroup, fullCaptureSelection, formatCaptureTime } from '../src/renderer/src/capture-group-policy.js'
+import { captureGroup, formatCaptureTime } from '../src/renderer/src/capture-group-policy.js'
 import { compositionLabel, savedCompositions } from '../src/renderer/src/composition-groups.js'
 
 function deferred() {
@@ -17,7 +17,7 @@ function harness(name, api) {
   const script = compileScript(parse(source.replace(/\r?\n/g, '\r\n')).descriptor, { id: 'preview-races' }).content.replace(/\r\n/g, '\n')
     .replace(/^import[\s\S]*?from ['"][^'"]+['"]\n/gm, '').replace('export default', 'return')
   const scope = effectScope(), cleanup = [], events = []
-  const deps = { computed, ref, watch, isPreviewPending, captureGroup, fullCaptureSelection, formatCaptureTime,
+  const deps = { computed, ref, watch, isPreviewPending, captureGroup, formatCaptureTime,
     PreviewProgress: {}, SubtitleFontPicker: {}, CaptureGroupPicker: {}, CompositionTree: {},
     ManualComposer: {}, CompositionGroups: {}, compositionLabel, savedCompositions,
     onMounted: () => {}, onUnmounted: fn => cleanup.push(fn), setTimeout: () => 0, clearTimeout: () => {} }

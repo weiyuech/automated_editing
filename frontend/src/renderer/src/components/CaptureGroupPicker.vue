@@ -9,7 +9,7 @@ const expanded = ref(false)
 const normalizedSelection = computed(() => normalizeCaptureSelection(props.group, props.modelValue))
 const state = computed(() => captureSelectionState(props.group, normalizedSelection.value))
 const summary = computed(() => {
-  if (state.value.whole) return '完整录制 · 1 个剪辑输入'
+  if (state.value.whole) return '完整有效录制 · 1 个剪辑输入'
   const unit = props.group.master_available ? '段' : '个可用片段'
   if (state.value.count) return `已选 ${state.value.count} / ${state.value.selectableCount} ${unit} · 合成 1 个剪辑输入`
   return `${state.value.selectableCount} ${unit} · 展开选择`
@@ -25,7 +25,7 @@ function preview(segment = null) {
 <template>
   <div class="capture-picker" :class="{ 'capture-picker-selected': state.checked || state.partial }">
     <div class="capture-picker-root">
-      <input type="checkbox" :aria-label="`选用 ${group.title} 的全部内容`" :checked="state.checked" :indeterminate="state.partial"
+      <input type="checkbox" :aria-label="`选用 ${group.title} 的完整有效录制`" :checked="state.checked" :indeterminate="state.partial"
         :disabled="disabled || (!group.master_available && state.selectableCount === 0)"
         @change="emit('update:modelValue', $event.target.checked ? defaultCaptureSelection(group) : null)" />
       <button class="capture-picker-disclosure" :aria-expanded="expanded" @click="expanded = !expanded">
@@ -36,8 +36,8 @@ function preview(segment = null) {
     </div>
     <div v-if="expanded" class="capture-picker-children">
       <div class="capture-picker-child">
-        <label><input type="checkbox" :checked="Boolean(normalizedSelection?.include_full)" :disabled="disabled || !group.master_available" @change="child('full', $event.target.checked)" />
-          <span><strong>完整录制</strong><small>{{ group.master_available ? '包含本次拍摄全部内容' : '原片已移走或删除' }}</small></span></label>
+        <label><input type="checkbox" :checked="state.checked" :disabled="disabled || !group.master_available" @change="emit('update:modelValue', $event.target.checked ? defaultCaptureSelection(group) : null)" />
+          <span><strong>完整有效录制</strong><small>{{ group.master_available ? '包含全部有效画面，不含准备片段' : '原片已移走或删除' }}</small></span></label>
         <button :disabled="!group.master_available" @click="preview()">预览</button>
       </div>
       <CaptureTreeNode v-for="segment in group.segments" :key="segment.id" :node="segment" :group="group"
