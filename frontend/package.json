@@ -1,6 +1,6 @@
 {
   "name": "automated-video-editing-frontend",
-  "version": "0.1.16",
+  "version": "0.1.17",
   "private": true,
   "packageManager": "pnpm@11.0.0",
   "engines": {

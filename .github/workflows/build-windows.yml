@@ -160,12 +160,12 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create v0.1.16 \
-            release/Automated-Video-Editing-0.1.16-Windows-x64-Setup.exe \
+          gh release create v0.1.17 \
+            release/Automated-Video-Editing-0.1.17-Windows-x64-Setup.exe \
             release/SHA256SUMS.txt \
             --target "$GITHUB_SHA" \
-            --title "自动视频剪辑 0.1.16" \
-            --notes "完整 Windows 安装包，包含运行所需的后端、媒体工具、字体和本地模型。本版在云台心跳中记录变焦倍率，按实际运动裁剪每个镜头的静止头尾并标注为“准备”（自动与手动组合默认均不包含）；到位未确认时按停稳与容差重发（首点原点唤醒最多 6 次、其余最多 4 次）。"
+            --title "自动视频剪辑 0.1.17" \
+            --notes "完整 Windows 安装包，包含运行所需的后端、媒体工具、字体和本地模型。本版新增可调的到位容差（默认 20°）与停稳阈值，并放宽指令起点容差以适配云台漂移；手动组合不再自动包含“准备”片段（改用完整有效录制）。"
 
   package-external-media-tools:
     name: Package Windows x64 — external media tools
