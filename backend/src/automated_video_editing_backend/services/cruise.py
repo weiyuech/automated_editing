@@ -618,6 +618,8 @@ class CruiseService:
                     zoom_tolerance=config.zoom_tolerance,
                     busy_owner=owner,
                     monitor_failsafe_seconds=monitor_failsafe_seconds,
+                    settled_delta_degrees=config.settled_delta_degrees,
+                    settled_delta_zoom=config.settled_delta_zoom,
                 )
             except ValueError:
                 # Definite non-arrival: settled outside tolerance, or still moving after the
@@ -752,6 +754,8 @@ class CruiseService:
         zoom_tolerance: float = 0.1,
         busy_owner: tuple[int, int] | None = None,
         monitor_failsafe_seconds: float | None = None,
+        settled_delta_degrees: float = _CW_POSE_SETTLED_DELTA_DEG,
+        settled_delta_zoom: float = _CW_ZOOM_SETTLED_DELTA,
     ) -> tuple[bool, bool]:
         """Wait for travel time, then use physical stability before applying tolerances.
 
@@ -806,9 +810,9 @@ class CruiseService:
                         pitch_range = max(value[1] for value in samples) - min(value[1] for value in samples)
                         zoom_range = max(value[2] for value in samples) - min(value[2] for value in samples)
                         stable = (
-                            yaw_range <= _CW_POSE_SETTLED_DELTA_DEG
-                            and pitch_range <= _CW_POSE_SETTLED_DELTA_DEG
-                            and zoom_range <= _CW_ZOOM_SETTLED_DELTA
+                            yaw_range <= settled_delta_degrees
+                            and pitch_range <= settled_delta_degrees
+                            and zoom_range <= settled_delta_zoom
                         )
                         yaw_error = abs(yaw - target_yaw)
                         pitch_error = abs(pitch - target_pitch)

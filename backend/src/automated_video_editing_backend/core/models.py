@@ -9,7 +9,7 @@ from uuid import uuid4
 from pydantic import BaseModel, Field, computed_field, field_validator, model_validator
 from automated_video_editing_backend.core.gimbal_limits import (
     PITCH_MIN, PITCH_MAX, YAW_MIN, YAW_MAX, ZOOM_MIN, ZOOM_MAX,
-    POSE_TOLERANCE_DEG, ZOOM_TOLERANCE,
+    START_POSE_GRACE_DEG, START_ZOOM_GRACE,
 )
 
 
@@ -156,18 +156,18 @@ class GimbalMoveRequest(BaseModel):
     """Full 镜头控制 move: yaw/pitch pan from start to end at a speed; zoom from start to end.
 
     Endpoints remain inside the configured command limits. Starts may describe physical
-    feedback just outside those limits: ±5 degrees for angles, ±0.05 for zoom. Preserve
-    the measured start rather than clipping it or expanding the destination rectangle.
+    feedback outside those limits (up to the operator's tolerance). Preserve the measured
+    start rather than clipping it or expanding the destination rectangle.
     Zoom has no speed. The service fixes mode to 1.
     Direction convention: negative yaw = right, negative pitch = up.
     """
-    yaw_start: float = Field(ge=YAW_MIN - POSE_TOLERANCE_DEG, le=YAW_MAX + POSE_TOLERANCE_DEG)
+    yaw_start: float = Field(ge=YAW_MIN - START_POSE_GRACE_DEG, le=YAW_MAX + START_POSE_GRACE_DEG)
     yaw_end: float = Field(ge=YAW_MIN, le=YAW_MAX)
     yaw_speed: float = Field(default=5, ge=2, le=5)
-    pitch_start: float = Field(default=0, ge=PITCH_MIN - POSE_TOLERANCE_DEG, le=PITCH_MAX + POSE_TOLERANCE_DEG)
+    pitch_start: float = Field(default=0, ge=PITCH_MIN - START_POSE_GRACE_DEG, le=PITCH_MAX + START_POSE_GRACE_DEG)
     pitch_end: float = Field(default=0, ge=PITCH_MIN, le=PITCH_MAX)
     pitch_speed: float = Field(default=5, ge=2, le=5)
-    zoom_start: float = Field(default=1, ge=ZOOM_MIN - ZOOM_TOLERANCE, le=ZOOM_MAX + ZOOM_TOLERANCE)
+    zoom_start: float = Field(default=1, ge=ZOOM_MIN - START_ZOOM_GRACE, le=ZOOM_MAX + START_ZOOM_GRACE)
     zoom_end: float = Field(default=1, ge=ZOOM_MIN, le=ZOOM_MAX)
 
 
@@ -184,8 +184,10 @@ class CameraworkProfile(BaseModel):
     pitch_max: int = Field(default=15, ge=-60, le=15)
     # The robot firmware expects whole-number yaw/pitch speeds on the wire.
     speed_max: int = Field(default=5, ge=2, le=5)
-    angle_tolerance_degrees: float = Field(default=5.0, ge=0.1, le=30.0)
+    angle_tolerance_degrees: float = Field(default=20.0, ge=0.1, le=30.0)
     zoom_tolerance: float = Field(default=0.1, ge=0.01, le=1.5)
+    settled_delta_degrees: float = Field(default=0.5, ge=0.01, le=10.0)
+    settled_delta_zoom: float = Field(default=0.03, ge=0.001, le=1.0)
 
     point_mode: Literal[4, 8] = 4
     piece_ids: list[str] | None = Field(default=None, max_length=12)

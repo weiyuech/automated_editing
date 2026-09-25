@@ -262,7 +262,7 @@ def test_legacy_camerawork_settings_migrate_to_fixed_origin_and_program(tmp_path
     assert loaded.anchor_yaw == 0
     assert loaded.anchor_pitch == 0
     assert loaded.point_mode == 4
-    assert loaded.angle_tolerance_degrees == 5
+    assert loaded.angle_tolerance_degrees == 20
     assert loaded.zoom_tolerance == 0.1
     assert "anchor_time_percent" not in loaded.model_dump()
     assert "anchor_dwell_seconds" not in loaded.model_dump()

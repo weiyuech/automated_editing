@@ -8,7 +8,7 @@ test('legacy anchors migrate to the fixed origin and unsupported controls are di
   assert.equal(profile.speed_max,4)
   assert.equal('anchor_time_percent' in profile,false)
   assert.equal(profile.point_mode,4)
-  assert.equal(profile.angle_tolerance_degrees,5)
+  assert.equal(profile.angle_tolerance_degrees,20)
   assert.equal(profile.zoom_tolerance,0.1)
   assert.equal(cameraworkProfileWarning(profile),'')
 })

@@ -308,6 +308,16 @@ p { margin: 6px 0 0; color: var(--text-muted); }
 .gimbal-axis label { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
 .gimbal-axis label small { color: var(--text-muted); font-size: 11px; }
 .gimbal-axis .axis-nospeed { color: var(--text-muted); font-size: 12px; padding-bottom: 11px; }
+.threshold-group { border-top: 1px solid var(--border); margin-top: 4px; }
+.threshold-group summary { cursor: pointer; font-size: 12px; color: var(--text-muted); padding: 8px 0; list-style: none; user-select: none; }
+.threshold-group summary::-webkit-details-marker { display: none; }
+.threshold-group summary::before { content: "▸"; display: inline-block; margin-right: 6px; color: var(--purple, #7961bf); transition: transform .15s; }
+.threshold-group[open] summary::before { transform: rotate(90deg); }
+.threshold-body { display: grid; gap: 8px; padding: 2px 0 8px; }
+.threshold-body .sub { display: flex; align-items: flex-end; gap: 10px; }
+.threshold-body .sub-name { flex: 0 0 60px; font-size: 11px; font-weight: 800; color: var(--purple, #7961bf); padding-bottom: 10px; }
+.threshold-body label { display: flex; flex-direction: column; gap: 3px; flex: 1; min-width: 0; }
+.threshold-body label small { color: var(--text-muted); font-size: 11px; }
 .camera-settings-section { border-top: 1px solid var(--border); margin-top: 8px; padding-top: 18px; scroll-margin-top: 24px; }
 .camera-settings-section > div:first-child { margin-bottom: 12px; }
 .camera-settings-section > div:first-child strong { color: var(--text); font-size: 15px; }

@@ -13,3 +13,8 @@ POSE_STABLE_SAMPLES = 3
 POSE_SETTLED_DELTA_DEG = 0.5
 ZOOM_TOLERANCE = 0.05
 ZOOM_SETTLED_DELTA = 0.03
+
+# Command-start grace. A drifting gimbal can report a start beyond the command rectangle;
+# this bound (the largest user tolerance) keeps such starts accepted rather than rejected.
+START_POSE_GRACE_DEG = 30.0
+START_ZOOM_GRACE = 1.5

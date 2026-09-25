@@ -13,9 +13,9 @@ def test_measured_start_preserves_outward_drift(yaw, pitch, zoom):
 
 
 @pytest.mark.parametrize("field,value", [
-    ("yaw_start", -95.01), ("yaw_start", 95.01),
-    ("pitch_start", -65.01), ("pitch_start", 20.01),
-    ("zoom_start", 0.949), ("zoom_start", 3.551),
+    ("yaw_start", -120.01), ("yaw_start", 120.01),
+    ("pitch_start", -90.01), ("pitch_start", 45.01),
+    ("zoom_start", -0.51), ("zoom_start", 5.01),
     ("yaw_end", -90.01), ("yaw_end", 90.01),
     ("pitch_end", -60.01), ("pitch_end", 15.01),
     ("zoom_end", 0.99), ("zoom_end", 3.51),
