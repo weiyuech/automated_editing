@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "automated-video-editing-backend"
-version = "0.1.15"
+version = "0.1.16"
 description = "Python backend for controlled robot capture and precise video concatenation"
 requires-python = ">=3.11"
 dependencies = [

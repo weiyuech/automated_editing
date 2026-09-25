@@ -156,16 +156,16 @@ jobs:
           retention-days: 14
 
       - name: Publish public Windows installer
-        if: github.ref == 'refs/heads/codex/gimbal-arrival-warmup-20260925'
+        if: github.ref == 'refs/heads/codex/motion-trim-retry-20260925'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create v0.1.15 \
-            release/Automated-Video-Editing-0.1.15-Windows-x64-Setup.exe \
+          gh release create v0.1.16 \
+            release/Automated-Video-Editing-0.1.16-Windows-x64-Setup.exe \
             release/SHA256SUMS.txt \
             --target "$GITHUB_SHA" \
-            --title "自动视频剪辑 0.1.15" \
-            --notes "完整 Windows 安装包，包含运行所需的后端、媒体工具、字体和本地模型。本版修复固定镜头到位预估（改用 2 秒固定预等待，仍按停稳与容差确认到位），并在首个点位新增最多 6 次的 (0,0) 原点唤醒重发；手动组合默认排除“准备”片段，选入时先提示。"
+            --title "自动视频剪辑 0.1.16" \
+            --notes "完整 Windows 安装包，包含运行所需的后端、媒体工具、字体和本地模型。本版在云台心跳中记录变焦倍率，按实际运动裁剪每个镜头的静止头尾并标注为“准备”（自动与手动组合默认均不包含）；到位未确认时按停稳与容差重发（首点原点唤醒最多 6 次、其余最多 4 次）。"
 
   package-external-media-tools:
     name: Package Windows x64 — external media tools
