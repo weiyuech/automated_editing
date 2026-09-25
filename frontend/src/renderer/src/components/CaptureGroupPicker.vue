@@ -1,7 +1,7 @@
 <script setup>
 import { computed, ref } from 'vue'
 import CaptureTreeNode from './CaptureTreeNode.vue'
-import { captureSelectionState, changeCaptureChild, fullCaptureSelection, formatCaptureTime, normalizeCaptureSelection } from '../capture-group-policy.js'
+import { captureSelectionState, changeCaptureChild, defaultCaptureSelection, formatCaptureTime, normalizeCaptureSelection } from '../capture-group-policy.js'
 
 const props = defineProps({ group: { type: Object, required: true }, modelValue: { type: Object, default: null }, disabled: Boolean })
 const emit = defineEmits(['update:modelValue', 'preview', 'retry'])
@@ -27,7 +27,7 @@ function preview(segment = null) {
     <div class="capture-picker-root">
       <input type="checkbox" :aria-label="`选用 ${group.title} 的全部内容`" :checked="state.checked" :indeterminate="state.partial"
         :disabled="disabled || (!group.master_available && state.selectableCount === 0)"
-        @change="emit('update:modelValue', $event.target.checked ? fullCaptureSelection(group) : null)" />
+        @change="emit('update:modelValue', $event.target.checked ? defaultCaptureSelection(group) : null)" />
       <button class="capture-picker-disclosure" :aria-expanded="expanded" @click="expanded = !expanded">
         <span class="capture-picker-caret">{{ expanded ? '▾' : '▸' }}</span>
         <span><strong>{{ group.title }}</strong><small>{{ summary }}</small></span>
