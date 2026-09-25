@@ -7,7 +7,6 @@ import CompositionTree from './CompositionTree.vue'
 import {
   captureGroup,
   defaultCaptureSelection,
-  fullCaptureSelection,
   formatCaptureTime,
 } from '../capture-group-policy.js'
 const props = defineProps({ api: Function, mediaUrl: Function })
@@ -132,7 +131,7 @@ function load(r) {
       if (group)
         choices.value[item.id] =
           r.request.capture_selections.find((c) => c.capture_id === group.id) ||
-          fullCaptureSelection(group)
+          defaultCaptureSelection(group)
     }
   builtChoice.value = fingerprint.value
 }
