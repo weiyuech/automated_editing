@@ -10,6 +10,11 @@ from __future__ import annotations
 import math
 from typing import Any
 
+from automated_video_editing_backend.core.gimbal_limits import (
+    POSE_SETTLED_DELTA_DEG,
+    ZOOM_SETTLED_DELTA,
+)
+
 
 def timestamp(value: Any) -> float | None:
     if isinstance(value, bool):
@@ -274,3 +279,103 @@ def shift_nodes(nodes: list[dict], offset: float) -> list[dict]:
         }
         for node in nodes
     ]
+
+
+_FRAME_SECONDS = 1.0 / 30.0
+
+
+def apply_motion_trim(
+    segments: list[dict],
+    samples: list[tuple[float, float, float, float]],
+    offset: float = 0.0,
+    delta_yaw: float = POSE_SETTLED_DELTA_DEG,
+    delta_pitch: float = POSE_SETTLED_DELTA_DEG,
+    delta_zoom: float = ZOOM_SETTLED_DELTA,
+) -> list[dict]:
+    """Relabel each shot's still head and tail as preparation using physical gimbal samples.
+
+    Samples use the cruise clock; ``offset`` maps them onto the tree clock already used by
+    ``build_timeline``. A shot with no detectable motion is left untouched, so a missed or
+    undersampled move can never be silently dropped.
+    """
+    points = sorted(
+        (t + offset, yaw, pitch, zoom)
+        for t, yaw, pitch, zoom in samples
+        if all(math.isfinite(value) for value in (t, yaw, pitch, zoom))
+    )
+    if not points:
+        return segments
+    for node in segments:
+        children = node.get("children") or []
+        if not any(child.get("kind") in {"shot", "zoom"} for child in children):
+            continue
+        rebuilt: list[dict] = []
+        for child in children:
+            if child.get("kind") not in {"shot", "zoom"}:
+                rebuilt.append(child)
+                continue
+            start, end = child["start"], child["end"]
+            span = _shot_motion_span(points, start, end, delta_yaw, delta_pitch, delta_zoom)
+            if span is None or end - start <= _FRAME_SECONDS:
+                rebuilt.append(child)
+                continue
+            motion_start, motion_end = span
+            if motion_start - start > _FRAME_SECONDS:
+                rebuilt.append(_preparation_node(child, "prep-head", start, motion_start))
+            rebuilt.append({**child, "start": motion_start, "end": motion_end})
+            if end - motion_end > _FRAME_SECONDS:
+                rebuilt.append(_preparation_node(child, "prep-tail", motion_end, end))
+        node["children"] = _merge_preparation(rebuilt)
+    return segments
+
+
+def _shot_motion_span(points, start, end, dy_t, dp_t, dz_t):
+    window = [point for point in points if start <= point[0] < end]
+    if len(window) < 2:
+        return None
+    first_start = None
+    last_end = None
+    prev = window[0]
+    for current in window[1:]:
+        moving = (
+            abs(current[1] - prev[1]) > dy_t
+            or abs(current[2] - prev[2]) > dp_t
+            or abs(current[3] - prev[3]) > dz_t
+        )
+        if moving:
+            if first_start is None:
+                first_start = prev[0]
+            last_end = current[0]
+        prev = current
+    if first_start is None:
+        return None
+    return first_start, last_end
+
+
+def _preparation_node(source, suffix, start, end):
+    return {
+        "id": f"{source['id']}:{suffix}",
+        "label": "静置准备",
+        "kind": "preparation",
+        "start": start,
+        "end": end,
+        "boundary_source": "gimbal_motion_trim",
+        "complete": True,
+    }
+
+
+def _merge_preparation(children):
+    merged: list[dict] = []
+    for child in children:
+        if (
+            merged
+            and child.get("kind") == "preparation"
+            and merged[-1].get("kind") == "preparation"
+            and abs(merged[-1]["end"] - child["start"]) < 1e-6
+        ):
+            merged[-1] = {**merged[-1], "end": child["end"]}
+        else:
+            merged.append(child)
+    for order, child in enumerate(merged):
+        child["order"] = order
+    return merged

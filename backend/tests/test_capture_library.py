@@ -368,7 +368,7 @@ async def test_missing_master_can_resolve_one_child_directly_and_join_multiple(t
     assert capture_payload["source_ranges"] == [[0.0, 1.6]]
     assert capture_payload["recording_timeline"][0]["start"] == 0.0
     samples = json.loads(gimbal_sidecar_path(joined.path).read_text(encoding="utf-8"))["samples"]
-    assert samples == [[0.2, -10.0, 1.0], [1.1, 10.0, 2.0]]
+    assert samples == [[0.2, -10.0, 1.0, 0.0], [1.1, 10.0, 2.0, 0.0]]
 
     with pytest.raises(ValueError, match="完整录制已移走或删除"):
         await captures.resolve(
@@ -420,7 +420,7 @@ async def test_present_master_materializes_noncontiguous_ranges_with_real_ffmpeg
         (0.5, 1.0),
     ]
     samples = json.loads(gimbal_sidecar_path(resolved.path).read_text(encoding="utf-8"))["samples"]
-    assert samples == [[0.2, -15.0, 1.0], [0.7, 15.0, 3.0]]
+    assert samples == [[0.2, -15.0, 1.0, 0.0], [0.7, 15.0, 3.0, 0.0]]
 
 
 @pytest.mark.asyncio

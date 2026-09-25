@@ -270,7 +270,7 @@ class CaptureService:
     def remember_gimbal_samples(
         self,
         session: CaptureSession,
-        samples: list[tuple[float, float, float]],
+        samples: list[tuple[float, ...]],
     ) -> None:
         """Persist measured camera movement until the recording is safely attached."""
         stored = self._sessions.get(session.id)

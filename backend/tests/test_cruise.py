@@ -1351,7 +1351,27 @@ async def test_warmup_stops_after_six_unconfirmed_sends(monkeypatch):
     monkeypatch.setattr(cruise_module, "_CW_WARMUP_MONITOR_SECONDS", 0.0)
     monkeypatch.setattr(cruise_module, "_CW_POSE_POLL_SECONDS", 0.0)
 
-    with pytest.raises(ValueError, match="原点唤醒未确认"):
+    with pytest.raises(ValueError, match="已发送 6 次"):
         await cruise._warm_up_origin(CameraworkConfig())
 
     assert len(adapter.gimbal_commands) == 6
+
+
+@pytest.mark.asyncio
+async def test_move_resends_when_pose_never_confirms(monkeypatch):
+    """A leg that cannot confirm resends up to max_sends instead of failing immediately."""
+    cruise, adapter, _ = build_cruise()
+    adapter.heartbeat_zoom = lambda: 1.0
+    confirmations = []
+
+    async def no_confirm(*args, **kwargs):
+        confirmations.append(1)
+        raise ValueError("云台已停稳但超出可接受偏差")
+
+    monkeypatch.setattr(cruise, "_await_camerawork_pose", no_confirm)
+
+    with pytest.raises(ValueError, match="已发送 4 次"):
+        await cruise._move_to_pose((10, 0), CameraworkConfig())
+
+    assert len(confirmations) == 4
+    assert len(adapter.gimbal_commands) == 4

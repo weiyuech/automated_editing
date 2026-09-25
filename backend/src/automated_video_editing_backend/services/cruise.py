@@ -38,6 +38,7 @@ _CW_OUT_OF_TOLERANCE_MAX_CHECKS = 3
 # cannot be turned into a meaningful wait. A short fixed floor lets the command propagate
 # before the settle gate opens; arrival still belongs to the settled + tolerance check.
 _CW_PREWAIT_SECONDS = 2.0
+_CW_MOVE_MAX_SENDS = 4
 _CW_WARMUP_MAX_SENDS = 6
 _CW_WARMUP_MONITOR_SECONDS = 10.0
 # This is only a fail-safe for missing or endlessly changing telemetry. It is not
@@ -87,7 +88,7 @@ class CruiseService:
         # Zoom uses the last command; yaw/pitch always come from physical heartbeat samples.
         self._cw_zoom = 1.0
         self._point_dwell_baseline_seconds = 7.5
-        self._telemetry: list[tuple[float, float, float]] = []
+        self._telemetry: list[tuple[float, float, float, float]] = []
         self._telemetry_task: asyncio.Task[None] | None = None
 
     def current(self) -> CruiseRun | None:
@@ -567,11 +568,12 @@ class CruiseService:
     async def _move_to_pose(
         self, target: tuple[float, float], config: CameraworkConfig,
         *, target_zoom: float | None = None, monitor_failsafe_seconds: float | None = None,
+        max_sends: int = _CW_MOVE_MAX_SENDS, retry_ambiguous: bool = False,
     ) -> None:
-        """Send one leg only after readiness; a busy rejection is resent at most three times."""
+        """Move one leg; resend on non-confirmation, optionally on ambiguous replies."""
         desired_zoom = config.anchor_zoom if target_zoom is None else target_zoom
         await self._wait_gimbal_settled()
-        for attempt in range(1, 5):
+        for attempt in range(1, max_sends + 1):
             if self._cancel.is_set():
                 raise asyncio.CancelledError
             yaw, pitch = self.robot.heartbeat_yaw(), self._heartbeat_pitch()
@@ -605,32 +607,42 @@ class CruiseService:
                 owner = await asyncio.wait_for(
                     sender(command, context=context, cancelled=self._cancel.is_set), timeout=10,
                 )
-            angle_estimated_seconds = _CW_PREWAIT_SECONDS
-            reached, _ = await self._await_camerawork_pose(
-                *target,
-                angle_estimated_seconds,
-                after_revision=revision,
-                target_zoom=desired_zoom,
-                after_zoom_revision=zoom_revision,
-                angle_tolerance=config.angle_tolerance_degrees,
-                zoom_tolerance=config.zoom_tolerance,
-                busy_owner=owner,
-                monitor_failsafe_seconds=monitor_failsafe_seconds,
-            )
+            try:
+                reached, _ = await self._await_camerawork_pose(
+                    *target,
+                    _CW_PREWAIT_SECONDS,
+                    after_revision=revision,
+                    target_zoom=desired_zoom,
+                    after_zoom_revision=zoom_revision,
+                    angle_tolerance=config.angle_tolerance_degrees,
+                    zoom_tolerance=config.zoom_tolerance,
+                    busy_owner=owner,
+                    monitor_failsafe_seconds=monitor_failsafe_seconds,
+                )
+            except ValueError:
+                # Definite non-arrival: settled outside tolerance, or still moving after the
+                # grace rounds. Resend the same leg from the current position.
+                log_event("warning", "cruise.gimbal.unconfirmed_retry", attempt=attempt,
+                          target_yaw=target[0], target_pitch=target[1], target_zoom=desired_zoom)
+                continue
             if self._cancel.is_set():
                 raise asyncio.CancelledError
             if reached:
                 self._cw_zoom = desired_zoom
                 return
             busy = getattr(self.robot, "gimbal_busy_seen", None)
-            if owner is None or not callable(busy) or not busy(owner):
-                raise ValueError(
-                    f"云台未确认到达 ({target[0]}, {target[1]})，倍率 {desired_zoom:g}×"
-                    f"（已发送 {attempt} 次）；已停止后续镜头和导航"
-                )
-            log_event("warning", "cruise.gimbal.busy_ignored", attempt=attempt,
-                      target_yaw=target[0], target_pitch=target[1], target_zoom=desired_zoom)
-        raise ValueError("机器人连续 4 次拒绝云台指令（含 3 次补发）；已停止后续镜头和导航")
+            definite_busy = owner is not None and callable(busy) and busy(owner)
+            if retry_ambiguous or definite_busy:
+                log_event("warning", "cruise.gimbal.unconfirmed_retry", attempt=attempt,
+                          target_yaw=target[0], target_pitch=target[1], target_zoom=desired_zoom)
+                continue
+            raise ValueError(
+                f"云台未确认到达 ({target[0]}, {target[1]})，倍率 {desired_zoom:g}×"
+                f"（已发送 {attempt} 次）；已停止后续镜头和导航"
+            )
+        raise ValueError(
+            f"云台未确认到位（已发送 {max_sends} 次，含 {max_sends - 1} 次补发）；已停止后续镜头和导航"
+        )
 
     async def _wait_gimbal_settled(self) -> None:
         reader = getattr(self.robot, "gimbal_stable_now", None)
@@ -646,28 +658,13 @@ class CruiseService:
         raise ValueError("云台心跳未确认停稳，未发送下一条指令；请检查角度与倍率反馈")
 
     async def _warm_up_origin(self, config: CameraworkConfig) -> None:
-        """First-point wake-up: re-home to (0, 0) with up to six bounded resends.
-
-        A freshly powered robot often ignores its first few gimbal commands, so a rejected
-        or unconfirmed home is retried. Each resend reuses the standard move + settle +
-        tolerance gate; only missing telemetry is fatal rather than retried.
-        """
-        for attempt in range(1, _CW_WARMUP_MAX_SENDS + 1):
-            if self._cancel.is_set():
-                raise asyncio.CancelledError
-            try:
-                await self._move_to_pose(
-                    (0, 0), config, monitor_failsafe_seconds=_CW_WARMUP_MONITOR_SECONDS,
-                )
-                return
-            except ValueError as exc:
-                if "反馈" in str(exc):
-                    raise
-                log_event(
-                    "warning", "cruise.gimbal.warmup_retry", attempt=attempt,
-                    target_yaw=0, target_pitch=0, target_zoom=config.anchor_zoom,
-                )
-        raise ValueError("原点唤醒未确认（已发送 6 次）；已停止后续镜头和导航")
+        """First-point wake-up: re-home to (0, 0) with extra resends for a cold robot."""
+        await self._move_to_pose(
+            (0, 0), config,
+            monitor_failsafe_seconds=_CW_WARMUP_MONITOR_SECONDS,
+            max_sends=_CW_WARMUP_MAX_SENDS,
+            retry_ambiguous=True,
+        )
 
     async def _run_camera_program(self, run, segment, config, selected) -> None:
         pieces = camera_program(config, config.piece_ids if selected is None else selected)
@@ -855,17 +852,19 @@ class CruiseService:
         return False, observed
 
     async def _sample_telemetry(self) -> None:
-        """Record physical heartbeat yaw/pitch, never optimistic command endpoints."""
+        """Record physical heartbeat yaw/pitch/zoom, never optimistic command endpoints."""
         while not self._cancel.is_set():
             try:
                 yaw = self.robot.heartbeat_yaw()
                 pitch = self._heartbeat_pitch()
-                if yaw is not None and pitch is not None:
+                zoom = self._heartbeat_zoom()
+                if yaw is not None and pitch is not None and zoom is not None:
                     self._telemetry.append(
                         (
                             round(self._elapsed(), 3),
                             round(float(yaw), 3),
                             round(float(pitch), 3),
+                            round(float(zoom), 3),
                         )
                     )
             except Exception:

@@ -261,7 +261,7 @@ class CaptureSession(BaseModel):
     recording_clock: dict[str, Any] = Field(default_factory=dict)
     # Physical heartbeat samples belong to the capture until its video is safely local.  Keeping
     # them here lets a later save retry write the same motion evidence as an immediate stop.
-    gimbal_samples: list[tuple[float, float, float]] = Field(default_factory=list)
+    gimbal_samples: list[tuple[float, ...]] = Field(default_factory=list)
     # The camera may stop successfully while its HTTP transfer fails. Keep the robot URL with
     # the still-active session so retry remains possible after the desktop backend restarts.
     pending_media_url: str | None = None

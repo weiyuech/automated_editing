@@ -26,6 +26,7 @@ from automated_video_editing_backend.services.capture import (
     sidecar_path,
 )
 from automated_video_editing_backend.services.recording_segments import (
+    apply_motion_trim,
     build_timeline,
     iter_nodes,
     selected_nodes,
@@ -489,6 +490,18 @@ class CaptureLibrary:
                 group["segments"] = build_timeline(
                     group["evidence"], duration, group["offset_seconds"]
                 )
+                samples: list[tuple[float, float, float, float]] = []
+                track, _ = read_json(gimbal_sidecar_path(group["master_path"]))
+                if isinstance(track, dict):
+                    for sample in track.get("samples") or []:
+                        if isinstance(sample, list) and len(sample) >= 3:
+                            zoom = float(sample[3]) if len(sample) >= 4 else 0.0
+                            samples.append(
+                                (float(sample[0]), float(sample[1]), float(sample[2]), zoom)
+                            )
+                group["segments"] = apply_motion_trim(
+                    group["segments"], samples, group["offset_seconds"]
+                )
                 for segment in iter_nodes(group["segments"]):
                     segment.update(status="virtual", error="")
                 group["timeline_version"] = digest(
@@ -702,11 +715,15 @@ class CaptureLibrary:
         if isinstance(track, dict) and track.get("samples"):
             samples, cursor = [], 0.0
             for start, end in ranges:
-                samples.extend(
-                    [cursor + t - start, yaw, pitch]
-                    for t, yaw, pitch in track["samples"]
-                    if start <= t < end
-                )
+                for sample in track["samples"]:
+                    if not isinstance(sample, list) or len(sample) < 3:
+                        continue
+                    t = float(sample[0])
+                    if start <= t < end:
+                        zoom = float(sample[3]) if len(sample) >= 4 else 0.0
+                        samples.append(
+                            [cursor + t - start, float(sample[1]), float(sample[2]), zoom]
+                        )
                 cursor += end - start
             if not write_json(target_gimbal, {"samples": samples}):
                 raise OSError("子视频云台轨迹保存失败")
@@ -729,9 +746,10 @@ class CaptureLibrary:
             track, _ = read_json(gimbal_sidecar_path(source))
             if isinstance(track, dict):
                 for sample in track.get("samples") or []:
-                    if isinstance(sample, list) and len(sample) == 3:
+                    if isinstance(sample, list) and len(sample) >= 3:
+                        zoom = float(sample[3]) if len(sample) >= 4 else 0.0
                         samples.append(
-                            [cursor + float(sample[0]), float(sample[1]), float(sample[2])]
+                            [cursor + float(sample[0]), float(sample[1]), float(sample[2]), zoom]
                         )
             cursor += segment["end"] - segment["start"]
         target_gimbal = gimbal_sidecar_path(target)
