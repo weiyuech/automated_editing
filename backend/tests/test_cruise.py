@@ -23,6 +23,7 @@ from automated_video_editing_backend.services.capture import (
     gimbal_sidecar_path,
     sidecar_path,
 )
+from automated_video_editing_backend.services import cruise as cruise_module
 from automated_video_editing_backend.services.cruise import CruisePreflightError, CruiseService
 from automated_video_editing_backend.services.robot import HardwareRobotAdapter, RobotService
 
@@ -1306,3 +1307,51 @@ async def test_a_healthy_run_reports_no_warnings(tmp_path):
 
     assert run.warnings == []
     assert sidecar_path(recording).exists()
+
+
+@pytest.mark.asyncio
+async def test_warmup_homes_to_origin_and_exits_on_first_settle(monkeypatch):
+    """The first-point wake-up re-homes to (0, 0) and stops sending once it settles there."""
+    cruise, adapter, _ = build_cruise()
+    adapter.heartbeat_zoom = lambda: 1.0
+    adapter._zrev = 0
+
+    def zoom_revision():
+        adapter._zrev += 1
+        return adapter._zrev
+
+    adapter.heartbeat_zoom_revision = zoom_revision
+    adapter._rev = 0
+
+    def revision():
+        adapter._rev += 1
+        return adapter._rev
+
+    adapter.heartbeat_revision = revision
+
+    monkeypatch.setattr(cruise_module, "_CW_PREWAIT_SECONDS", 0.0)
+    monkeypatch.setattr(cruise_module, "_CW_POSE_POLL_SECONDS", 0.0)
+    monkeypatch.setattr(cruise_module, "_CW_WARMUP_MONITOR_SECONDS", 0.5)
+
+    await cruise._warm_up_origin(CameraworkConfig())
+
+    assert len(adapter.gimbal_commands) == 1
+    assert adapter.gimbal_commands[0].yaw_end == 0
+    assert adapter.gimbal_commands[0].pitch_end == 0
+
+
+@pytest.mark.asyncio
+async def test_warmup_stops_after_six_unconfirmed_sends(monkeypatch):
+    """When zoom telemetry never confirms, the wake-up stops after six sends rather than looping."""
+    cruise, adapter, _ = build_cruise()
+    adapter.heartbeat_zoom = lambda: 1.0
+    # No heartbeat_zoom_revision: zoom is never fresh, so no leg can ever confirm.
+
+    monkeypatch.setattr(cruise_module, "_CW_PREWAIT_SECONDS", 0.0)
+    monkeypatch.setattr(cruise_module, "_CW_WARMUP_MONITOR_SECONDS", 0.0)
+    monkeypatch.setattr(cruise_module, "_CW_POSE_POLL_SECONDS", 0.0)
+
+    with pytest.raises(ValueError, match="原点唤醒未确认"):
+        await cruise._warm_up_origin(CameraworkConfig())
+
+    assert len(adapter.gimbal_commands) == 6

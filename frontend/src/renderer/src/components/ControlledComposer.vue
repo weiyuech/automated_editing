@@ -6,6 +6,7 @@ import CaptureGroupPicker from './CaptureGroupPicker.vue'
 import CompositionTree from './CompositionTree.vue'
 import {
   captureGroup,
+  defaultCaptureSelection,
   fullCaptureSelection,
   formatCaptureTime,
 } from '../capture-group-policy.js'
@@ -102,7 +103,7 @@ function toggle(item, checked) {
     item,
     checked
       ? captureGroup(item)
-        ? fullCaptureSelection(captureGroup(item))
+        ? defaultCaptureSelection(captureGroup(item))
         : true
       : null,
   )

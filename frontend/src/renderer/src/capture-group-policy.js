@@ -32,6 +32,14 @@ export function normalizeCaptureSelection(group, selection) {
 export function fullCaptureSelection(group) {
   return normalizeCaptureSelection(group, { include_full: true, segment_ids: [] })
 }
+export function defaultCaptureSelection(group) {
+  return normalizeCaptureSelection(group, {
+    include_full: false,
+    segment_ids: captureLeaves(group.segments)
+      .filter((node) => node.kind !== 'preparation')
+      .map((node) => node.id)
+  })
+}
 export function captureSelectionState(group, selection) {
   const normalized = normalizeCaptureSelection(group, selection)
   const leaves = captureLeaves(group.segments)

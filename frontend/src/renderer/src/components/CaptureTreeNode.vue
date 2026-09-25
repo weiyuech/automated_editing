@@ -5,12 +5,23 @@ const props = defineProps({ node: Object, group: Object, selection: Object, disa
 const emit = defineEmits(['change', 'preview'])
 const open = ref(!props.readOnly)
 const state = computed(() => captureNodeState(props.group, props.selection, props.node))
+function onToggle(event) {
+  const checked = event.target.checked
+  if (checked && props.node.kind === 'preparation') {
+    const confirmed = window.confirm('该区间为“准备”镜头（云台就位或回原点），通常不应进入成片。仍要选入吗？')
+    if (!confirmed) {
+      event.target.checked = false
+      return
+    }
+  }
+  emit('change', { id: props.node.id, checked })
+}
 </script>
 <template>
   <div class="tree-node" :class="{ 'tree-node-point': depth === 0 }">
     <div class="node-row" :class="{ 'node-row-point': depth === 0 }">
       <button v-if="node.children?.length" class="disclosure" :aria-label="`${open ? '收起' : '展开'}${node.label}`" :aria-expanded="open" @click="open = !open">{{ open ? '▾' : '▸' }}</button>
-      <component :is="readOnly ? 'div' : 'label'" class="node-label"><input v-if="!readOnly" type="checkbox" :checked="state.checked" :indeterminate="state.partial" :disabled="disabled || (!group.master_available && !node.available)" @change="emit('change', { id: node.id, checked: $event.target.checked })" />
+      <component :is="readOnly ? 'div' : 'label'" class="node-label"><input v-if="!readOnly" type="checkbox" :checked="state.checked" :indeterminate="state.partial" :disabled="disabled || (!group.master_available && !node.available)" @change="onToggle" />
         <span><strong>{{ node.label }}</strong><small>{{ formatCaptureTime(node.end - node.start) }} · {{ formatCaptureTime(node.start) }}–{{ formatCaptureTime(node.end) }}<em v-if="node.complete === false"> · 未完成</em></small></span>
       </component>
       <button :disabled="!group.master_available && !node.available" @click="emit('preview', node)">预览</button>

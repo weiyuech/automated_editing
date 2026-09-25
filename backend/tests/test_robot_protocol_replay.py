@@ -611,6 +611,9 @@ async def test_zoom_pieces_wait_for_actual_zoom_and_restore_custom_base(
     service = CruiseService(events, RobotService(events, adapter=adapter),
                             CaptureService(events, path=tmp_path / "capture.json"))
     monkeypatch.setattr(cruise_module, "_CW_POSE_POLL_SECONDS", 0.001)
+    # The fixed two-second pre-wait is a transport concern; this test isolates zoom
+    # confirmation, so it holds the pre-wait at zero rather than depending on wall time.
+    monkeypatch.setattr(cruise_module, "_CW_PREWAIT_SECONDS", 0.0)
     config = CameraworkConfig(anchor_zoom=base, zoom_target=target)
 
     async def sample(zoom=None):

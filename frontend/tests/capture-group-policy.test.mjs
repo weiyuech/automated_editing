@@ -6,6 +6,7 @@ import {
   captureTuneClipIdentity,
   captureTuneSourceGroups,
   changeCaptureChild,
+  defaultCaptureSelection,
   fullCaptureSelection,
   normalizeCaptureSelection
 } from '../src/renderer/src/capture-group-policy.js'
@@ -118,6 +119,29 @@ test('missing master without usable children has no default selection', () => {
     count: 0,
     selectableCount: 0,
     duration: 0
+  })
+})
+
+test('default selection excludes preparation intervals but keeps shots and travel', () => {
+  const capture = {
+    ...group(),
+    segments: [
+      { id: 'a', kind: 'preparation', label: '开始准备', start: 0, end: 10, available: true, path: '/managed/a.mp4' },
+      { id: 'b', kind: 'transit', label: '起点 → A', start: 10, end: 20, available: true, path: '/managed/b.mp4' },
+      {
+        id: 'c', kind: 'dwell', label: 'A · 停留', start: 20, end: 30, available: true, path: '/managed/c.mp4',
+        children: [
+          { id: 'c1', kind: 'shot', label: '原点 → 左', start: 20, end: 25, available: true, path: '/managed/c1.mp4' },
+          { id: 'c2', kind: 'preparation', label: '镜头准备', start: 25, end: 30, available: true, path: '/managed/c2.mp4' }
+        ]
+      }
+    ]
+  }
+
+  assert.deepEqual(defaultCaptureSelection(capture), {
+    capture_id: capture.id,
+    include_full: false,
+    segment_ids: ['b', 'c1']
   })
 })
 

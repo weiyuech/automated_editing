@@ -34,6 +34,12 @@ from automated_video_editing_backend.services.camera_program import camera_progr
 _CW_POSE_POLL_SECONDS = 0.2
 _CW_OUT_OF_TOLERANCE_GRACE_SECONDS = 3.0
 _CW_OUT_OF_TOLERANCE_MAX_CHECKS = 3
+# The wire speed is a whole-number 2–5 gear, not degrees per second, so angle travel
+# cannot be turned into a meaningful wait. A short fixed floor lets the command propagate
+# before the settle gate opens; arrival still belongs to the settled + tolerance check.
+_CW_PREWAIT_SECONDS = 2.0
+_CW_WARMUP_MAX_SENDS = 6
+_CW_WARMUP_MONITOR_SECONDS = 10.0
 # This is only a fail-safe for missing or endlessly changing telemetry. It is not
 # added to the robot's estimated movement time and cannot make a move complete.
 _CW_MONITOR_FAILSAFE_SECONDS = 60.0
@@ -560,7 +566,7 @@ class CruiseService:
 
     async def _move_to_pose(
         self, target: tuple[float, float], config: CameraworkConfig,
-        *, target_zoom: float | None = None,
+        *, target_zoom: float | None = None, monitor_failsafe_seconds: float | None = None,
     ) -> None:
         """Send one leg only after readiness; a busy rejection is resent at most three times."""
         desired_zoom = config.anchor_zoom if target_zoom is None else target_zoom
@@ -599,10 +605,7 @@ class CruiseService:
                 owner = await asyncio.wait_for(
                     sender(command, context=context, cancelled=self._cancel.is_set), timeout=10,
                 )
-            angle_estimated_seconds = max(
-                abs(target[0] - yaw) / speed,
-                abs(target[1] - pitch) / speed,
-            )
+            angle_estimated_seconds = _CW_PREWAIT_SECONDS
             reached, _ = await self._await_camerawork_pose(
                 *target,
                 angle_estimated_seconds,
@@ -612,6 +615,7 @@ class CruiseService:
                 angle_tolerance=config.angle_tolerance_degrees,
                 zoom_tolerance=config.zoom_tolerance,
                 busy_owner=owner,
+                monitor_failsafe_seconds=monitor_failsafe_seconds,
             )
             if self._cancel.is_set():
                 raise asyncio.CancelledError
@@ -641,10 +645,34 @@ class CruiseService:
             await asyncio.sleep(_CW_POSE_POLL_SECONDS)
         raise ValueError("云台心跳未确认停稳，未发送下一条指令；请检查角度与倍率反馈")
 
+    async def _warm_up_origin(self, config: CameraworkConfig) -> None:
+        """First-point wake-up: re-home to (0, 0) with up to six bounded resends.
+
+        A freshly powered robot often ignores its first few gimbal commands, so a rejected
+        or unconfirmed home is retried. Each resend reuses the standard move + settle +
+        tolerance gate; only missing telemetry is fatal rather than retried.
+        """
+        for attempt in range(1, _CW_WARMUP_MAX_SENDS + 1):
+            if self._cancel.is_set():
+                raise asyncio.CancelledError
+            try:
+                await self._move_to_pose(
+                    (0, 0), config, monitor_failsafe_seconds=_CW_WARMUP_MONITOR_SECONDS,
+                )
+                return
+            except ValueError as exc:
+                if "反馈" in str(exc):
+                    raise
+                log_event(
+                    "warning", "cruise.gimbal.warmup_retry", attempt=attempt,
+                    target_yaw=0, target_pitch=0, target_zoom=config.anchor_zoom,
+                )
+        raise ValueError("原点唤醒未确认（已发送 6 次）；已停止后续镜头和导航")
+
     async def _run_camera_program(self, run, segment, config, selected) -> None:
         pieces = camera_program(config, config.piece_ids if selected is None else selected)
 
-        async def record_piece(key, label, targets, kind, zooms=None):
+        async def record_piece(key, label, targets, kind, zooms=None, runner=None):
             shot = {
                 "id": key,
                 "label": label,
@@ -659,11 +687,14 @@ class CruiseService:
             segment.shots.append(shot)
             await self._publish_segment("CRUISE_SHOT_STARTED", run, segment)
             try:
-                for target in targets:
-                    if zooms is None:
-                        await self._move_to_pose(target, config)
-                    else:
-                        await self._move_to_pose(target, config, target_zoom=zooms[1])
+                if runner is not None:
+                    await runner()
+                else:
+                    for target in targets:
+                        if zooms is None:
+                            await self._move_to_pose(target, config)
+                        else:
+                            await self._move_to_pose(target, config, target_zoom=zooms[1])
                 shot["status"] = "complete"
             finally:
                 shot["end"] = self._elapsed()
@@ -672,6 +703,22 @@ class CruiseService:
                 await self._publish_segment("CRUISE_SHOT_FINISHED", run, segment)
 
         previous = (0, 0)
+        if segment.index == 0:
+            observed = (self.robot.heartbeat_yaw(), self._heartbeat_pitch())
+            observed_zoom = self._heartbeat_zoom()
+            zoom_needs_home = (
+                observed_zoom is not None
+                and abs(observed_zoom - config.anchor_zoom) > config.zoom_tolerance
+            )
+            needs_home = zoom_needs_home or any(
+                value is None or abs(value) > config.angle_tolerance_degrees
+                for value in observed
+            )
+            if needs_home:
+                await record_piece(
+                    "warm-up-origin", "原点唤醒", [(0, 0)], "preparation",
+                    runner=lambda: self._warm_up_origin(config),
+                )
         for piece in pieces:
             if self._cancel.is_set():
                 raise asyncio.CancelledError
