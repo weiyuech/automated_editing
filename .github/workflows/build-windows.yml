@@ -156,16 +156,16 @@ jobs:
           retention-days: 14
 
       - name: Publish public Windows installer
-        if: github.ref == 'refs/heads/codex/shot-intent-zoom-20260926'
+        if: github.ref == 'refs/heads/codex/camera-clock-align-20260926'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create v0.1.19 \
-            release/Automated-Video-Editing-0.1.19-Windows-x64-Setup.exe \
+          gh release create v0.1.20 \
+            release/Automated-Video-Editing-0.1.20-Windows-x64-Setup.exe \
             release/SHA256SUMS.txt \
             --target "$GITHUB_SHA" \
-            --title "自动视频剪辑 0.1.19" \
-            --notes-file docs/releases/0.1.19.md
+            --title "自动视频剪辑 0.1.20" \
+            --notes-file docs/releases/0.1.20.md
 
   package-external-media-tools:
     name: Package Windows x64 — external media tools
