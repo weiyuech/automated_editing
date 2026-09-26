@@ -303,6 +303,22 @@ async def saved_material(studio, tmp_path, duration=1):
 
 
 @pytest.mark.asyncio
+async def test_a_composition_titled_after_a_recording_time_can_be_saved(studio, tmp_path):
+    """Generated titles carry the session clock, and a colon must not block saving."""
+    source = studio.media.import_path(str(video(tmp_path / "source.mp4", "red", 1)))
+    title = "产品晨拍 09-26 17:20 · 组合 01"
+    record = await ready(
+        studio, CompositionRequest(purpose="library", media_ids=[source.id], title=title)
+    )
+
+    material = await studio.save_material(record["id"], record["signature"])
+
+    assert material.metadata["title"] == title
+    assert not set(Path(material.path).name) & set('/\\:*?"<>|')
+    assert Path(material.path).name.endswith(".mp4")
+
+
+@pytest.mark.asyncio
 async def test_cross_recording_provenance_prompt_and_tts_survive_recombining(studio, tmp_path):
     from automated_video_editing_backend.core.composition import NarrationAllocateRequest
     from automated_video_editing_backend.services.narration_context import narration_context

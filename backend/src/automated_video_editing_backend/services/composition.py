@@ -25,6 +25,7 @@ from automated_video_editing_backend.core.paths import GENERATED_DIRS
 from automated_video_editing_backend.core.store import read_json, write_json
 from automated_video_editing_backend.services.capture import read_sidecar
 from automated_video_editing_backend.services.capture_library import digest
+from automated_video_editing_backend.services.naming import safe_stem
 from automated_video_editing_backend.services.narration_context import original_recording_ids
 from automated_video_editing_backend.services.recording_segments import (
     rebase_timeline,
@@ -593,8 +594,12 @@ class CompositionService:
             self.media.ensure_media_pool_initialized()
             directory = GENERATED_DIRS["data"] / "downloads"
             directory.mkdir(parents=True, exist_ok=True)
-            name = self.jobs._safe_output_name(record["title"] or "组合")
-            target = directory / f"{Path(name).stem} 组合-{key[:8]}.mp4"
+            # The title is a label the operator and the app write for people, so it may
+            # hold characters a filename cannot (a recording stamped 17:20 is the common
+            # case). Keep the label readable and only clean the derived filename, instead
+            # of refusing to save the composition at all.
+            stem = safe_stem(record["title"] or "组合", "组合")
+            target = directory / f"{stem} 组合-{key[:8]}.mp4"
             stage = target.with_suffix(".part")
             metadata = {
                 "composition_id": key,

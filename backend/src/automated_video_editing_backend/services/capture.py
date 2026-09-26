@@ -423,12 +423,14 @@ class CaptureService:
         return target
 
     def _session_title(self, title: str) -> str:
-        """Stamp every session with its local start time: '产品晨拍 08-04 17:20'.
+        """Stamp every session with its local start time: '产品晨拍 08-04 17-20'.
 
         Applied here so manual and cruise sessions are named identically. A cruise passes
         its 清单 name; stamping at start time keeps a saved 清单 from replaying an old one.
+        The time uses '-' rather than ':' because this title becomes a filename: capture
+        groups are named after it and compositions saved from them are named after that.
         """
-        stamp = utc_now().astimezone().strftime("%m-%d %H:%M")
+        stamp = utc_now().astimezone().strftime("%m-%d %H-%M")
         name = title.strip() or "采集"
         return self._unique_title(f"{name} {stamp}")
 

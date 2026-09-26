@@ -6,8 +6,9 @@ import pytest
 
 from automated_video_editing_backend.core.events import EventHub
 from automated_video_editing_backend.services.capture import CaptureService
+from automated_video_editing_backend.services.naming import validate_filename
 
-STAMPED = r"\d{2}-\d{2} \d{2}:\d{2}"
+STAMPED = r"\d{2}-\d{2} \d{2}-\d{2}"
 
 
 def _tmp_sessions():
@@ -24,6 +25,17 @@ async def test_every_session_is_stamped_with_its_start_time():
 
     title = capture.list_sessions()[0].title
     assert re.fullmatch(rf"产品晨拍 {STAMPED}", title), title
+
+
+@pytest.mark.asyncio
+async def test_a_stamped_session_title_is_usable_as_a_filename():
+    """This title names the capture group, so it must survive being written to disk."""
+    capture = CaptureService(EventHub(), path=_tmp_sessions())
+
+    await capture.start("产品晨拍")
+    title = capture.active_session().title
+
+    assert validate_filename(title, ".mp4") == f"{title}.mp4"
 
 
 @pytest.mark.asyncio

@@ -701,7 +701,7 @@ async def test_each_run_gets_a_timestamped_session_so_runs_are_distinguishable()
     titles = [session.title for session in capture.list_sessions()]
 
     # A saved 清单 stores its request, so the stamp must come from run time, not save time.
-    assert re.fullmatch(r"早班清单 \d{2}-\d{2} \d{2}:\d{2}", first)
+    assert re.fullmatch(r"早班清单 \d{2}-\d{2} \d{2}-\d{2}", first)
     assert len(titles) == 2
     assert all(title.startswith("早班清单 ") for title in titles)
     # Two runs inside the same minute share a stamp, so the numbering keeps them apart.
