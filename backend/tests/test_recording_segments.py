@@ -165,14 +165,59 @@ def test_slow_motion_below_per_sample_threshold_is_not_reclassified_as_waiting()
     ]
 
 
-def test_intended_return_shot_and_internal_pause_remain_one_shot():
+def test_a_short_pause_inside_a_sweep_stays_in_the_shot():
+    """A pause under the stop threshold is part of the sweep, not a cut point."""
     segments = _dwell([_shot("visit-0:right-origin")])
-    samples = [(i, yaw, 0, 1) for i, yaw in enumerate([30, 30, 30, 20, 20, 20, 10, 0, 0, 0])]
+    samples = [
+        (0.0, 30.0, 0.0, 1.0),
+        (1.0, 30.0, 0.0, 1.0),
+        (2.0, 30.0, 0.0, 1.0),
+        (3.0, 20.0, 0.0, 1.0),
+        (4.0, 20.0, 0.0, 1.0),
+        (5.0, 20.0, 0.0, 1.0),
+        (5.5, 10.0, 0.0, 1.0),
+        (6.0, 0.0, 0.0, 1.0),
+        (7.0, 0.0, 0.0, 1.0),
+        (8.0, 0.0, 0.0, 1.0),
+        (9.0, 0.0, 0.0, 1.0),
+    ]
     apply_motion_trim(segments, samples)
     shots = [x for x in segments[0]["children"] if x["kind"] == "shot"]
     assert len(shots) == 1
     assert shots[0]["id"] == "visit-0:right-origin"
     assert shots[0]["start"] < 3 < 6 < shots[0]["end"]
+
+
+def test_a_long_pause_mid_sweep_ends_the_shot_even_towards_the_same_target():
+    """A long stop ends the shot whether the gimbal resumes or swings back."""
+    segments = _dwell([_shot("visit-0:origin-left", end=14)])
+    samples = [
+        (0.0, 0.0, 0.0, 1.0),
+        (1.0, 0.0, 0.0, 1.0),
+        (2.0, 0.0, 0.0, 1.0),
+        (3.0, 30.0, 0.0, 1.0),
+        (4.0, 70.0, 0.0, 1.0),
+        (5.0, 100.0, 0.0, 1.0),
+        (6.0, 100.0, 0.0, 1.0),
+        (7.0, 100.0, 0.0, 1.0),
+        (8.0, 100.0, 0.0, 1.0),
+        (9.0, 110.0, 0.0, 1.0),
+        (10.0, 110.0, 0.0, 1.0),
+        (11.0, 110.0, 0.0, 1.0),
+        (12.0, 110.0, 0.0, 1.0),
+        (13.0, 110.0, 0.0, 1.0),
+    ]
+
+    apply_motion_trim(segments, samples)
+    children = segments[0]["children"]
+
+    assert [(c["kind"], c["start"], c["end"]) for c in children] == [
+        ("preparation", 0.0, 1.0),
+        ("shot", 1.0, 6.0),
+        ("preparation", 6.0, 14),
+    ]
+    assert children[2]["id"] == "visit-0:origin-left:prep-tail"
+    assert children[2]["source_shot_id"] == "visit-0:origin-left"
 
 
 def test_overshoot_hold_and_settle_back_become_trimmed_wait():
@@ -207,16 +252,17 @@ def test_overshoot_hold_and_settle_back_become_trimmed_wait():
     assert children[2]["source_shot_id"] == "visit-0:origin-left"
 
 
-def test_a_stall_that_resumes_the_same_way_stays_in_the_shot():
-    """A retried nudge continues the sweep; only a reversal ends the shot."""
+def test_a_wake_up_nudge_is_not_mistaken_for_the_shot():
+    """The small leg that wakes the gimbal up stays outside the shot it precedes."""
     segments = _dwell([_shot("visit-0:origin-left")])
-    samples = [(i, yaw, 0, 1) for i, yaw in enumerate([0, 0, 0, 40, 40, 40, 40, 80, 80, 80])]
+    samples = [(i, yaw, 0, 1) for i, yaw in enumerate([0, 0, 0, 4, 4, 4, 4, 70, 70, 70])]
 
     apply_motion_trim(segments, samples)
     shots = [x for x in segments[0]["children"] if x["kind"] == "shot"]
 
     assert len(shots) == 1
-    assert shots[0]["start"] < 7 < shots[0]["end"]
+    assert shots[0]["start"] == 5.0
+    assert shots[0]["end"] == 8.0
 
 
 def test_slow_drift_after_a_sweep_is_cut_as_waiting():

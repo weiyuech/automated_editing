@@ -1,5 +1,5 @@
 __all__ = ["create_app"]
-__version__ = "0.1.21"
+__version__ = "0.1.22"
 
 
 def __getattr__(name: str):

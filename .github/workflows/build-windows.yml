@@ -156,16 +156,16 @@ jobs:
           retention-days: 14
 
       - name: Publish public Windows installer
-        if: github.ref == 'refs/heads/codex/overshoot-peak-trim-20260926'
+        if: github.ref == 'refs/heads/codex/stall-cut-trim-20260926'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create v0.1.21 \
-            release/Automated-Video-Editing-0.1.21-Windows-x64-Setup.exe \
+          gh release create v0.1.22 \
+            release/Automated-Video-Editing-0.1.22-Windows-x64-Setup.exe \
             release/SHA256SUMS.txt \
             --target "$GITHUB_SHA" \
-            --title "自动视频剪辑 0.1.21" \
-            --notes-file docs/releases/0.1.21.md
+            --title "自动视频剪辑 0.1.22" \
+            --notes-file docs/releases/0.1.22.md
 
   package-external-media-tools:
     name: Package Windows x64 — external media tools
