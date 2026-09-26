@@ -933,3 +933,21 @@ async def test_timeline_upgrade_waits_for_use_and_preserves_offline_tree(tmp_pat
     assert captures.groups["capture-1"] == original
     master.unlink()
     assert await captures.ensure_timeline("capture-1") == original
+def test_initial_offset_prefers_observed_recording_start():
+    payload = {
+        "recording_clock": {
+            "recording_start_seconds": 7.5,
+            "confirmation_delay_seconds": 0.7,
+        }
+    }
+    assert capture_library_module._initial_offset_seconds(payload) == pytest.approx(-7.5)
+
+
+def test_initial_offset_falls_back_to_confirmation_delay():
+    payload = {"recording_clock": {"confirmation_delay_seconds": 0.7}}
+    assert capture_library_module._initial_offset_seconds(payload) == pytest.approx(-0.7)
+
+
+def test_initial_offset_defaults_to_zero_without_clock():
+    assert capture_library_module._initial_offset_seconds({}) == 0.0
+    assert capture_library_module._initial_offset_seconds({"recording_clock": {}}) == 0.0

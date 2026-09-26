@@ -46,6 +46,23 @@ def digest(value: object) -> str:
     ).hexdigest()[:24]
 
 
+def _initial_offset_seconds(payload: dict) -> float:
+    """Seed the camera-to-app clock offset from the first observed recording heartbeat.
+
+    The camera starts recording some time after the app writes the Start command. Prefer the
+    heartbeat-observed start; fall back to the confirmation delay (acknowledgement time), which
+    is an upper bound on the camera start. The offset is negative because ``build_timeline``
+    maps cruise time onto camera time via ``cruise_time + offset``.
+    """
+    clock = payload.get("recording_clock") or {}
+    camera_start = clock.get("recording_start_seconds")
+    if camera_start is None:
+        camera_start = clock.get("confirmation_delay_seconds")
+    if not isinstance(camera_start, (int, float)) or not math.isfinite(camera_start):
+        return 0.0
+    return -float(camera_start)
+
+
 class CaptureLibrary:
     def __init__(self, path: Path, directory: Path) -> None:
         self.path = path
@@ -250,7 +267,7 @@ class CaptureLibrary:
                     "status": "pending",
                     "error": "",
                     "duration": 0.0,
-                    "offset_seconds": 0.0,
+                    "offset_seconds": _initial_offset_seconds(payload),
                     "segments": [],
                     "evidence": payload,
                     "timing_note": "边界来自机器人反馈与应用计时；相机起始时间为估计值",

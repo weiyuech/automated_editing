@@ -247,6 +247,7 @@ class HardwareRobotAdapter(RobotAdapter):
         # Until hardware reports the commanded state (or a newer command supersedes it), an
         # opposite transitional record_status must not undo that acknowledgement.
         self._recording_heartbeat_guard: tuple[int, str, bool, int] | None = None
+        self._recording_started_monotonic: float | None = None
         self._recording_heartbeat_conflict_count = 0
         self._recording_heartbeat_conflict_state: bool | None = None
         self._recording_heartbeat_conflict_deadline = 0.0
@@ -615,6 +616,10 @@ class HardwareRobotAdapter(RobotAdapter):
 
     def heartbeat_zoom_revision(self) -> int:
         return self._heartbeat_zoom_revision
+
+    def recording_started_monotonic(self) -> float | None:
+        """Monotonic time of the first heartbeat reporting the camera actually recording."""
+        return self._recording_started_monotonic
 
     def gimbal_busy_seen(self, owner: tuple[int, int]) -> bool:
         """A busy reply belongs to the current socket write, as far as the id-less protocol allows."""
@@ -1071,6 +1076,7 @@ class HardwareRobotAdapter(RobotAdapter):
             # Clear before sending because send/ack failure is precisely where stale fallback
             # is unsafe.
             self._recording_media_url = None
+            self._recording_started_monotonic = None
             try:
                 response = await self._request(
                     {"video_record": {"start": 0, "resolution": 4}},
@@ -2230,6 +2236,8 @@ class HardwareRobotAdapter(RobotAdapter):
             # send the stop command, so a missing field must mean "unchanged", not "no".
             if "record_status" in gimbal:
                 reported_recording = gimbal.get("record_status") == "recording"
+                if reported_recording and self._recording_started_monotonic is None:
+                    self._recording_started_monotonic = time.monotonic()
                 recovery = self._recording_reply_recovery
                 stop_recovery_idle = bool(
                     recovery is not None
@@ -3098,6 +3106,10 @@ class RobotService:
 
     def heartbeat_revision(self) -> int | None:
         reader = getattr(self.adapter, "heartbeat_revision", None)
+        return reader() if callable(reader) else None
+
+    def recording_started_monotonic(self) -> float | None:
+        reader = getattr(self.adapter, "recording_started_monotonic", None)
         return reader() if callable(reader) else None
 
     def gimbal_busy_seen(self, owner: tuple[int, int]) -> bool:

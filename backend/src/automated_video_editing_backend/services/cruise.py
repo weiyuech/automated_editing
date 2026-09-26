@@ -405,6 +405,13 @@ class CruiseService:
                 # that reached at least one requested point retains the existing partial-success
                 # behavior instead of turning one bad id into a total loss.
                 run.status = "succeeded"
+            reader = getattr(self.robot, "recording_started_monotonic", None)
+            started = reader() if callable(reader) else None
+            if started is not None:
+                self.capture.remember_recording_clock(
+                    session,
+                    recording_start_seconds=max(0.0, started - self._origin_monotonic),
+                )
         except asyncio.CancelledError:
             run.status = "canceled"
             raise
