@@ -12,6 +12,7 @@ import uvicorn
 from fastapi import FastAPI, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 
+from automated_video_editing_backend import __version__
 from automated_video_editing_backend.api.routes import build_media_file_router, build_router
 from automated_video_editing_backend.api.ws import websocket_endpoint
 from automated_video_editing_backend.core.diagnostics import configure_diagnostics, log_event
@@ -258,7 +259,7 @@ async def _shutdown_robot_and_capture(
 def create_app() -> FastAPI:
     ensure_generated_dirs()
     configure_diagnostics(GENERATED_DIRS["logs"] / "diagnostics.log")
-    log_event("info", "backend.started", version="0.1.18")
+    log_event("info", "backend.started", version=__version__)
     abandoned_parts = cleanup_abandoned_download_parts(
         GENERATED_DIRS["data"] / "downloads"
     )
@@ -318,7 +319,7 @@ def create_app() -> FastAPI:
             await jobs.compositions.close()
             await media.captures.close()
 
-    app = FastAPI(title="Automated Video Editing Backend", version="0.1.18", lifespan=lifespan)
+    app = FastAPI(title="Automated Video Editing Backend", version=__version__, lifespan=lifespan)
     app.add_middleware(
         CORSMiddleware,
         # electron-vite serves the installed renderer from file://, whose browser origin is
