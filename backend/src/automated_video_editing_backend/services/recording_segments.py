@@ -292,11 +292,12 @@ def apply_motion_trim(
     delta_pitch: float = POSE_SETTLED_DELTA_DEG,
     delta_zoom: float = ZOOM_SETTLED_DELTA,
 ) -> list[dict]:
-    """Relabel each shot's still head and tail as preparation using physical gimbal samples.
+    """Cut only each shot's still head and tail, keeping the motion as one smooth span.
 
     Samples use the cruise clock; ``offset`` maps them onto the tree clock already used by
     ``build_timeline``. A shot with no detectable motion is left untouched, so a missed or
-    undersampled move can never be silently dropped.
+    undersampled move can never be silently dropped. The pan itself is never split, so a
+    smooth sweep stays one continuous clip.
     """
     points = sorted(
         (t + offset, yaw, pitch, zoom)

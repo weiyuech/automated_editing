@@ -729,18 +729,27 @@ class CruiseService:
                 observed_zoom is not None
                 and abs(observed_zoom - zoom_start) > config.zoom_tolerance
             )
-            if zoom_needs_preparation or previous != piece.poses[0] or any(
+            position_needs_preparation = previous != piece.poses[0] or any(
                 value is None or abs(value - desired) > config.angle_tolerance_degrees
                 for value, desired in zip(observed, piece.poses[0])
-            ):
+            )
+            if zoom_needs_preparation or position_needs_preparation:
+                to_origin = position_needs_preparation and piece.poses[0] == (0, 0)
                 await record_piece(
                     f"prepare-{piece.id}", "镜头准备", [piece.poses[0]], "preparation",
-                    (self._cw_zoom, zoom_start) if piece.zooms is not None or zoom_needs_preparation else None,
+                    None if to_origin else (
+                        (self._cw_zoom, zoom_start)
+                        if piece.zooms is not None or zoom_needs_preparation else None
+                    ),
+                    runner=(lambda: self._warm_up_origin(config)) if to_origin else None,
                 )
             await record_piece(piece.id, piece.label, piece.poses[1:], "shot", piece.zooms)
             previous = piece.poses[-1]
         if previous != (0, 0):
-            await record_piece("return-origin", "回原点准备", [(0, 0)], "preparation")
+            await record_piece(
+                "return-origin", "回原点准备", [(0, 0)], "preparation",
+                runner=lambda: self._warm_up_origin(config),
+            )
 
     async def _await_camerawork_pose(
         self,
