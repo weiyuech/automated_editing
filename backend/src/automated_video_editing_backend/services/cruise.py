@@ -659,10 +659,13 @@ class CruiseService:
             await asyncio.sleep(_CW_POSE_POLL_SECONDS)
         raise ValueError("云台心跳未确认停稳，未发送下一条指令；请检查角度与倍率反馈")
 
-    async def _warm_up_origin(self, config: CameraworkConfig) -> None:
-        """First-point wake-up: re-home to (0, 0) with extra resends for a cold robot."""
+    async def _warm_up_origin(
+        self, config: CameraworkConfig, *, target_zoom: float | None = None,
+    ) -> None:
+        """Prepare the next shot's starting pose, without performing its zoom early."""
         await self._move_to_pose(
             (0, 0), config,
+            target_zoom=target_zoom,
             monitor_failsafe_seconds=_CW_WARMUP_MONITOR_SECONDS,
             max_sends=_CW_WARMUP_MAX_SENDS,
             retry_ambiguous=True,
@@ -671,7 +674,7 @@ class CruiseService:
     async def _run_camera_program(self, run, segment, config, selected) -> None:
         pieces = camera_program(config, config.piece_ids if selected is None else selected)
 
-        async def record_piece(key, label, targets, kind, zooms=None, runner=None):
+        async def record_piece(key, label, targets, kind, zooms=None, runner=None, motion_axes=None):
             shot = {
                 "id": key,
                 "label": label,
@@ -683,6 +686,10 @@ class CruiseService:
             }
             if zooms is not None:
                 shot.update(zoom_start=zooms[0], zoom_end=zooms[1])
+            if motion_axes is not None:
+                shot["motion_axes"] = motion_axes
+            if kind == "preparation":
+                shot["preparation_reason"] = "reposition"
             segment.shots.append(shot)
             await self._publish_segment("CRUISE_SHOT_STARTED", run, segment)
             try:
@@ -737,13 +744,17 @@ class CruiseService:
                 to_origin = position_needs_preparation and piece.poses[0] == (0, 0)
                 await record_piece(
                     f"prepare-{piece.id}", "镜头准备", [piece.poses[0]], "preparation",
-                    None if to_origin else (
-                        (self._cw_zoom, zoom_start)
-                        if piece.zooms is not None or zoom_needs_preparation else None
-                    ),
-                    runner=(lambda: self._warm_up_origin(config)) if to_origin else None,
+                    (observed_zoom, zoom_start) if observed_zoom is not None else None,
+                    runner=(lambda: self._warm_up_origin(config, target_zoom=zoom_start))
+                    if to_origin else None,
                 )
-            await record_piece(piece.id, piece.label, piece.poses[1:], "shot", piece.zooms)
+            axes = ["zoom"] if piece.zooms is not None else [
+                axis for i, axis in enumerate(("yaw", "pitch"))
+                if len({pose[i] for pose in piece.poses}) > 1
+            ]
+            await record_piece(
+                piece.id, piece.label, piece.poses[1:], "shot", piece.zooms, motion_axes=axes,
+            )
             previous = piece.poses[-1]
         if previous != (0, 0):
             await record_piece(

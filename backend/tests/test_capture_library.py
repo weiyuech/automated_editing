@@ -866,3 +866,70 @@ async def test_other_capture_timeline_does_not_wait_for_an_encoding_group(tmp_pa
     async with captures._group_lock("one"):
         group = await asyncio.wait_for(captures.ensure_timeline("two"), timeout=2)
     assert group["status"] == "ready"
+
+
+@pytest.mark.asyncio
+async def test_upgrade_rebuilds_coarse_zoom_without_encoding_or_losing_old_media(tmp_path, monkeypatch):
+    master = tmp_path / "master.mp4"
+    master.write_bytes(b"unchanged original")
+    captures = CaptureLibrary(tmp_path / "captures.json", tmp_path / "segments")
+    old_file = captures.directory / "v1" / "zoom.mp4"
+    old_file.parent.mkdir(parents=True)
+    old_file.write_bytes(b"old exported child")
+    evidence = _evidence()
+    evidence["segments"][0]["shots"] = [{
+        "id": "zoom-return", "label": "缩放倍率 → 基础倍率", "kind": "shot",
+        "start": 0.8, "end": 1.0, "status": "complete", "zoom_start": 2, "zoom_end": 1,
+    }]
+    old_tree = [_child("old", 0, 0, 2, old_file)]
+    sidecar_path(master).write_text(json.dumps(evidence))
+    item = MediaItem(id="master", path=str(master), kind="video", metadata={"role": "raw_video"})
+    captures.enrich({item.id: item})
+    fingerprint = captures.groups["capture-1"]["fingerprint"]
+    captures._commit(_group(
+        master, old_tree, evidence=evidence, offset_seconds=0.05, fingerprint=fingerprint,
+    ))
+    captures.enrich({item.id: item})
+    assert captures.groups["capture-1"]["status"] == "pending"
+    assert captures.groups["capture-1"]["segments"] == old_tree
+    gimbal_sidecar_path(master).write_text(json.dumps({
+        "samples": [[0.81, 0, 0, 2], [0.9, 0, 0, 2], [0.99, 0, 0, 1]],
+    }))
+    monkeypatch.setattr(captures.renderer, "probe_duration", lambda _: 2.0)
+
+    async def forbidden(*args, **kwargs):
+        raise AssertionError("A timeline upgrade must not encode any media")
+
+    monkeypatch.setattr(captures, "_encode", forbidden)
+    upgraded = await captures.ensure_timeline("capture-1")
+    assert upgraded["motion_trim_version"] == capture_library_module.MOTION_TRIM_VERSION
+    assert upgraded["offset_seconds"] == 0.05
+    assert upgraded["previous_timeline"]["segments"] == old_tree
+    assert upgraded["timeline_version"] != "timeline-1"
+    shot = next(n for n in capture_library_module.iter_nodes(upgraded["segments"])
+                if n["id"].endswith(":zoom-return"))
+    assert (shot["start"], shot["end"]) == pytest.approx((0.85, 1.05))
+    assert shot["kind"] == "shot"
+    assert master.read_bytes() == b"unchanged original"
+    assert old_file.read_bytes() == b"old exported child"
+    assert not captures._needs_timeline_upgrade(upgraded)
+    restored = CaptureLibrary(captures.path, captures.directory)
+    assert restored.problem == ""
+    assert (await restored.ensure_timeline("capture-1"))["timeline_version"] == upgraded["timeline_version"]
+
+
+@pytest.mark.asyncio
+async def test_timeline_upgrade_waits_for_use_and_preserves_offline_tree(tmp_path):
+    master = tmp_path / "master.mp4"
+    master.write_bytes(b"original")
+    captures = CaptureLibrary(tmp_path / "captures.json", tmp_path / "segments")
+    evidence = _evidence()
+    evidence["segments"][0]["shots"] = [{"id": "zoom-return"}]
+    original = _group(master, evidence=evidence)
+    captures._commit(original)
+    captures.external_path_in_use = lambda path: path == str(master)
+    with pytest.raises(ValueError, match="正在使用"):
+        await captures.ensure_timeline("capture-1")
+    assert captures.groups["capture-1"] == original
+    master.unlink()
+    assert await captures.ensure_timeline("capture-1") == original

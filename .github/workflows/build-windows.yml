@@ -156,16 +156,16 @@ jobs:
           retention-days: 14
 
       - name: Publish public Windows installer
-        if: github.ref == 'refs/heads/codex/motion-trim-retry-20260925'
+        if: github.ref == 'refs/heads/codex/shot-intent-zoom-20260926'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create v0.1.18 \
-            release/Automated-Video-Editing-0.1.18-Windows-x64-Setup.exe \
+          gh release create v0.1.19 \
+            release/Automated-Video-Editing-0.1.19-Windows-x64-Setup.exe \
             release/SHA256SUMS.txt \
             --target "$GITHUB_SHA" \
-            --title "自动视频剪辑 0.1.18" \
-            --notes "完整 Windows 安装包，包含运行所需的后端、媒体工具、字体和本地模型。本版在每次回到原点的准备阶段都使用最多 6 次唤醒重发，更稳地归位；裁剪保持镜头运动的平滑连续，只移除静止的头尾并标注为“准备”。"
+            --title "自动视频剪辑 0.1.19" \
+            --notes-file docs/releases/0.1.19.md
 
   package-external-media-tools:
     name: Package Windows x64 — external media tools

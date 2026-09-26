@@ -180,6 +180,11 @@ def build_timeline(payload: dict, duration: float, offset: float = 0.0) -> list[
                 shot.get("boundary_source", "application_estimate"),
                 shot.get("status") == "complete",
             )
+            # Keep the commanded shot's purpose through the derived tree. Its endpoint
+            # alone cannot distinguish an intentional return shot from repositioning.
+            for field in ("zoom_start", "zoom_end", "motion_axes", "preparation_reason"):
+                if field in shot and end > start:
+                    children[-1][field] = shot[field]
             cursor = max(cursor, end)
         append_child("tail", "结束准备", "preparation", cursor, node["end"], "application_estimate")
         node["children"] = children
@@ -282,6 +287,30 @@ def shift_nodes(nodes: list[dict], offset: float) -> list[dict]:
 
 
 _FRAME_SECONDS = 1.0 / 30.0
+MOTION_TRIM_VERSION = 2
+_MIN_STILL_SECONDS = 1.0
+_MAX_SAMPLE_GAP_SECONDS = 1.0
+
+
+def _motion_axes(child):
+    known = {"yaw": 1, "pitch": 2, "zoom": 3}
+    declared = child.get("motion_axes")
+    if isinstance(declared, list) and declared and all(axis in known for axis in declared):
+        return tuple(known[axis] for axis in declared)
+    key = child["id"].rsplit(":", 1)[-1]
+    # Old recordings carry program IDs and zoom endpoints but no explicit axes.
+    if child.get("kind") == "zoom" or key in {"zoom-outbound", "zoom-return"} or (
+        "zoom_start" in child and "zoom_end" in child
+        and child["zoom_start"] != child["zoom_end"]
+    ):
+        return (3,)
+    if key in {"origin-left", "left-right", "right-origin"}:
+        return (1,)
+    if key in {"origin-up", "up-down", "down-origin"}:
+        return (2,)
+    if key in {"upper-left", "upper-right", "lower-right", "lower-left"}:
+        return (1, 2)
+    return (1, 2, 3)
 
 
 def apply_motion_trim(
@@ -316,48 +345,78 @@ def apply_motion_trim(
                 rebuilt.append(child)
                 continue
             start, end = child["start"], child["end"]
-            span = _shot_motion_span(points, start, end, delta_yaw, delta_pitch, delta_zoom)
+            axes = _motion_axes(child)
+            span = None if child.get("complete") is False else _shot_motion_span(
+                points, start, end, delta_yaw, delta_pitch, delta_zoom, axes=axes,
+            )
             if span is None or end - start <= _FRAME_SECONDS:
-                rebuilt.append(child)
+                rebuilt.append({**child, "trim_status": "retained_uncertain"})
                 continue
             motion_start, motion_end = span
             if motion_start - start > _FRAME_SECONDS:
                 rebuilt.append(_preparation_node(child, "prep-head", start, motion_start))
-            rebuilt.append({**child, "start": motion_start, "end": motion_end})
+            rebuilt.append({
+                **child, "start": motion_start, "end": motion_end,
+                "command_start": start, "command_end": end,
+                "trim_status": "heartbeat_head_tail",
+            })
             if end - motion_end > _FRAME_SECONDS:
                 rebuilt.append(_preparation_node(child, "prep-tail", motion_end, end))
         node["children"] = _merge_preparation(rebuilt)
     return segments
 
 
-def _shot_motion_span(points, start, end, dy_t, dp_t, dz_t):
+def _shot_motion_span(points, start, end, dy_t, dp_t, dz_t, *, axes=(1, 2, 3)):
     window = [point for point in points if start <= point[0] < end]
-    if len(window) < 2:
+    if len(window) < 3 or any(
+        not 0 < b[0] - a[0] <= _MAX_SAMPLE_GAP_SECONDS
+        for a, b in zip(window, window[1:])
+    ):
         return None
-    first_start = None
-    last_end = None
-    prev = window[0]
-    for current in window[1:]:
-        moving = (
-            abs(current[1] - prev[1]) > dy_t
-            or abs(current[2] - prev[2]) > dp_t
-            or abs(current[3] - prev[3]) > dz_t
+    thresholds = {1: dy_t, 2: dp_t, 3: dz_t}
+    moving = [
+        i for i in range(1, len(window))
+        if any(abs(window[i][axis] - window[i - 1][axis]) > thresholds[axis] for axis in axes)
+    ]
+    ranges = {axis: (min(p[axis] for p in window), max(p[axis] for p in window))
+              for axis in axes}
+    # Endpoint-only telemetry does not locate the actual motion in the video. In
+    # particular, yaw jitter must never turn a 1x/2x zoom report into a confident cut.
+    if len(moving) < 2 or not any(
+        any(
+            ranges[axis][0] + thresholds[axis] < point[axis]
+            < ranges[axis][1] - thresholds[axis]
+            for point in window
+        ) for axis in axes
+    ):
+        return None
+    first, last = moving[0] - 1, moving[-1]
+
+    def still(edge):
+        return (
+            len(edge) >= 3 and edge[-1][0] - edge[0][0] >= _MIN_STILL_SECONDS
+            and all(max(p[axis] for p in edge) - min(p[axis] for p in edge)
+                    <= thresholds[axis] for axis in axes)
         )
-        if moving:
-            if first_start is None:
-                first_start = prev[0]
-            last_end = current[0]
-        prev = current
-    if first_start is None:
-        return None
-    return first_start, last_end
+
+    # Retain one neighbouring sample as a timing guard. Do not cut a slowly moving
+    # edge just because each individual heartbeat delta was below the threshold.
+    lo = window[max(0, first - 1)][0] if (
+        window[0][0] - start <= _MAX_SAMPLE_GAP_SECONDS and still(window[:first + 1])
+    ) else start
+    hi = window[min(len(window) - 1, last + 1)][0] if (
+        end - window[-1][0] <= _MAX_SAMPLE_GAP_SECONDS and still(window[last:])
+    ) else end
+    return lo, hi
 
 
 def _preparation_node(source, suffix, start, end):
     return {
         "id": f"{source['id']}:{suffix}",
-        "label": "静置准备",
+        "label": "镜头前等待" if suffix == "prep-head" else "镜头后等待",
         "kind": "preparation",
+        "preparation_reason": "shot_wait",
+        "source_shot_id": source["id"],
         "start": start,
         "end": end,
         "boundary_source": "gimbal_motion_trim",
@@ -372,6 +431,8 @@ def _merge_preparation(children):
             merged
             and child.get("kind") == "preparation"
             and merged[-1].get("kind") == "preparation"
+            and child.get("preparation_reason") == merged[-1].get("preparation_reason")
+            and child.get("source_shot_id") == merged[-1].get("source_shot_id")
             and abs(merged[-1]["end"] - child["start"]) < 1e-6
         ):
             merged[-1] = {**merged[-1], "end": child["end"]}

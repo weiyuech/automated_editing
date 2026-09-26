@@ -90,6 +90,67 @@ class Robot:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("anchor,target", [(1.0, 2.0), (2.0, 1.0), (1.2, 1.8)])
+async def test_reposition_before_zoom_return_preserves_its_starting_zoom(
+    tmp_path, monkeypatch, anchor, target,
+):
+    robot = Robot()
+    robot.zoom = anchor
+    service = CruiseService(EventHub(), robot, CaptureService(EventHub(), path=tmp_path / "c.json"))
+    config = CameraworkConfig(anchor_zoom=anchor, zoom_target=target)
+    segment = CruiseSegment(index=1, path_name="r", goal_id=2)
+    run = CruiseRun(segments=[segment])
+    calls = []
+
+    async def move(pose, config, *, target_zoom=None, **options):
+        desired = config.anchor_zoom if target_zoom is None else target_zoom
+        calls.append((segment.shots[-1]["id"], robot.zoom, desired, options))
+        robot.pose, robot.zoom = pose, desired
+
+    async def publish(event, *_):
+        if event == "CRUISE_SHOT_FINISHED" and segment.shots[-1]["id"] == "zoom-outbound":
+            # Pose feedback changes after successful arrival, before the next shot.
+            robot.pose = (config.angle_tolerance_degrees + 1, 0)
+
+    monkeypatch.setattr(service, "_move_to_pose", move)
+    monkeypatch.setattr(service, "_publish_segment", publish)
+    await service._run_camera_program(run, segment, config, [])
+
+    assert [(name, start, end) for name, start, end, _ in calls] == [
+        ("zoom-outbound", anchor, target),
+        ("prepare-zoom-return", target, target),
+        ("zoom-return", target, anchor),
+    ]
+    assert calls[1][3]["max_sends"] == 6
+    assert [s["kind"] for s in segment.shots] == ["shot", "preparation", "shot"]
+    assert segment.shots[1]["zoom_start"] == segment.shots[1]["zoom_end"] == target
+    assert segment.shots[2]["motion_axes"] == ["zoom"]
+
+
+@pytest.mark.asyncio
+async def test_selected_return_to_origin_is_a_shot_not_a_warmup(tmp_path, monkeypatch):
+    robot = Robot()
+    service = CruiseService(EventHub(), robot, CaptureService(EventHub(), path=tmp_path / "c.json"))
+    segment = CruiseSegment(index=1, path_name="r", goal_id=2)
+    run = CruiseRun(segments=[segment])
+    calls = []
+
+    async def move(pose, config, *, target_zoom=None, **options):
+        calls.append((segment.shots[-1]["id"], pose, options))
+        robot.pose = pose
+        robot.zoom = config.anchor_zoom if target_zoom is None else target_zoom
+
+    monkeypatch.setattr(service, "_move_to_pose", move)
+    await service._run_camera_program(run, segment, CameraworkConfig(), ["right-origin"])
+    assert [s["id"] for s in segment.shots] == [
+        "zoom-outbound", "zoom-return", "prepare-right-origin", "right-origin",
+    ]
+    assert segment.shots[-1]["kind"] == "shot"
+    assert segment.shots[-1]["motion_axes"] == ["yaw"]
+    assert calls[-1] == ("right-origin", (0, 0), {})
+
+
+@pytest.mark.asyncio
 async def test_next_chassis_goal_waits_for_entire_selected_camera_program(tmp_path, monkeypatch):
     robot = Robot()
     capture = CaptureService(EventHub(), path=tmp_path / "captures.json")

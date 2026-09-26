@@ -26,6 +26,7 @@ from automated_video_editing_backend.services.capture import (
     sidecar_path,
 )
 from automated_video_editing_backend.services.recording_segments import (
+    MOTION_TRIM_VERSION,
     apply_motion_trim,
     build_timeline,
     iter_nodes,
@@ -262,6 +263,10 @@ class CaptureLibrary:
         by_path = {item.path: item for item in items.values()}
         for key in list(self.groups):
             group = self.groups[key]
+            if self._needs_timeline_upgrade(group) and not self._timeline_in_use(group):
+                if group["status"] == "ready":
+                    group = {**group, "status": "pending"}
+                    self._commit(group)
             if group.get("status") == "ready" and group.get("obsolete_paths"):
                 updated = deepcopy(group)
                 remaining = self._cleanup_obsolete(updated)
@@ -293,7 +298,8 @@ class CaptureLibrary:
                 )
                 items[item.id] = item
             public = {
-                k: deepcopy(v) for k, v in group.items() if k not in {"evidence", "obsolete_paths"}
+                k: deepcopy(v) for k, v in group.items()
+                if k not in {"evidence", "obsolete_paths", "previous_timeline"}
             }
             public["master_available"] = master_exists
             public["size_bytes"] = Path(item.path).stat().st_size if master_exists else 0
@@ -460,10 +466,29 @@ class CaptureLibrary:
         async with lock:
             yield
 
+    @staticmethod
+    def _needs_timeline_upgrade(group: dict) -> bool:
+        return (
+            group.get("motion_trim_version") != MOTION_TRIM_VERSION
+            and bool(group.get("timeline_version"))
+            and any(isinstance(visit, dict) and visit.get("shots")
+                    for visit in group["evidence"].get("segments", []))
+            and Path(group["master_path"]).is_file()
+        )
+
+    def _timeline_in_use(self, group: dict) -> bool:
+        return any(
+            self.is_path_in_use(path) or self.external_path_in_use(path)
+            for path in [group["master_path"], *(
+                node["path"] for node in iter_nodes(group["segments"]) if node.get("path")
+            )]
+        )
+
     async def ensure_timeline(self, key: str, progress=None) -> dict:
         """Read source timing once. Tree nodes are intervals, not pre-encoded files."""
         current = self.groups[key]
-        if current.get("timeline_version") and current["duration"] > 0:
+        if (current.get("timeline_version") and current["duration"] > 0
+                and not self._needs_timeline_upgrade(current)):
             if current["status"] == "pending" and not current.get("materialize_requested"):
                 current = deepcopy(current)
                 current.update(status="ready", error="")
@@ -474,8 +499,19 @@ class CaptureLibrary:
             return deepcopy(current)
         async with self._group_lock(key, progress):
             group = deepcopy(self.groups[key])
-            if group.get("timeline_version") and group["duration"] > 0:
+            upgrading = self._needs_timeline_upgrade(group)
+            if group.get("timeline_version") and group["duration"] > 0 and not upgrading:
                 return group
+            if upgrading:
+                if self._timeline_in_use(group):
+                    raise ValueError("这次拍摄正在使用，请稍后再更新镜头区间")
+                # Publish the new tree atomically. Preserve the previous tree and
+                # materialized files; saved compositions and originals are untouched.
+                group["previous_timeline"] = {
+                    "timeline_version": group["timeline_version"],
+                    "offset_seconds": group["offset_seconds"],
+                    "segments": deepcopy(group["segments"]),
+                }
             master = Path(group["master_path"])
             self._active.add(str(master.resolve()))
             try:
@@ -495,9 +531,13 @@ class CaptureLibrary:
                 if isinstance(track, dict):
                     for sample in track.get("samples") or []:
                         if isinstance(sample, list) and len(sample) >= 3:
-                            zoom = float(sample[3]) if len(sample) >= 4 else 0.0
+                            try:
+                                zoom = float(sample[3]) if len(sample) >= 4 else 0.0
+                                values = (float(sample[0]), float(sample[1]), float(sample[2]), zoom)
+                            except (TypeError, ValueError, OverflowError):
+                                continue
                             samples.append(
-                                (float(sample[0]), float(sample[1]), float(sample[2]), zoom)
+                                values
                             )
                 group["segments"] = apply_motion_trim(
                     group["segments"], samples, group["offset_seconds"]
@@ -505,7 +545,12 @@ class CaptureLibrary:
                 for segment in iter_nodes(group["segments"]):
                     segment.update(status="virtual", error="")
                 group["timeline_version"] = digest(
-                    [group["fingerprint"], group["offset_seconds"], group["segments"]]
+                    [MOTION_TRIM_VERSION, group["fingerprint"], group["offset_seconds"], group["segments"]]
+                )
+                group["motion_trim_version"] = MOTION_TRIM_VERSION
+                group["timing_note"] = (
+                    "准备仅用于下一镜头的起点就位；镜头前后等待另行标注。"
+                    "反馈不足时保留完整镜头，可能包含等待；相机起始时间仍为估计值。"
                 )
                 group.update(status="ready", error="")
                 self._commit(group)
