@@ -175,6 +175,74 @@ def test_intended_return_shot_and_internal_pause_remain_one_shot():
     assert shots[0]["start"] < 3 < 6 < shots[0]["end"]
 
 
+def test_overshoot_hold_and_settle_back_become_trimmed_wait():
+    """A sweep that stops, holds, then returns must end where the sweep ended."""
+    segments = _dwell([_shot("visit-0:origin-left", end=14)])
+    samples = [
+        (0.0, 0.0, 0.0, 1.0),
+        (1.0, 0.0, 0.0, 1.0),
+        (2.0, 0.0, 0.0, 1.0),
+        (3.0, 20.0, 0.0, 1.0),
+        (4.0, 60.0, 0.0, 1.0),
+        (5.0, 90.0, 0.0, 1.0),
+        (6.0, 112.0, 0.0, 1.0),
+        (7.0, 112.0, 0.0, 1.0),
+        (8.0, 112.0, 0.0, 1.0),
+        (9.0, 112.0, 0.0, 1.0),
+        (10.0, 112.0, 0.0, 1.0),
+        (11.0, 90.0, 0.0, 1.0),
+        (12.0, 90.0, 0.0, 1.0),
+        (13.0, 90.0, 0.0, 1.0),
+    ]
+
+    apply_motion_trim(segments, samples)
+    children = segments[0]["children"]
+
+    assert [(c["kind"], c["start"], c["end"]) for c in children] == [
+        ("preparation", 0.0, 1.0),
+        ("shot", 1.0, 7.0),
+        ("preparation", 7.0, 14),
+    ]
+    assert children[2]["id"] == "visit-0:origin-left:prep-tail"
+    assert children[2]["source_shot_id"] == "visit-0:origin-left"
+
+
+def test_a_stall_that_resumes_the_same_way_stays_in_the_shot():
+    """A retried nudge continues the sweep; only a reversal ends the shot."""
+    segments = _dwell([_shot("visit-0:origin-left")])
+    samples = [(i, yaw, 0, 1) for i, yaw in enumerate([0, 0, 0, 40, 40, 40, 40, 80, 80, 80])]
+
+    apply_motion_trim(segments, samples)
+    shots = [x for x in segments[0]["children"] if x["kind"] == "shot"]
+
+    assert len(shots) == 1
+    assert shots[0]["start"] < 7 < shots[0]["end"]
+
+
+def test_slow_drift_after_a_sweep_is_cut_as_waiting():
+    segments = _dwell([_shot("visit-0:left-right")])
+    samples = [
+        (0.0, 0.0, 0.0, 1.0),
+        (1.0, 0.0, 0.0, 1.0),
+        (2.0, 0.0, 0.0, 1.0),
+        (3.0, 10.0, 0.0, 1.0),
+        (4.0, 20.0, 0.0, 1.0),
+        (5.0, 30.0, 0.0, 1.0),
+        (6.0, 30.0, 0.0, 1.0),
+        (7.0, 30.4, 0.0, 1.0),
+        (8.0, 30.8, 0.0, 1.0),
+        (9.0, 31.2, 0.0, 1.0),
+    ]
+
+    apply_motion_trim(segments, samples)
+
+    assert [(c["kind"], c["start"], c["end"]) for c in segments[0]["children"]] == [
+        ("preparation", 0.0, 1.0),
+        ("shot", 1.0, 6.0),
+        ("preparation", 6.0, 10),
+    ]
+
+
 @pytest.mark.parametrize("problem", ["gap", "incomplete", "missing_tail"])
 def test_unreliable_edges_are_not_silently_discarded(problem):
     segments = _dwell([_shot("visit-0:origin-left")])

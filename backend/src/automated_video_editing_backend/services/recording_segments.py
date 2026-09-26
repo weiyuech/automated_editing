@@ -287,9 +287,15 @@ def shift_nodes(nodes: list[dict], offset: float) -> list[dict]:
 
 
 _FRAME_SECONDS = 1.0 / 30.0
-MOTION_TRIM_VERSION = 2
+MOTION_TRIM_VERSION = 3
 _MIN_STILL_SECONDS = 1.0
 _MAX_SAMPLE_GAP_SECONDS = 1.0
+# A stall this long is a real stop, not the step-shaped gap between two heartbeat
+# reports, so the movement on either side of it is a separate leg.
+_MIN_HOLD_SECONDS = 2.5
+# A still edge may creep slowly while the gimbal holds a pose. Allow this much drift
+# over the whole edge before the drift itself counts as movement to keep.
+_STILL_BAND = {1: 2.0, 2: 2.0, 3: 0.05}
 
 
 def _motion_axes(child):
@@ -321,12 +327,15 @@ def apply_motion_trim(
     delta_pitch: float = POSE_SETTLED_DELTA_DEG,
     delta_zoom: float = ZOOM_SETTLED_DELTA,
 ) -> list[dict]:
-    """Cut only each shot's still head and tail, keeping the motion as one smooth span.
+    """Cut each shot's still head and tail, keeping the motion as one smooth span.
 
     Samples use the cruise clock; ``offset`` maps them onto the tree clock already used by
     ``build_timeline``. A shot with no detectable motion is left untouched, so a missed or
     undersampled move can never be silently dropped. The pan itself is never split, so a
-    smooth sweep stays one continuous clip.
+    smooth sweep stays one continuous clip. The one thing richer than an edge that is cut
+    is the gimbal's own overshoot correction: when a sweep stops, holds, and then travels
+    back to the target, that trailing hold and return are preparation, not part of the
+    shot, so the shot ends where the sweep itself ended.
     """
     points = sorted(
         (t + offset, yaw, pitch, zoom)
@@ -390,22 +399,57 @@ def _shot_motion_span(points, start, end, dy_t, dp_t, dz_t, *, axes=(1, 2, 3)):
         ) for axis in axes
     ):
         return None
-    first, last = moving[0] - 1, moving[-1]
+
+    def band(axis):
+        return max(thresholds[axis], _STILL_BAND[axis])
+
+    def shift(first_index, last_index):
+        return [window[last_index][axis] - window[first_index - 1][axis] for axis in axes]
+
+    # Split the moving samples at long stalls, then re-join legs that keep travelling the
+    # same way. A leg that goes back the other way is the gimbal's overshoot correction
+    # rather than a second half of the shot.
+    legs: list[list[int]] = [[moving[0]]]
+    for index in moving[1:]:
+        if window[index][0] - window[legs[-1][-1]][0] >= _MIN_HOLD_SECONDS:
+            legs.append([index])
+        else:
+            legs[-1].append(index)
+    phases: list[list[int]] = [list(legs[0])]
+    heading = shift(legs[0][0], legs[0][-1])
+    for candidate in legs[1:]:
+        leg = shift(candidate[0], candidate[-1])
+        if sum(a * b for a, b in zip(heading, leg)) < 0:
+            phases.append(list(candidate))
+            heading = leg
+        else:
+            phases[-1] = phases[-1] + candidate
+            heading = shift(phases[-1][0], phases[-1][-1])
+    # Keep the leg that travels furthest; a shot may wake up with a smaller nudge.
+    chosen = max(phases, key=lambda phase: math.dist(
+        [window[phase[0] - 1][axis] for axis in axes],
+        [window[phase[-1]][axis] for axis in axes],
+    ))
+    first, last = chosen[0] - 1, chosen[-1]
 
     def still(edge):
         return (
             len(edge) >= 3 and edge[-1][0] - edge[0][0] >= _MIN_STILL_SECONDS
-            and all(max(p[axis] for p in edge) - min(p[axis] for p in edge)
-                    <= thresholds[axis] for axis in axes)
+            and all(max(p[axis] for p in edge) - min(p[axis] for p in edge) <= band(axis)
+                    for axis in axes)
         )
 
     # Retain one neighbouring sample as a timing guard. Do not cut a slowly moving
     # edge just because each individual heartbeat delta was below the threshold.
+    # When the chosen movement is not the whole window, the earlier and later legs are
+    # the tail of the overshoot/settle-back and are cut even though they still move.
     lo = window[max(0, first - 1)][0] if (
-        window[0][0] - start <= _MAX_SAMPLE_GAP_SECONDS and still(window[:first + 1])
+        window[0][0] - start <= _MAX_SAMPLE_GAP_SECONDS
+        and (still(window[:first + 1]) or phases[0][-1] < last)
     ) else start
     hi = window[min(len(window) - 1, last + 1)][0] if (
-        end - window[-1][0] <= _MAX_SAMPLE_GAP_SECONDS and still(window[last:])
+        end - window[-1][0] <= _MAX_SAMPLE_GAP_SECONDS
+        and (still(window[last:]) or last < phases[-1][-1])
     ) else end
     return lo, hi
 
